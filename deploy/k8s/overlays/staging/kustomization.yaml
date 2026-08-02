@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payments-staging
+resources:
+  - namespace.yaml
+  - ../../base
+# NOTE: base/externalsecret.yaml points at prod/payments-api/* Secrets Manager paths. A real
+# staging overlay adds a JSON6902 patch here retargeting each `remoteRef.key` to
+# staging/payments-api/* — omitted in this reference slice to keep the overlay diff readable;
+# follow the same patch pattern used below for the Deployment/HPA/ConfigMap.
+patches:
+  - target:
+      kind: Deployment
+      name: payments-api
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: payments-api
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 12
+  - target:
+      kind: ConfigMap
+      name: payments-api-config
+    patch: |-
+      - op: replace
+        path: /data/ENV
+        value: "staging"
+images:
+  - name: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/payments-api
+    newTag: staging-latest

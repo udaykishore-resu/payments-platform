@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-api
+  namespace: payments
+spec:
+  # Guarantees that voluntary disruptions (node drains during a cluster upgrade, cluster-autoscaler
+  # consolidation) never take more than 20% of capacity out at once — this is what turns "the
+  # Deployment has enough replicas" into an actual availability guarantee during maintenance, per
+  # docs/09-production-checklist.md.
+  minAvailable: 80%
+  selector:
+    matchLabels:
+      app: payments-api

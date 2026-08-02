@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Deliberately no top-level `namespace:` transformer and no Namespace resource here: the
+# Namespace object is cluster-scoped and its name differs per environment
+# (payments / payments-staging / payments-dev), so each overlay under ../overlays/<env>/ owns its
+# own namespace.yaml and sets its own `namespace:` transformer, which then applies uniformly to
+# every namespaced resource listed below. Keeping that decision in the overlay (not here) avoids
+# the classic kustomize footgun where a namespace transformer set in the base is silently
+# shadowed or duplicated by the overlay's own transformer.
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - externalsecret.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml

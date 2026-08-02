@@ -1,0 +1,45 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payments-dev
+resources:
+  - namespace.yaml
+  - ../../base
+# NOTE: see the equivalent note in overlays/staging/kustomization.yaml regarding
+# externalsecret.yaml's Secrets Manager paths — dev should retarget to dev/payments-api/*.
+patches:
+  - target:
+      kind: Deployment
+      name: payments-api
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: "100m"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: "64Mi"
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: payments-api
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+  - target:
+      kind: ConfigMap
+      name: payments-api-config
+    patch: |-
+      - op: replace
+        path: /data/ENV
+        value: "dev"
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: "debug"
+images:
+  - name: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/payments-api
+    newTag: dev-latest

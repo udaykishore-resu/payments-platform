@@ -1,0 +1,21 @@
+# NOTE: this file is intentionally NOT referenced by base/kustomization.yaml. The Namespace
+# object is cluster-scoped and its name differs per environment (payments / payments-staging /
+# payments-dev), so ownership lives in each environment's overlay instead:
+#   deploy/k8s/overlays/prod/namespace.yaml
+#   deploy/k8s/overlays/staging/namespace.yaml
+#   deploy/k8s/overlays/dev/namespace.yaml
+# This file is kept only as the canonical example of the Pod Security Admission labels every
+# environment's namespace must carry (see docs/05-security-architecture.md) — copy this shape,
+# don't `resources:`-include this specific file.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+  labels:
+    name: payments
+    # Pod Security Admission: enforce the restricted profile at the namespace level so any pod
+    # spec that requests privilege escalation, host networking, etc. is rejected by the API
+    # server itself — defense in depth beyond code review (docs/05-security-architecture.md).
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

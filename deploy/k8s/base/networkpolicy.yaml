@@ -1,0 +1,70 @@
+# Default-deny plus explicit allow rules — implements the microsegmentation described in
+# docs/05-security-architecture.md, "Network Security". A compromised payments-api pod cannot
+# reach anything not explicitly listed here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payments-api-default-deny
+  namespace: payments
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payments-api-allow
+  namespace: payments
+spec:
+  podSelector:
+    matchLabels:
+      app: payments-api
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Only the ALB ingress controller's pods (or mesh gateway) may reach this service's HTTP
+    # port; Prometheus (in the monitoring namespace) may scrape the metrics port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+  egress:
+    # DNS (required for any outbound resolution).
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+    # Aurora PostgreSQL, restricted to the DB subnet CIDR (replace with the real VPC CIDR at
+    # apply time via the prod overlay).
+    - to:
+        - ipBlock:
+            cidr: 10.0.20.0/24
+      ports:
+        - protocol: TCP
+          port: 5432
+    # AWS API endpoints (SQS, Secrets Manager, KMS) via VPC endpoints — restricted to the VPC
+    # endpoint security group's CIDR range rather than the open internet.
+    - to:
+        - ipBlock:
+            cidr: 10.0.30.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+    # OTel Collector DaemonSet (traces/metrics export).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4317

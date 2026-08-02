@@ -1,0 +1,133 @@
+# CI: runs on every pull request and every push to main. Gate for merge — nothing in
+# docs/09-production-checklist.md's "Correctness/Security" sections is optional here; this
+# workflow is where those checklist items are actually enforced, not just documented.
+name: ci
+
+on:
+  pull_request:
+    paths:
+      - "services/payments-api/**"
+      - ".github/workflows/ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "services/payments-api/**"
+
+defaults:
+  run:
+    working-directory: services/payments-api
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: services/payments-api/go.sum
+      # go.sum is not committed by the environment that authored this repo (no module-proxy
+      # network access) — see the NOTE at the bottom of go.mod. `go mod tidy` here both
+      # regenerates it deterministically from go.mod and is the first real compile-time
+      # verification this code has had; a first green run should immediately commit the
+      # resulting go.sum so subsequent runs are fully reproducible/cached.
+      - run: go mod tidy
+      - run: gofmt -l . | tee /tmp/gofmt.out && test ! -s /tmp/gofmt.out
+      - run: go vet ./...
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1.3.1
+        with:
+          working-directory: services/payments-api
+          version: "2024.1"
+
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: services/payments-api/go.sum
+      - run: go mod tidy
+      - run: go test -race -coverprofile=coverage.out ./...
+      - name: enforce coverage floor
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "total coverage: ${total}%"
+          # 85% floor per docs/09-production-checklist.md; ledger-balance logic is covered by the
+          # DB-level trigger test in the integration suite, not counted here.
+          awk -v c="$total" 'BEGIN { exit !(c >= 85) }'
+
+  integration-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: payments_test
+          POSTGRES_PASSWORD: payments_test
+          POSTGRES_DB: payments_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U payments_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_DSN: postgres://payments_test:payments_test@localhost:5432/payments_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: services/payments-api/go.sum
+      - run: go mod tidy
+      - run: go test -race -tags=integration ./tests/integration/...
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: govulncheck (known-CVE dependency scan)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: gosec (SAST)
+        uses: securego/gosec@master
+        with:
+          args: "-fmt sarif -out gosec-results.sarif ./services/payments-api/..."
+      - name: upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec-results.sarif
+
+  build-image:
+    needs: [lint-and-vet, unit-test, integration-test, security-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build image (no push — CI validates buildability only)
+        uses: docker/build-push-action@v5
+        with:
+          context: services/payments-api
+          push: false
+          tags: payments-api:ci-${{ github.sha }}
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: payments-api:ci-${{ github.sha }}
+          severity: "CRITICAL,HIGH"
+          exit-code: "1" # fail the build on any critical/high CVE in the final image — the enforcement point for docs/09-production-checklist.md's image-scan gate

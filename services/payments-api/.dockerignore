@@ -1,0 +1,4 @@
+bin/
+*.md
+tests/
+.git

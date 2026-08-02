@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-api-config
+  namespace: payments
+data:
+  # Non-secret configuration only. DB DSN, JWKS URL secrets, and the AWS queue URL are injected
+  # via External Secrets (see externalsecret.yaml) — never placed here (docs/05-security-architecture.md).
+  ENV: "production"
+  SERVICE_NAME: "payments-api"
+  LOG_LEVEL: "info"
+  HTTP_PORT: "8080"
+  METRICS_PORT: "9090"
+  AWS_REGION: "us-east-1"
+  OUTBOX_POLL_INTERVAL: "200ms"
+  OUTBOX_BATCH_SIZE: "50"
+  OUTBOX_MAX_ATTEMPTS: "10"
+  RATE_LIMIT_PER_CLIENT_RPS: "50"
+  RATE_LIMIT_PER_CLIENT_BURST: "100"
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: "5"
+  CIRCUIT_BREAKER_OPEN_DURATION: "10s"
+  SHUTDOWN_GRACE_PERIOD: "25s"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"

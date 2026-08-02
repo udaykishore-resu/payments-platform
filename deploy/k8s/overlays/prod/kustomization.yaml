@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payments
+resources:
+  - namespace.yaml
+  - ../../base
+# Production intentionally makes no changes to replica/resource baselines set in base — base IS
+# the production-sized configuration (see docs/07-reliability-slo.md capacity planning). This
+# overlay exists so the CD pipeline (.github/workflows/cd.yml) has one canonical apply target per
+# environment and so production-only additions (e.g. a future PodMonitor, canary Argo Rollout)
+# have an obvious home that doesn't affect dev/staging.
+images:
+  - name: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/payments-api
+    newTag: REPLACED_BY_CI

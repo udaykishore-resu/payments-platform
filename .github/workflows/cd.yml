@@ -1,0 +1,124 @@
+# CD: builds and pushes the image once on merge to main, then progressively deploys it through
+# staging -> prod, gated by automated canary analysis at the prod step. Manual approval
+# ("environment: production" below) is the Release Manager's sign-off point referenced in
+# docs/09-production-checklist.md.
+name: cd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/payments-api/**"
+      - "deploy/k8s/**"
+
+permissions:
+  id-token: write # required for OIDC federation to the AWS deploy role — no static AWS keys in CI, mirroring docs/05-security-architecture.md's IRSA principle for the cluster itself
+  contents: read
+
+env:
+  ECR_REPOSITORY: payments-api
+  AWS_REGION: us-east-1
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::ACCOUNT_ID:role/github-actions-ci-deploy
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: services/payments-api
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:staging-latest
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::ACCOUNT_ID:role/github-actions-ci-deploy
+          aws-region: ${{ env.AWS_REGION }}
+      - name: point kubeconfig at staging cluster
+        run: aws eks update-kubeconfig --name payments-staging --region ${{ env.AWS_REGION }}
+      - uses: imranismail/setup-kustomize@v2
+      - name: set image tag and apply
+        working-directory: deploy/k8s/overlays/staging
+        run: |
+          kustomize edit set image ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/payments-api=ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
+          kustomize build . | kubectl apply -f -
+          kubectl -n payments-staging rollout status deployment/payments-api --timeout=5m
+      - name: smoke test staging
+        run: ./scripts/smoke-test.sh https://payments-api.staging.internal
+
+  deploy-prod:
+    needs: [build-and-push, deploy-staging]
+    runs-on: ubuntu-latest
+    # Requires a human reviewer to approve in the GitHub Environments UI before this job runs —
+    # the concrete implementation of the Release Manager sign-off gate in
+    # docs/09-production-checklist.md. Configure required reviewers on the "production"
+    # environment in repo settings.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::ACCOUNT_ID:role/github-actions-ci-deploy
+          aws-region: ${{ env.AWS_REGION }}
+      - name: point kubeconfig at prod cluster
+        run: aws eks update-kubeconfig --name payments-prod --region ${{ env.AWS_REGION }}
+      - uses: imranismail/setup-kustomize@v2
+
+      - name: canary — deploy to 10% of pods
+        working-directory: deploy/k8s/overlays/prod
+        run: |
+          kustomize edit set image ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/payments-api=ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
+          # Progressive delivery: this repo's baseline uses a plain RollingUpdate (see
+          # docs/09-production-checklist.md's canary-analysis requirement). A cluster with Argo
+          # Rollouts or Flagger installed replaces this step with a Rollout resource that shifts
+          # traffic 10% -> 50% -> 100% automatically, gated on the same error-rate/latency
+          # comparison this workflow does manually below. Documented here as the concrete next
+          # step rather than silently pretending the RollingUpdate strategy alone is canarying.
+          kustomize build . | kubectl apply -f -
+          kubectl -n payments rollout status deployment/payments-api --timeout=10m
+
+      - name: automated canary analysis
+        run: |
+          # Compares error rate and P99 latency for the new revision against the pre-deploy
+          # baseline over a bake window, querying Prometheus directly. Fails (non-zero exit) if
+          # the new revision's SLO burn rate exceeds docs/07-reliability-slo.md's fast-burn
+          # threshold — this is the automated half of "automated rollback on canary-analysis
+          # failure" from docs/09-production-checklist.md.
+          ./scripts/canary-analysis.sh \
+            --prometheus-url "$PROMETHEUS_URL" \
+            --deployment payments-api \
+            --namespace payments \
+            --bake-seconds 300 \
+            --max-error-rate 0.01 \
+            --max-p99-ms 600
+        env:
+          PROMETHEUS_URL: ${{ secrets.PROMETHEUS_URL }}
+
+      - name: rollback on canary failure
+        if: failure()
+        run: |
+          kubectl -n payments rollout undo deployment/payments-api
+          kubectl -n payments rollout status deployment/payments-api --timeout=5m
+          echo "::error::Canary analysis failed — automatically rolled back. See docs/08-runbook.md section 8."
+
+      - name: post-deploy smoke test
+        run: ./scripts/smoke-test.sh https://payments-api.internal
