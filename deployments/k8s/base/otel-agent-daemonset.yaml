@@ -1,0 +1,260 @@
+# otel-agent — one per node.
+#
+# Node-local means a pod never blocks on a network hop to a remote collector, and
+# a gateway rollout does not drop spans. The agent enriches with Kubernetes
+# metadata, redacts, batches and then routes to the gateway BY TRACE-ID HASH —
+# without that routing, tail sampling sees partial traces and its decisions are
+# wrong (observability.md §2.2).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-agent
+  namespace: pp-observability
+  labels:
+    app.kubernetes.io/name: otel-agent
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      k8sattributes:
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.node.name
+            - k8s.deployment.name
+      # Redaction happens at the FIRST hop, not at the gateway: a span that
+      # leaves the node carrying an Authorization header has already crossed a
+      # trust boundary, and the archive keeps it for 30 days.
+      attributes/redact:
+        actions:
+          - key: http.request.header.authorization
+            action: delete
+          - key: http.request.header.idempotency-key
+            action: hash
+          - key: db.statement
+            action: delete          # db.operation + db.sql.table are emitted instead
+          - key: pp.gateway.credential_ref
+            action: delete
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 20
+      batch:
+        timeout: 2s
+        send_batch_size: 1024
+        send_batch_max_size: 2048
+    exporters:
+      loadbalancing:
+        routing_key: traceID
+        protocol:
+          otlp:
+            tls:
+              insecure: false
+        resolver:
+          k8s:
+            service: otel-gateway.pp-observability.svc.cluster.local
+    service:
+      telemetry:
+        metrics:
+          address: 0.0.0.0:9090
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, attributes/redact, batch]
+          exporters: [loadbalancing]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, batch]
+          exporters: [loadbalancing]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-agent
+  namespace: pp-observability
+  labels:
+    app: otel-agent
+    app.kubernetes.io/name: otel-agent
+    app.kubernetes.io/part-of: payments-platform
+    pp.plane: observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app: otel-agent
+        app.kubernetes.io/name: otel-agent
+        pp.plane: observability
+      annotations:
+        checksum/config: "replaced-by-kustomize-configmapgenerator"
+    spec:
+      # Platform-critical, not observability priority: this is a DaemonSet whose
+      # eviction frees no schedulable capacity anyway, and losing it blinds every
+      # pod on the node at once.
+      priorityClassName: pp-platform-critical
+      serviceAccountName: otel-collector
+      automountServiceAccountToken: true   # k8sattributes reads the Kubernetes API
+      # It runs everywhere, including on the tainted data nodes it must observe.
+      tolerations:
+        - key: pp.plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      hostNetwork: false                   # keeps IMDS unreachable from this pod
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-agent
+          image: otel/opentelemetry-collector-contrib@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              # hostPort so the SDK can reach its own node's agent at
+              # status.hostIP without a Service lookup on the hot path.
+              hostPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              hostPort: 4318
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: otel-agent
+                  resource: limits.memory
+                  divisor: "1"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # No CPU limit: a throttled agent applies backpressure to the OTLP
+              # receiver, which applies backpressure to the exporting service —
+              # on the money path. Memory is limited because memory_limiter needs
+              # a ceiling to compute 75% of.
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /
+              port: 13133
+            periodSeconds: 2
+            failureThreshold: 15
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            # TCP accept on the OTLP receiver, not the health endpoint: the agent
+            # must stay alive while the gateway is unavailable, buffering rather
+            # than restarting. Restarting it would drop the buffer it exists to
+            # hold.
+            tcpSocket:
+              port: otlp-grpc
+            periodSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: otel-agent
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-agent
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-agent
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # OTLP from any workload on this node, and from the other pp-* namespaces.
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: pp.plane
+                operator: In
+                values: [data, control, automation, observability, platform]
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-gateway
+      ports:
+        - protocol: TCP
+          port: 4317
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

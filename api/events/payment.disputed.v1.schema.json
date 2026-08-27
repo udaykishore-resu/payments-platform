@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.disputed.v1.json",
+  "title": "payment.disputed.v1",
+  "description": "A dispute was opened, advanced or resolved against a payment. Published by Ledger & Reconciliation (BC-8) on pp.payments.payment.v1, keyed by payment_id, because disputes arrive from gateway webhooks and settlement reports rather than being decided by the orchestrator. A dispute is NOT a refund and deliberately does not share its shape: a refund is a merchant decision, a dispute is imposed on the merchant, and conflating them makes chargeback ratios unmeasurable.",
+  "type": "object",
+  "required": ["disputeId", "gatewayCode", "disputedAmount", "reasonCode", "stage", "openedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "disputeId": {
+      "description": "The gateway's dispute reference.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "disputedAmount": { "$ref": "#/$defs/money" },
+    "reasonCode": {
+      "description": "Normalized reason. Scheme reason codes differ per network and per gateway; mapping them here is the anti-corruption layer's job so that risk models are not written against a single scheme's vocabulary.",
+      "type": "string",
+      "enum": [
+        "FRAUDULENT",
+        "PRODUCT_NOT_RECEIVED",
+        "DUPLICATE_PROCESSING",
+        "CREDIT_NOT_PROCESSED",
+        "SUBSCRIPTION_CANCELED",
+        "OTHER"
+      ]
+    },
+    "stage": {
+      "description": "How far the dispute has escalated. Each stage has different evidence deadlines and different cost.",
+      "type": "string",
+      "enum": ["INQUIRY", "CHARGEBACK", "PRE_ARBITRATION", "ARBITRATION"]
+    },
+    "outcome": {
+      "description": "Absent while the dispute is open. LOST reverses funds and moves the payment to REFUNDED; WON restores them.",
+      "type": "string",
+      "enum": ["WON", "LOST", "ACCEPTED"]
+    },
+    "evidenceDueBy": {
+      "description": "The deadline for submitting evidence. Missing it loses the dispute by default, so this drives merchant notification urgency.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "openedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer", "minimum": 1 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "event-consumer",
+  "x-context": "BC-8 Ledger & Reconciliation",
+  "x-consumers": ["Ledger", "Risk", "Notification"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "reasonCode": "route-to-dlq", "stage": "route-to-dlq", "outcome": "route-to-dlq" },
+  "examples": [
+    {
+      "disputeId": "dp_1Oq8yM3fAwLZ",
+      "gatewayCode": "stripe",
+      "disputedAmount": { "amount": 600, "currency": "USD" },
+      "reasonCode": "FRAUDULENT",
+      "stage": "CHARGEBACK",
+      "evidenceDueBy": "2026-09-12T23:59:59.000Z",
+      "openedAt": "2026-08-30T08:00:00.000Z"
+    },
+    {
+      "disputeId": "dp_1Oq8yM3fAwLZ",
+      "gatewayCode": "stripe",
+      "disputedAmount": { "amount": 600, "currency": "USD" },
+      "reasonCode": "FRAUDULENT",
+      "stage": "CHARGEBACK",
+      "outcome": "WON",
+      "openedAt": "2026-08-30T08:00:00.000Z"
+    }
+  ]
+}

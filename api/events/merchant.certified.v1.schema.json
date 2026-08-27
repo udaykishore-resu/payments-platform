@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.certified.v1.json",
+  "title": "merchant.certified.v1",
+  "description": "A certification run completed and produced a signed, immutable report. Published by Onboarding (BC-3) on pp.merchants.merchant.v1, keyed by merchant_id. Certification is a machine-checked matrix, not a checkbox: for every (gateway, payment method, currency) the merchant enabled, all seven assertions must pass. assertionsPassed == assertionsTotal is the only definition of a pass, and there is no waiver field anywhere in this payload - a waiver is the mechanism by which 'certified' degrades into an opinion.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "reportId",
+    "environment",
+    "suiteVersion",
+    "matrix",
+    "assertionsPassed",
+    "assertionsTotal",
+    "artifactUri",
+    "artifactSha256",
+    "certifiedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "reportId": {
+      "description": "The sealed report. Immutable once PASSED or FAILED; a re-certification is a new report, never an edit.",
+      "type": "string",
+      "maxLength": 64
+    },
+    "environment": {
+      "description": "A sandbox report never certifies a production connection.",
+      "type": "string",
+      "enum": ["SANDBOX", "PRODUCTION"]
+    },
+    "suiteVersion": {
+      "description": "Version of the certification suite. Carried so a suite regression can be scoped to the reports it produced.",
+      "type": "string",
+      "maxLength": 64
+    },
+    "matrix": {
+      "description": "One entry per (gateway, payment method, currency) cell.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/matrixCell" }
+    },
+    "assertionsPassed": { "type": "integer", "minimum": 0 },
+    "assertionsTotal": { "type": "integer", "minimum": 1 },
+    "artifactUri": {
+      "description": "Signed, immutable report in object storage under Object Lock.",
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048
+    },
+    "artifactSha256": {
+      "description": "Digest of the stored object. A mismatch invalidates the report; a consumer must reject rather than trust.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "certifiedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "matrixCell": {
+      "title": "Certification matrix cell",
+      "type": "object",
+      "required": ["gatewayCode", "paymentMethod", "currency", "passed"],
+      "additionalProperties": false,
+      "properties": {
+        "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+        "paymentMethod": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,31}$" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "passed": {
+          "description": "True only when all seven assertions passed for this cell. There is no partial pass.",
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "workflow-worker",
+  "x-context": "BC-3 Onboarding",
+  "x-consumers": ["Onboarding", "Audit"],
+  "x-revision": 1,
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "reportId": "rpt_01JB8ZAAAAAAAAAAAAAAAAAAAA",
+      "environment": "PRODUCTION",
+      "suiteVersion": "cert-suite@2.4.0",
+      "matrix": [
+        { "gatewayCode": "adyen", "paymentMethod": "CARD", "currency": "EUR", "passed": true },
+        { "gatewayCode": "adyen", "paymentMethod": "IDEAL", "currency": "EUR", "passed": true }
+      ],
+      "assertionsPassed": 14,
+      "assertionsTotal": 14,
+      "artifactUri": "s3://pp-cert-eu/ten_01JB8Z00000000000000000000/rpt_01JB8ZAAAAAAAAAAAAAAAAAAAA.json",
+      "artifactSha256": "9f2ce41b7a3d5c8e0b1f4a6d2c9e7b0a3f5d8c1e4b7a0d3f6c9e2b5a8d1f4c7e",
+      "certifiedAt": "2026-08-27T18:44:31.004Z"
+    }
+  ]
+}

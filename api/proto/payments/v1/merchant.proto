@@ -1,0 +1,482 @@
+// Merchant Registry (BC-2) internal interface.
+//
+// This is the control-plane read the data plane depends on, plus the small set of
+// writes the automation plane is allowed to request. It is NOT the public merchant API
+// - that is REST, in api/openapi/payments-platform.v1.yaml.
+//
+// The data plane calls GetMerchantContext on its cache-miss path only. It must never
+// take a synchronous dependency on this service for a payment: the cache is warmed by
+// events, tolerates 30 s of staleness, and fails static rather than open.
+syntax = "proto3";
+
+package payments.v1;
+
+import "google/protobuf/timestamp.proto";
+import "payments/v1/common.proto";
+
+option go_package = "github.com/udaykishore-resu/payments-platform/api/proto/payments/v1;paymentsv1";
+option java_multiple_files = true;
+option java_package = "com.example.payments.v1";
+option java_outer_classname = "MerchantProto";
+option csharp_namespace = "Example.Payments.V1";
+
+// The 20 states of the merchant lifecycle. Transitions absent from the transition
+// table are rejected with INVALID_STATE_TRANSITION; nothing is ever coerced.
+//
+// MERCHANT_STATUS_COMPLIANCE_REJECTED exists so a compliance officer's rejection at the
+// manual gate is representable. Without it the workflow would have to either lie
+// (blaming the integration for a policy decision) or hang. It is non-terminal and
+// routes back to CONFIGURING or KYC_PENDING, or forward to TERMINATED.
+enum MerchantStatus {
+  MERCHANT_STATUS_UNSPECIFIED = 0;
+  MERCHANT_STATUS_CREATED = 1;
+  MERCHANT_STATUS_VALIDATING = 2;
+  MERCHANT_STATUS_VALIDATION_FAILED = 3;
+  MERCHANT_STATUS_KYC_PENDING = 4;
+  MERCHANT_STATUS_KYC_APPROVED = 5;
+  MERCHANT_STATUS_KYC_FAILED = 6;
+  MERCHANT_STATUS_BANK_VALIDATED = 7;
+  MERCHANT_STATUS_BANK_VALIDATION_FAILED = 8;
+  MERCHANT_STATUS_GATEWAY_PROVISIONING = 9;
+  MERCHANT_STATUS_PROVISIONING_FAILED = 10;
+  MERCHANT_STATUS_CONFIGURING = 11;
+  MERCHANT_STATUS_CONFIGURATION_FAILED = 12;
+  MERCHANT_STATUS_SANDBOX_VALIDATION = 13;
+  MERCHANT_STATUS_CERTIFICATION = 14;
+  MERCHANT_STATUS_CERTIFICATION_FAILED = 15;
+  MERCHANT_STATUS_COMPLIANCE_REJECTED = 16;
+  MERCHANT_STATUS_APPROVED = 17;
+  MERCHANT_STATUS_PRODUCTION_READY = 18;
+  MERCHANT_STATUS_ACTIVE = 19;
+  MERCHANT_STATUS_SUSPENDED = 20;
+  MERCHANT_STATUS_TERMINATED = 21;
+}
+
+// Legal form of the merchant entity. Drives KYB evidence requirements.
+enum EntityType {
+  ENTITY_TYPE_UNSPECIFIED = 0;
+  ENTITY_TYPE_SOLE_TRADER = 1;
+  ENTITY_TYPE_PARTNERSHIP = 2;
+  ENTITY_TYPE_PRIVATE_LIMITED = 3;
+  ENTITY_TYPE_PUBLIC_LIMITED = 4;
+  ENTITY_TYPE_NON_PROFIT = 5;
+  ENTITY_TYPE_TRUST = 6;
+  ENTITY_TYPE_GOVERNMENT = 7;
+}
+
+// Payment scheme a bank account settles over.
+enum BankAccountScheme {
+  BANK_ACCOUNT_SCHEME_UNSPECIFIED = 0;
+  BANK_ACCOUNT_SCHEME_SEPA = 1;
+  BANK_ACCOUNT_SCHEME_ACH = 2;
+  BANK_ACCOUNT_SCHEME_FPS = 3;
+  BANK_ACCOUNT_SCHEME_SWIFT = 4;
+}
+
+// Outcome of the bank validation port for one account.
+enum BankValidationState {
+  BANK_VALIDATION_STATE_UNSPECIFIED = 0;
+  BANK_VALIDATION_STATE_UNVALIDATED = 1;
+  BANK_VALIDATION_STATE_VALIDATING = 2;
+  BANK_VALIDATION_STATE_VALIDATED = 3;
+  BANK_VALIDATION_STATE_FAILED = 4;
+}
+
+// Confirmation-of-payee outcome. NONE does not automatically fail onboarding but does
+// require a recorded operator decision.
+enum NameMatch {
+  NAME_MATCH_UNSPECIFIED = 0;
+  NAME_MATCH_EXACT = 1;
+  NAME_MATCH_CLOSE = 2;
+  NAME_MATCH_NONE = 3;
+}
+
+// Role a principal holds in the merchant entity.
+enum PrincipalRole {
+  PRINCIPAL_ROLE_UNSPECIFIED = 0;
+  PRINCIPAL_ROLE_DIRECTOR = 1;
+  PRINCIPAL_ROLE_OFFICER = 2;
+  PRINCIPAL_ROLE_SHAREHOLDER = 3;
+  PRINCIPAL_ROLE_TRUSTEE = 4;
+  PRINCIPAL_ROLE_AUTHORIZED_SIGNATORY = 5;
+}
+
+// Per-principal KYC outcome as reported by the vendor.
+enum VerificationState {
+  VERIFICATION_STATE_UNSPECIFIED = 0;
+  VERIFICATION_STATE_UNVERIFIED = 1;
+  VERIFICATION_STATE_PENDING = 2;
+  VERIFICATION_STATE_VERIFIED = 3;
+  VERIFICATION_STATE_FAILED = 4;
+  VERIFICATION_STATE_REVIEW = 5;
+}
+
+// Why a merchant was suspended. Carried into merchant.suspended.v1 so the data plane
+// cache can prioritise the invalidation.
+enum SuspensionReason {
+  SUSPENSION_REASON_UNSPECIFIED = 0;
+  SUSPENSION_REASON_RISK_BREACH = 1;
+  SUSPENSION_REASON_COMPLIANCE_EXPIRY = 2;
+  SUSPENSION_REASON_GATEWAY_DEPROVISIONED = 3;
+  SUSPENSION_REASON_OPERATOR_ACTION = 4;
+  SUSPENSION_REASON_TENANT_SUSPENDED = 5;
+}
+
+// The merchant's legal identity as declared at signup and verified during KYB.
+message BusinessProfile {
+  // Registered legal name, exactly as on the incorporation record.
+  string legal_name = 1;
+  // Trading or "doing business as" name, when it differs.
+  string trading_name = 2;
+  // Legal form of the entity.
+  EntityType entity_type = 3;
+  // Company registration number in the incorporation country's registry.
+  string registration_number = 4;
+  // VAT or tax identification number.
+  string tax_id = 5;
+  // ISO 3166-1 alpha-2 country of incorporation.
+  string incorporation_country = 6;
+  // ISO 18245 merchant category code, four digits. Drives risk policy, gateway
+  // eligibility and prohibited-category checks.
+  string mcc = 7;
+  // Self-declared expected monthly processing volume. A risk and gateway-selection
+  // input, and the baseline against which volume anomalies are measured.
+  Money declared_monthly_volume = 8;
+  // Primary customer-facing website. Reachability is a WARNING-severity L2 rule, not a
+  // blocker.
+  string website_url = 9;
+  // Merchant support contact, surfaced to payers on statements and in disputes.
+  string support_email = 10;
+  string support_phone = 11;
+
+  reserved 12 to 19;
+}
+
+// A settlement destination.
+//
+// The full account number is never carried on this message. It is submitted once
+// through the write path, validated through the bank validation port, and discarded.
+// Only the masked last four survive.
+message BankAccount {
+  // `ba_` + ULID.
+  string id = 1;
+  // Last four digits only, e.g. "****4471". There is no field anywhere in this
+  // interface that carries a full account number - not redacted, absent.
+  string masked_account = 2;
+  // Account holder name as held by the bank.
+  string holder_name = 3;
+  // ISO 3166-1 alpha-2.
+  string country = 4;
+  // ISO 4217 settlement currency.
+  string currency = 5;
+  BankAccountScheme scheme = 6;
+  // Exactly one primary account per settlement currency.
+  bool is_primary = 7;
+  BankValidationState validation_state = 8;
+  NameMatch name_match = 9;
+  google.protobuf.Timestamp validated_at = 10;
+
+  reserved 11 to 15;
+}
+
+// A director, officer or ultimate beneficial owner.
+//
+// KYC evidence is never carried here - only the vendor's case reference. The evidence
+// itself lives in Object-Locked storage under the tenant's residency region and is
+// retained at least five years under the AML legal-obligation basis.
+message Principal {
+  // `prn_` + ULID.
+  string id = 1;
+  string first_name = 2;
+  string last_name = 3;
+  PrincipalRole role = 4;
+  // At least one UBO must exist before the merchant may enter KYC_PENDING.
+  bool is_ubo = 5;
+  // Beneficial ownership share, 0-100. The sum across UBOs may not exceed 100.
+  double ownership_percentage = 6;
+  // ISO 3166-1 alpha-2 country of residence.
+  string country = 7;
+  VerificationState verification_state = 8;
+  // The KYC vendor's case reference. A pointer, never the decision evidence and never
+  // personal data.
+  string kyc_reference = 9;
+  // Politically exposed person flag. True requires a recorded enhanced-due-diligence
+  // decision before onboarding proceeds.
+  bool is_pep = 10;
+
+  reserved 11 to 15;
+  reserved "date_of_birth";
+}
+
+// The merchant aggregate as the control plane holds it.
+message Merchant {
+  // `mrc_` + ULID, unique within the tenant.
+  string id = 1;
+  // `ten_` + ULID.
+  string tenant_id = 2;
+  // The tenant's own identifier for this merchant, unique within the tenant.
+  string external_reference = 3;
+  string display_name = 4;
+  MerchantStatus status = 5;
+  // Why the merchant is in its current state. Carries the reviewer's reason code for
+  // COMPLIANCE_REJECTED.
+  string status_reason = 6;
+  // Where this merchant's personal data may live. The routing engine will not select a
+  // gateway whose region violates it.
+  string residency_region = 7;
+  BusinessProfile business_profile = 8;
+  // Bounded at 20 by aggregate invariant, so the whole merchant loads in one round trip.
+  repeated BankAccount bank_accounts = 9;
+  // Bounded at 25 by aggregate invariant.
+  repeated Principal principals = 10;
+  // The passing certification report backing production readiness. PRODUCTION_READY is
+  // unreachable without one.
+  string certification_report_id = 11;
+  // Version number of the currently active configuration document.
+  int32 active_configuration_version = 12;
+  google.protobuf.Timestamp activated_at = 13;
+  google.protobuf.Timestamp suspended_at = 14;
+  google.protobuf.Timestamp terminated_at = 15;
+  // Optimistic concurrency version. The merchant row is the concurrency point for all
+  // child mutations: adding a bank account bumps this, so a concurrent status
+  // transition loses and retries.
+  int64 version = 16;
+  google.protobuf.Timestamp created_at = 17;
+  google.protobuf.Timestamp updated_at = 18;
+
+  reserved 19 to 29;
+}
+
+// The minimal merchant projection the data plane needs to admit a payment.
+//
+// Deliberately narrow: it carries what the payment pipeline actually branches on and
+// nothing else. A fat context would make every merchant field change a data-plane
+// deployment concern.
+message MerchantContext {
+  string merchant_id = 1;
+  string tenant_id = 2;
+  MerchantStatus status = 3;
+  // Currencies this merchant may transact in, from the active configuration.
+  repeated string supported_currencies = 4;
+  // Payment methods this merchant may transact with, from the active configuration.
+  repeated string supported_payment_methods = 5;
+  // Payer countries this merchant may accept from.
+  repeated string supported_countries = 6;
+  // Certified connections the router may select.
+  repeated CertifiedConnection certified_connections = 7;
+  // Active configuration version this projection was built from.
+  int32 configuration_version = 8;
+  // Residency region, enforced by routing.
+  string residency_region = 9;
+  // True while the merchant may create NEW payments. False for SUSPENDED merchants,
+  // which still accept refunds, voids and webhook processing - you must always be able
+  // to give money back.
+  bool accepts_new_payments = 10;
+  // How stale this projection is. Emitted on every attempt as config_snapshot_age_ms,
+  // which is the field that makes a staleness incident diagnosable after the fact.
+  int64 snapshot_age_ms = 11;
+  // When the projection was built.
+  google.protobuf.Timestamp snapshot_at = 12;
+
+  reserved 13 to 19;
+}
+
+// One gateway connection the data plane is allowed to route to.
+message CertifiedConnection {
+  // `gwc_` + ULID.
+  string connection_id = 1;
+  // `gw_` + ULID.
+  string gateway_id = 2;
+  // Stable gateway code, e.g. "stripe".
+  string gateway_code = 3;
+  Environment environment = 4;
+  google.protobuf.Timestamp certified_at = 5;
+}
+
+// Request for one merchant by identifier.
+message GetMerchantRequest {
+  TenantContext context = 1;
+  // `mrc_` + ULID.
+  string merchant_id = 2;
+}
+
+// One merchant.
+message GetMerchantResponse {
+  Merchant merchant = 1;
+}
+
+// Fetch several merchants in one round trip. Used by the console and by batch jobs;
+// never on the payment hot path.
+message BatchGetMerchantsRequest {
+  TenantContext context = 1;
+  // At most 200 identifiers. All must belong to the caller's tenant.
+  repeated string merchant_ids = 2;
+}
+
+// Merchants found. Identifiers that do not resolve within the tenant are reported in
+// `missing_merchant_ids` rather than failing the whole batch - a partial answer is more
+// useful than none, and a missing identifier is indistinguishable from another
+// tenant's by design.
+message BatchGetMerchantsResponse {
+  repeated Merchant merchants = 1;
+  repeated string missing_merchant_ids = 2;
+}
+
+// Cursor-paginated merchant listing.
+message ListMerchantsRequest {
+  TenantContext context = 1;
+  PageRequest page = 2;
+  // Optional status filter. Empty means all states.
+  repeated MerchantStatus statuses = 3;
+  // Optional exact-match filter on the tenant's own identifier.
+  string external_reference = 4;
+}
+
+// A page of merchants.
+message ListMerchantsResponse {
+  repeated Merchant merchants = 1;
+  PageResponse page = 2;
+}
+
+// Request for the data plane's merchant projection.
+message GetMerchantContextRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  // Maximum staleness the caller will accept, in milliseconds. Zero means the caller
+  // accepts the server's default bound (30 s). A caller that needs a fresher answer
+  // than the server can produce gets an error, not a silently stale one.
+  int64 max_staleness_ms = 3;
+}
+
+// The projection.
+message GetMerchantContextResponse {
+  MerchantContext merchant_context = 1;
+}
+
+// Warm-start payload for a data-plane cache, keyed by tenant.
+message ListMerchantContextsRequest {
+  TenantContext context = 1;
+  PageRequest page = 2;
+  // Only merchants in these states. Defaults to ACTIVE and SUSPENDED, which is the set
+  // the data plane can do anything with.
+  repeated MerchantStatus statuses = 3;
+}
+
+// A page of projections.
+message ListMerchantContextsResponse {
+  repeated MerchantContext merchant_contexts = 1;
+  PageResponse page = 2;
+}
+
+// Request a merchant lifecycle transition.
+//
+// The caller REQUESTS; the merchant aggregate DECIDES. Guards are evaluated inside the
+// aggregate, which is what stops the automation plane from bypassing the FSM.
+message TransitionMerchantStatusRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  // Target state. Must be reachable from the current state.
+  MerchantStatus target_status = 3;
+  // Why. Recorded on the merchant and in the audit trail.
+  string reason = 4;
+  // Machine-readable reason code, where one applies.
+  string reason_code = 5;
+  // Optimistic concurrency. A stale version loses and the caller retries.
+  Precondition precondition = 6;
+  // Required: every transition is an unsafe operation.
+  IdempotencyOptions idempotency = 7;
+}
+
+// The merchant after the transition.
+message TransitionMerchantStatusResponse {
+  Merchant merchant = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Suspend a merchant. Available to operators and to the automation plane (risk breach,
+// compliance expiry, gateway de-provisioning).
+message SuspendMerchantRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  SuspensionReason reason = 3;
+  string reason_detail = 4;
+  Precondition precondition = 5;
+  IdempotencyOptions idempotency = 6;
+}
+
+// The suspended merchant.
+message SuspendMerchantResponse {
+  Merchant merchant = 1;
+  // Always true. Suspension rejects new payments but permits refunds, voids and
+  // webhook processing. Stated explicitly so no caller has to remember the rule.
+  bool permits_refunds = 2;
+  IdempotencyResult idempotency = 3;
+}
+
+// Resume a suspended merchant.
+message ResumeMerchantRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  string reason = 3;
+  Precondition precondition = 4;
+  IdempotencyOptions idempotency = 5;
+}
+
+// The resumed merchant.
+message ResumeMerchantResponse {
+  Merchant merchant = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Attach a passing certification report to the merchant.
+message AttachCertificationReportRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  // Identifier of a PASSED report for the target environment. A sandbox report never
+  // certifies a production merchant.
+  string certification_report_id = 3;
+  Precondition precondition = 4;
+  IdempotencyOptions idempotency = 5;
+}
+
+// The merchant with the report attached.
+message AttachCertificationReportResponse {
+  Merchant merchant = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Merchant Registry (BC-2).
+//
+// Reads are safe and cacheable. Writes are the narrow set the automation plane needs;
+// everything a human does goes through the REST control plane so it passes the same
+// authorization, dual-control and audit path.
+service MerchantService {
+  // Fetch one merchant with its business profile, bank accounts and principals.
+  rpc GetMerchant(GetMerchantRequest) returns (GetMerchantResponse);
+
+  // Fetch several merchants in one round trip. Not for the payment hot path.
+  rpc BatchGetMerchants(BatchGetMerchantsRequest) returns (BatchGetMerchantsResponse);
+
+  // Cursor-paginated listing within the caller's tenant.
+  rpc ListMerchants(ListMerchantsRequest) returns (ListMerchantsResponse);
+
+  // The narrow projection the data plane needs to admit a payment. Called only on a
+  // cache miss; the steady-state path is served from the event-warmed local cache.
+  rpc GetMerchantContext(GetMerchantContextRequest) returns (GetMerchantContextResponse);
+
+  // Bulk projections for warming a cold data-plane cache after a deploy or a restart.
+  rpc ListMerchantContexts(ListMerchantContextsRequest) returns (ListMerchantContextsResponse);
+
+  // Request a lifecycle transition. Guards are enforced by the aggregate; an illegal
+  // transition is FAILED_PRECONDITION / INVALID_STATE_TRANSITION.
+  rpc TransitionMerchantStatus(TransitionMerchantStatusRequest) returns (TransitionMerchantStatusResponse);
+
+  // Suspend a merchant. Rejects new payments; refunds and voids continue.
+  rpc SuspendMerchant(SuspendMerchantRequest) returns (SuspendMerchantResponse);
+
+  // Resume a suspended merchant.
+  rpc ResumeMerchant(ResumeMerchantRequest) returns (ResumeMerchantResponse);
+
+  // Attach a passing certification report. Workflow activity callback for step 10.
+  rpc AttachCertificationReport(AttachCertificationReportRequest) returns (AttachCertificationReportResponse);
+}

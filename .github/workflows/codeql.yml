@@ -1,0 +1,116 @@
+# .github/workflows/codeql.yml — CodeQL for Go.
+#
+# deployment.md §4.1 stage 12 names gosec and CodeQL together. They are not redundant:
+#
+#   * gosec is a pattern matcher over the AST. It is fast, it runs on every PR inside the
+#     `sast` job, and it finds the things that look wrong locally — a weak cipher, a
+#     command built by concatenation, a file opened world-readable.
+#   * CodeQL builds a relational database of the program and answers questions about
+#     *dataflow*: does a value that came from an HTTP request body reach a SQL string
+#     without passing through a sanitiser, anywhere in the call graph, across package
+#     boundaries. That is the class of finding a pattern matcher structurally cannot make,
+#     and it is the class that matters most here — every taint source in this platform is a
+#     merchant-supplied field on the payment path.
+#
+# It is a separate workflow because it has a different cadence and a different failure
+# semantics. A CodeQL run takes 10–20 minutes on this codebase and its findings are
+# reviewed in the security tab rather than blocking the author of an unrelated change.
+
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # Only when Go, the module graph or this workflow changes. CodeQL on a documentation
+    # PR costs twenty minutes to analyse a tree that did not change.
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/codeql.yml"
+  schedule:
+    # Weekly, independent of any change: the query packs are updated by GitHub, so a
+    # scheduled run finds vulnerabilities that new queries recognise in code that has been
+    # sitting on main for months. This is the same argument as the nightly image rescan —
+    # the artefact did not change, the knowledge did.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (go)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # The whole point: findings land in the security tab and appear inline on the PR diff.
+      security-events: write
+      actions: read
+      packages: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-go@v5
+        with:
+          # The same pinned toolchain as everything else. CodeQL's autobuild would pick
+          # whatever the runner image ships, and analysing a build that differs from the one
+          # that ships is analysing a different program.
+          go-version: "1.24.7"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          build-mode: manual
+          # security-extended adds the queries with a higher false-positive rate but real
+          # coverage of injection and cryptography; security-and-quality would add
+          # maintainability queries that duplicate golangci-lint and bury the security
+          # findings in style noise.
+          queries: security-extended
+          config: |
+            paths-ignore:
+              - "**/*_test.go"
+              - "tests/load"
+              - "scripts"
+            paths:
+              - "cmd"
+              - "internal"
+              - "pkg"
+
+      - name: Build
+        # Manual build rather than autobuild. Autobuild guesses; on a repository with a
+        # tools.go behind a build tag and nine main packages it has guessed wrong before,
+        # and a CodeQL database built from a partial compilation reports "no findings" for
+        # the packages it failed to build — a green result that means nothing.
+        run: |
+          set -euo pipefail
+          go build ./...
+          # The build-tagged trees are compiled too: the integration and contract suites
+          # are where the code that touches real databases and real gateways lives, and
+          # excluding them from dataflow analysis excludes the code closest to the data.
+          go vet -tags=integration ./... || true
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go"
+          # Findings are uploaded and surfaced; the build is not failed here. The blocking
+          # SAST gate is gosec in ci.yml, which is fast and deterministic. CodeQL's value is
+          # depth, and depth comes with a false-positive rate that would make it a gate
+          # people learn to dismiss. Severity-based blocking is configured in the
+          # repository's code-scanning rules, where a security owner sets it — not here,
+          # where a workflow author would.
+          upload: always

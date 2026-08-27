@@ -1,0 +1,146 @@
+# Recording rules. Two conventions worth stating because both are load-bearing:
+#
+#   1. clamp_min(x, 1e-9) on every rate used as a denominator. A zero-traffic
+#      window must yield 0, not NaN, or every burn-rate alert flaps at 03:00
+#      on a Sunday and the team learns to ignore it.
+#   2. `offset 1h` on the authorization baseline. An alert whose threshold is
+#      computed from data that includes the incident silences itself precisely
+#      when it matters.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pp-recording-rules
+  namespace: pp-observability
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+    prometheus: pp
+    role: recording-rules
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  groups:
+    - name: pp.sli.availability
+      interval: 30s
+      rules:
+        # The availability SLI. The denominator excludes nothing on purpose here
+        # and the numerator counts only 5xx: a client sending a malformed body is
+        # a 4xx and is not us being unavailable.
+        - record: pp:payment_api_requests:rate5m
+          expr: sum(rate(pp_http_requests_total{service="payment-api",route=~"/v1/payments.*"}[5m]))
+        - record: pp:payment_api_errors:rate5m
+          expr: sum(rate(pp_http_requests_total{service="payment-api",route=~"/v1/payments.*",status="5xx"}[5m]))
+        - record: pp:payment_api_availability:ratio_rate5m
+          expr: 1 - (pp:payment_api_errors:rate5m / clamp_min(pp:payment_api_requests:rate5m, 1e-9))
+        # The same ratio at every burn-rate window, RECORDED rather than computed
+        # at alert time: a 6h rate() across 120 payment-api pods is not something
+        # to evaluate every 15 seconds.
+        #
+        # clamp_min(x, 1e-9) on every denominator: a zero-traffic window must
+        # yield 0, not NaN, or every burn-rate alert flaps at 03:00 on a Sunday.
+        - record: pp:payment_api_error:ratio_rate5m
+          expr: |
+            sum(rate(pp_http_requests_total{service="payment-api",status="5xx"}[5m]))
+            / clamp_min(sum(rate(pp_http_requests_total{service="payment-api"}[5m])), 1e-9)
+        - record: pp:payment_api_error:ratio_rate30m
+          expr: |
+            sum(rate(pp_http_requests_total{service="payment-api",status="5xx"}[30m]))
+            / clamp_min(sum(rate(pp_http_requests_total{service="payment-api"}[30m])), 1e-9)
+        - record: pp:payment_api_error:ratio_rate1h
+          expr: |
+            sum(rate(pp_http_requests_total{service="payment-api",status="5xx"}[1h]))
+            / clamp_min(sum(rate(pp_http_requests_total{service="payment-api"}[1h])), 1e-9)
+        - record: pp:payment_api_error:ratio_rate6h
+          expr: |
+            sum(rate(pp_http_requests_total{service="payment-api",status="5xx"}[6h]))
+            / clamp_min(sum(rate(pp_http_requests_total{service="payment-api"}[6h])), 1e-9)
+        - record: pp:payment_api_error:ratio_rate3d
+          expr: |
+            sum(rate(pp_http_requests_total{service="payment-api",status="5xx"}[3d]))
+            / clamp_min(sum(rate(pp_http_requests_total{service="payment-api"}[3d])), 1e-9)
+        - record: pp:control_plane_error:ratio_rate5m
+          expr: |
+            sum(rate(pp_http_requests_total{service="control-plane-api",status="5xx"}[5m]))
+            / clamp_min(sum(rate(pp_http_requests_total{service="control-plane-api"}[5m])), 1e-9)
+        - record: pp:control_plane_error:ratio_rate1h
+          expr: |
+            sum(rate(pp_http_requests_total{service="control-plane-api",status="5xx"}[1h]))
+            / clamp_min(sum(rate(pp_http_requests_total{service="control-plane-api"}[1h])), 1e-9)
+
+    - name: pp.sli.latency
+      interval: 30s
+      rules:
+        # Latency as a GOOD-EVENTS RATIO, not a quantile. Quantiles cannot be
+        # aggregated across pods or burned down against a budget; ratios can.
+        # The le="0.25" bucket boundary exists in the histogram precisely so this
+        # ratio is exact rather than interpolated — changing the SLO number
+        # requires adding a bucket first, which is the intended friction.
+        - record: pp:payment_api_latency_good:ratio_rate5m
+          expr: |
+            sum(rate(pp_http_request_duration_seconds_bucket{service="payment-api",le="0.25"}[5m]))
+            / clamp_min(sum(rate(pp_http_request_duration_seconds_count{service="payment-api"}[5m])), 1e-9)
+        - record: pp:payment_api_latency_bad:ratio_rate5m
+          expr: 1 - pp:payment_api_latency_good:ratio_rate5m
+        - record: pp:payment_api_latency_bad:ratio_rate30m
+          expr: |
+            1 - (sum(rate(pp_http_request_duration_seconds_bucket{service="payment-api",le="0.25"}[30m]))
+                 / clamp_min(sum(rate(pp_http_request_duration_seconds_count{service="payment-api"}[30m])), 1e-9))
+        - record: pp:payment_api_latency_bad:ratio_rate1h
+          expr: |
+            1 - (sum(rate(pp_http_request_duration_seconds_bucket{service="payment-api",le="0.25"}[1h]))
+                 / clamp_min(sum(rate(pp_http_request_duration_seconds_count{service="payment-api"}[1h])), 1e-9))
+        - record: pp:payment_api_latency_bad:ratio_rate6h
+          expr: |
+            1 - (sum(rate(pp_http_request_duration_seconds_bucket{service="payment-api",le="0.25"}[6h]))
+                 / clamp_min(sum(rate(pp_http_request_duration_seconds_count{service="payment-api"}[6h])), 1e-9))
+        - record: pp:payment_api_latency:p50_5m
+          expr: histogram_quantile(0.50, sum by (le) (rate(pp_http_request_duration_seconds_bucket{service="payment-api"}[5m])))
+        - record: pp:payment_api_latency:p99_5m
+          expr: histogram_quantile(0.99, sum by (le) (rate(pp_http_request_duration_seconds_bucket{service="payment-api"}[5m])))
+
+    - name: pp.sli.business
+      interval: 30s
+      rules:
+        # pp_payment_authorization_rate is defined as a RECORDED gauge, never
+        # instrumented directly. This is it.
+        - record: pp_payment_authorization_rate
+          expr: |
+            sum by (gateway, currency) (rate(pp_payments_total{outcome="authorized"}[5m]))
+            / clamp_min(sum by (gateway, currency)
+                (rate(pp_payments_total{outcome=~"authorized|declined|failed"}[5m])), 1e-9)
+        - record: pp:payment_authorization_rate:ratio_rate30m
+          expr: |
+            sum by (gateway) (rate(pp_payments_total{outcome="authorized"}[30m]))
+            / clamp_min(sum by (gateway)
+                (rate(pp_payments_total{outcome=~"authorized|declined|failed"}[30m])), 1e-9)
+        # 7-day trailing baseline, OFFSET ONE HOUR so an in-progress incident
+        # cannot drag its own baseline down and silence the alert that exists to
+        # catch it.
+        - record: pp:payment_authorization_rate:baseline7d
+          expr: avg_over_time(pp:payment_authorization_rate:ratio_rate30m[7d] offset 1h)
+        - record: pp:gateway_error:ratio_rate5m
+          expr: |
+            sum by (gateway, operation) (rate(pp_gateway_errors_total[5m]))
+            / clamp_min(sum by (gateway, operation)
+                (rate(pp_gateway_request_duration_seconds_count[5m])), 1e-9)
+        - record: pp:gateway_latency:p99_5m
+          expr: |
+            histogram_quantile(0.99, sum by (le, gateway, operation)
+              (rate(pp_gateway_request_duration_seconds_bucket[5m])))
+        - record: pp:payments:tps5m
+          expr: sum(rate(pp_payments_total{outcome="created"}[5m]))
+
+    - name: pp.sli.async
+      interval: 30s
+      rules:
+        - record: pp:webhook_processing_lag:p99_5m
+          expr: histogram_quantile(0.99, sum by (le) (rate(pp_webhook_processing_lag_seconds_bucket[5m])))
+        - record: pp:config_propagation:p99_5m
+          expr: max(pp_config_snapshot_age_seconds)
+        - record: pp:onboarding_duration:p95_1h
+          expr: |
+            histogram_quantile(0.95, sum by (le)
+              (rate(pp_onboarding_duration_seconds_bucket{outcome="completed"}[1h])))
+        # 1.0 = untouched, 0.0 = exhausted. Read by the canary's error-budget
+        # guard and by scripts/slo-gate.sh in the PR pipeline.
+        - record: pp:error_budget_remaining:payment_api
+          expr: 1 - (pp:payment_api_error:ratio_rate3d / 0.0001)

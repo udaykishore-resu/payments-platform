@@ -1,0 +1,103 @@
+# One ResourceQuota per namespace. The quota is the backstop that makes
+# 'a pod without a CPU limit cannot starve its neighbours' true at the
+# namespace level (deployment.md §1.3).
+---
+# Sized for the §0 maxima with headroom: 120 payment-api + 150 orchestrator + 90 webhook-ingress + 24 relay + 48 consumer = 432 pods at peak, so 400 is the *managed* floor's bound and Karpenter burst nodes carry the rest under their own quota.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pp-data-plane-quota
+  namespace: pp-data-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  hard:
+    requests.cpu: "600"
+    requests.memory: 1200Gi
+    limits.memory: 1800Gi
+    pods: "400"
+    # No limits.cpu quota. Quoting a resource forces every container in the
+    # namespace to declare it, which would make the deliberate omission of CPU
+    # limits on the latency-sensitive services impossible.
+    count/persistentvolumeclaims: "0"
+    services.nodeports: "0"
+---
+# 12 control-plane-api pods at 300m plus the control-plane CronJobs.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pp-control-plane-quota
+  namespace: pp-control-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  hard:
+    requests.cpu: "60"
+    requests.memory: 120Gi
+    limits.memory: 200Gi
+    pods: "80"
+    # No limits.cpu quota. Quoting a resource forces every container in the
+    # namespace to declare it, which would make the deliberate omission of CPU
+    # limits on the latency-sensitive services impossible.
+    count/persistentvolumeclaims: "0"
+    services.nodeports: "0"
+---
+# 24 workflow-worker pods at 500m/2000m plus workflow CronJobs; certification suites are the CPU spike.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pp-automation-quota
+  namespace: pp-automation
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  hard:
+    requests.cpu: "80"
+    requests.memory: 160Gi
+    limits.memory: 240Gi
+    pods: "60"
+    # No limits.cpu quota. Quoting a resource forces every container in the
+    # namespace to declare it, which would make the deliberate omission of CPU
+    # limits on the latency-sensitive services impossible.
+    count/persistentvolumeclaims: "0"
+    services.nodeports: "0"
+---
+# Cluster machinery. Bounded so a runaway controller cannot consume the cluster.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pp-platform-quota
+  namespace: pp-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  hard:
+    requests.cpu: "40"
+    requests.memory: 80Gi
+    limits.memory: 120Gi
+    pods: "120"
+    # No limits.cpu quota. Quoting a resource forces every container in the
+    # namespace to declare it, which would make the deliberate omission of CPU
+    # limits on the latency-sensitive services impossible.
+    count/persistentvolumeclaims: "0"
+    services.nodeports: "0"
+---
+# otel-gateway tail sampling buffers whole traces, so memory is the real constraint; the DaemonSets scale with the node count.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pp-observability-quota
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  hard:
+    requests.cpu: "80"
+    requests.memory: 200Gi
+    limits.memory: 300Gi
+    pods: "150"
+    # No limits.cpu quota. Quoting a resource forces every container in the
+    # namespace to declare it, which would make the deliberate omission of CPU
+    # limits on the latency-sensitive services impossible.
+    count/persistentvolumeclaims: "0"
+    services.nodeports: "0"

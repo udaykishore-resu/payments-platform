@@ -1,0 +1,19 @@
+apiVersion: v2
+name: outbox-relay
+description: Postgres outbox -> Kafka. The only publisher in the system.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0-0"
+keywords:
+  - payments
+  - data-plane
+annotations:
+  pp.plane: data
+  pp.namespace: pp-data-plane
+  pp.node-group: data
+  pp.availability-target: "99.99%"
+dependencies:
+  - name: pp-common
+    version: 1.0.0
+    repository: "file://../pp-common"

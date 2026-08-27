@@ -1,0 +1,86 @@
+# .dockerignore — what never enters the build context.
+#
+# The build context is uploaded to the daemon in full before the first instruction runs,
+# so an unignored .git directory is not a tidiness problem: it is seconds added to every
+# build and, more importantly, credentials and history inside the layer cache. This file
+# is a security control before it is a performance one.
+
+# --- version control -------------------------------------------------------------------
+# .git carries the full history including anything ever committed and later removed. It
+# must never be in an image layer.
+.git
+.git*
+!.gitignore
+.github
+
+# --- build output --------------------------------------------------------------------
+bin/
+dist/
+build/
+out/
+*.exe
+*.test
+*.out
+*.prof
+coverage*
+.loadtest/
+evidence/
+
+# --- local development state -----------------------------------------------------------
+# A stray .env is the most common way a real credential reaches an image.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+!testdata/**/*.pem
+
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# --- editors and OS ---------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- things the build does not need ------------------------------------------------------
+# Excluded to keep the context small. Note what is NOT excluded: migrations/ and api/ stay,
+# because migrations are embedded (migrations/embed.go) and the OpenAPI document is served
+# by the control plane.
+docs/
+deploy/
+helm/
+terraform/
+deployments/
+tests/load/
+tests/chaos/
+tests/e2e/
+*.md
+!README.md
+LICENSE
+
+# Test sources are excluded from the image build but NOT from the module: `go build` never
+# compiles _test.go files, so removing them shrinks the context without changing the
+# binary. testdata/ goes with them.
+**/*_test.go
+**/testdata/
+
+# --- container tooling itself ---------------------------------------------------------------
+Dockerfile*
+.dockerignore
+docker-compose*.yml
+
+# --- caches ------------------------------------------------------------------------------------
+node_modules/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+vendor/

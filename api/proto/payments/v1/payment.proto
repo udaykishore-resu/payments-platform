@@ -1,0 +1,713 @@
+// Payment Orchestration (BC-6) internal interface.
+//
+// `payment-api` speaks this to `payment-orchestrator`. They are separate binaries so a
+// slow gateway cannot consume the ingress connection pool, and so ingress scales on
+// connection count while orchestration scales on in-flight gateway calls.
+//
+// THE TIMEOUT RULE governs this whole file. If a gateway call times out or returns an
+// ambiguous transport error, the attempt is recorded TIMEOUT_UNKNOWN and the payment
+// STAYS in PROCESSING. The caller receives a normal response carrying that state, not
+// an error. No timer may fail a payment. Only a gateway webhook, a reconciler lookup
+// keyed on our deterministic gateway idempotency key, or a settlement report can move
+// it out.
+syntax = "proto3";
+
+package payments.v1;
+
+import "google/protobuf/timestamp.proto";
+import "payments/v1/common.proto";
+
+option go_package = "github.com/udaykishore-resu/payments-platform/api/proto/payments/v1;paymentsv1";
+option java_multiple_files = true;
+option java_package = "com.example.payments.v1";
+option java_outer_classname = "PaymentProto";
+option csharp_namespace = "Example.Payments.V1";
+
+// The 14 states of the payment FSM.
+//
+// PENDING and PROCESSING exist so that asynchronous and UNKNOWN outcomes are
+// representable. Without them a gateway timeout forces the platform to lie about
+// whether money moved, and auto-failing a timed-out authorization is the single most
+// common cause of double charges in real platforms.
+enum PaymentState {
+  PAYMENT_STATE_UNSPECIFIED = 0;
+  PAYMENT_STATE_CREATED = 1;
+  // 3DS or a redirect is required from the payer.
+  PAYMENT_STATE_REQUIRES_ACTION = 2;
+  // Dispatched to a gateway; outcome not yet known.
+  PAYMENT_STATE_PROCESSING = 3;
+  // Asynchronous method, or an UNKNOWN attempt awaiting reconciliation.
+  PAYMENT_STATE_PENDING = 4;
+  PAYMENT_STATE_AUTHORIZED = 5;
+  PAYMENT_STATE_CAPTURED = 6;
+  PAYMENT_STATE_SETTLED = 7;
+  PAYMENT_STATE_PARTIALLY_REFUNDED = 8;
+  PAYMENT_STATE_REFUNDED = 9;
+  PAYMENT_STATE_DISPUTED = 10;
+  PAYMENT_STATE_VOIDED = 11;
+  PAYMENT_STATE_FAILED = 12;
+  PAYMENT_STATE_CANCELED = 13;
+  PAYMENT_STATE_EXPIRED = 14;
+}
+
+// The platform's own payment-method vocabulary. A gateway's method string never
+// appears here; mapping is the anti-corruption layer's job.
+enum PaymentMethod {
+  PAYMENT_METHOD_UNSPECIFIED = 0;
+  PAYMENT_METHOD_CARD = 1;
+  PAYMENT_METHOD_APPLE_PAY = 2;
+  PAYMENT_METHOD_GOOGLE_PAY = 3;
+  PAYMENT_METHOD_PAYPAL = 4;
+  PAYMENT_METHOD_IDEAL = 5;
+  PAYMENT_METHOD_SEPA_DEBIT = 6;
+  PAYMENT_METHOD_ACH_DEBIT = 7;
+  PAYMENT_METHOD_BANCONTACT = 8;
+  PAYMENT_METHOD_SOFORT = 9;
+  PAYMENT_METHOD_KLARNA = 10;
+}
+
+// Whether capture follows authorization automatically.
+enum CaptureMode {
+  CAPTURE_MODE_UNSPECIFIED = 0;
+  CAPTURE_MODE_AUTOMATIC = 1;
+  CAPTURE_MODE_MANUAL = 2;
+}
+
+// The risk engine's decision. On scorer unavailability the engine fails open to the
+// merchant's configured POLICY DEFAULT, never to "allow".
+enum RiskDecision {
+  RISK_DECISION_UNSPECIFIED = 0;
+  RISK_DECISION_ALLOW = 1;
+  RISK_DECISION_REQUIRE_3DS = 2;
+  RISK_DECISION_DECLINE = 3;
+}
+
+// Strong customer authentication outcome. Exemptions are modelled explicitly and
+// audited: claiming one is a decision the platform must be able to defend, so it is
+// never implicit.
+enum ThreeDsStatus {
+  THREE_DS_STATUS_UNSPECIFIED = 0;
+  THREE_DS_STATUS_AUTHENTICATED = 1;
+  THREE_DS_STATUS_ATTEMPTED = 2;
+  THREE_DS_STATUS_CHALLENGE_REQUIRED = 3;
+  THREE_DS_STATUS_FAILED = 4;
+  THREE_DS_STATUS_EXEMPT_TRA = 5;
+  THREE_DS_STATUS_EXEMPT_LOW_VALUE = 6;
+  THREE_DS_STATUS_EXEMPT_MIT = 7;
+  THREE_DS_STATUS_NOT_APPLICABLE = 8;
+}
+
+// Lifecycle of one gateway interaction.
+enum AttemptState {
+  ATTEMPT_STATE_UNSPECIFIED = 0;
+  ATTEMPT_STATE_PENDING = 1;
+  ATTEMPT_STATE_DISPATCHED = 2;
+  ATTEMPT_STATE_COMPLETED = 3;
+}
+
+// How one gateway interaction ended.
+enum AttemptOutcome {
+  ATTEMPT_OUTCOME_UNSPECIFIED = 0;
+  ATTEMPT_OUTCOME_SUCCESS = 1;
+  // The gateway definitively said no. Failover is permitted only when the decline
+  // reason is in the retryable-decline set. A hard decline (stolen card, invalid
+  // account) must NEVER be retried on another gateway - that is card-testing behaviour
+  // and gets a platform de-registered.
+  ATTEMPT_OUTCOME_DECLINED = 2;
+  // Our side or transport failed BEFORE the gateway could have acted. Safe to retry.
+  ATTEMPT_OUTCOME_ERROR = 3;
+  // We do not know whether money moved. NEVER retried automatically. Enters the
+  // reconciliation queue.
+  ATTEMPT_OUTCOME_TIMEOUT_UNKNOWN = 4;
+}
+
+// The gateway operation an attempt performs.
+enum GatewayOperationKind {
+  GATEWAY_OPERATION_KIND_UNSPECIFIED = 0;
+  GATEWAY_OPERATION_KIND_AUTHORIZE = 1;
+  GATEWAY_OPERATION_KIND_CAPTURE = 2;
+  GATEWAY_OPERATION_KIND_REFUND = 3;
+  GATEWAY_OPERATION_KIND_VOID = 4;
+}
+
+// Why a gateway was chosen, or why it was excluded. The routing plan records a reason
+// for EVERY candidate, including rejected ones, because "why was this gateway not
+// chosen" is the question asked in every routing incident.
+enum RoutingReason {
+  ROUTING_REASON_UNSPECIFIED = 0;
+  ROUTING_REASON_PRIMARY_BY_POLICY = 1;
+  ROUTING_REASON_FALLBACK_BY_POLICY = 2;
+  ROUTING_REASON_COST_PREFERRED = 3;
+  ROUTING_REASON_LOWEST_LATENCY = 4;
+  ROUTING_REASON_WEIGHTED_SCORE = 5;
+  ROUTING_REASON_HEALTH_DEGRADED = 6;
+  ROUTING_REASON_CIRCUIT_OPEN = 7;
+  ROUTING_REASON_CURRENCY_UNSUPPORTED = 8;
+  ROUTING_REASON_METHOD_UNSUPPORTED = 9;
+  ROUTING_REASON_CAPABILITY_MISSING = 10;
+  ROUTING_REASON_RESIDENCY_VIOLATION = 11;
+  ROUTING_REASON_NOT_CERTIFIED = 12;
+  ROUTING_REASON_AMOUNT_ABOVE_GATEWAY_MAX = 13;
+}
+
+// Why a refund was requested.
+enum RefundReason {
+  REFUND_REASON_UNSPECIFIED = 0;
+  REFUND_REASON_DUPLICATE = 1;
+  REFUND_REASON_FRAUDULENT = 2;
+  REFUND_REASON_REQUESTED_BY_CUSTOMER = 3;
+  REFUND_REASON_OTHER = 4;
+}
+
+// Lifecycle of a refund. A FAILED refund does not decrement the refunded total: the
+// amount is reserved on REQUESTED and released on FAILED, which is why the refunded
+// total and the sum of succeeded refunds are reconciled nightly rather than assumed
+// equal.
+enum RefundState {
+  REFUND_STATE_UNSPECIFIED = 0;
+  REFUND_STATE_REQUESTED = 1;
+  REFUND_STATE_PROCESSING = 2;
+  REFUND_STATE_SUCCEEDED = 3;
+  REFUND_STATE_FAILED = 4;
+}
+
+// Why an authorization was voided.
+enum VoidReason {
+  VOID_REASON_UNSPECIFIED = 0;
+  VOID_REASON_MERCHANT_REQUEST = 1;
+  VOID_REASON_AUTH_EXPIRY_PREVENTION = 2;
+  VOID_REASON_RISK_REVERSAL = 3;
+  VOID_REASON_ONBOARDING_TEST = 4;
+}
+
+// Why a payment needs reconciliation.
+enum ReconciliationReason {
+  RECONCILIATION_REASON_UNSPECIFIED = 0;
+  RECONCILIATION_REASON_TIMEOUT_UNKNOWN = 1;
+  RECONCILIATION_REASON_AMBIGUOUS_TRANSPORT_ERROR = 2;
+  RECONCILIATION_REASON_RESPONSE_VALIDATION_FAILED = 3;
+  RECONCILIATION_REASON_WEBHOOK_STATE_CONFLICT = 4;
+  RECONCILIATION_REASON_SETTLEMENT_MISMATCH = 5;
+}
+
+// A reference to a payment instrument, NEVER the instrument itself.
+//
+// This platform is assessed at SAQ-A / A-EP level because cardholder data neither
+// traverses nor is stored by it, and that has to be structural rather than a promise.
+// There is no field named pan, card_number, cvv, cvc, track1, track2 or expiry
+// anywhere in this interface - not optional, not deprecated, absent. Field numbers for
+// such fields are permanently reserved below so a future contributor cannot quietly
+// add one.
+//
+// A bare network token (a DPAN) is itself PAN-formatted and is therefore NOT accepted
+// inline: it is referenced by vault reference, which keeps PAN-shaped digits out of
+// our request bodies, logs and traces entirely.
+message PaymentMethodReference {
+  // Which kind of reference this is.
+  ReferenceKind kind = 1;
+
+  // The gateway that minted the token, for GATEWAY_TOKEN. A gateway token is only
+  // meaningful to its issuer, which constrains failover: routing to another gateway
+  // requires a token that gateway can accept.
+  string gateway_code = 2;
+
+  // The opaque token or vault handle. Must begin with a letter, which is what makes a
+  // 13-19 digit PAN structurally unrepresentable in this field.
+  string token = 3;
+
+  // Card brand as reported by the tokenizer. Display and routing only.
+  string brand = 4;
+
+  // Last four digits. Four digits are not cardholder data under PCI DSS and cannot be
+  // extended into a PAN.
+  string last4 = 5;
+
+  // Expiry of the underlying instrument, for account-updater and MIT scheduling. Not
+  // sufficient to transact with.
+  int32 expiry_month = 6;
+  int32 expiry_year = 7;
+
+  // Scheme-assigned token requestor identifier, for NETWORK_TOKEN_REF.
+  string token_requestor_id = 8;
+
+  // Platform identifier of a stored instrument, for STORED_INSTRUMENT.
+  string instrument_id = 9;
+
+  // Scheme transaction reference of the initial cardholder-initiated payment, chaining
+  // a merchant-initiated transaction to it. Required to claim an MIT exemption.
+  string network_transaction_id = 10;
+
+  // Whether this is customer- or merchant-initiated. Drives exemption eligibility.
+  InstrumentUsage usage = 11;
+
+  // Permanently reserved. Cardholder data must never become expressible here.
+  reserved 90 to 99;
+  reserved "pan", "card_number", "cvv", "cvc", "track1", "track2", "expiry";
+
+  // Which variant of reference is carried.
+  enum ReferenceKind {
+    REFERENCE_KIND_UNSPECIFIED = 0;
+    // A token minted by the gateway's own hosted fields or SDK. The card data went from
+    // the payer's browser to the gateway and never touched us.
+    REFERENCE_KIND_GATEWAY_TOKEN = 1;
+    // A handle to a network token held in a segregated vault. The vault resolves it at
+    // dispatch time inside its own compliance boundary.
+    REFERENCE_KIND_NETWORK_TOKEN_REF = 2;
+    // A previously used instrument, referenced by platform identifier.
+    REFERENCE_KIND_STORED_INSTRUMENT = 3;
+  }
+
+  // How the instrument is being used, which determines SCA exemption eligibility.
+  enum InstrumentUsage {
+    INSTRUMENT_USAGE_UNSPECIFIED = 0;
+    INSTRUMENT_USAGE_CUSTOMER_INITIATED = 1;
+    INSTRUMENT_USAGE_MERCHANT_INITIATED_RECURRING = 2;
+    INSTRUMENT_USAGE_MERCHANT_INITIATED_UNSCHEDULED = 3;
+  }
+}
+
+// One execution of a payment intent against one gateway.
+//
+// Failover creates a NEW attempt and never mutates the old one. At most one attempt per
+// payment may hold a successful terminal outcome, enforced by a partial unique index -
+// the constraint that makes double-charging structurally impossible rather than merely
+// unlikely.
+message PaymentAttempt {
+  // `att_` + ULID.
+  string id = 1;
+  string payment_id = 2;
+  // Dense from 1, unique per payment.
+  int32 attempt_number = 3;
+  string gateway_id = 4;
+  string gateway_code = 5;
+  string connection_id = 6;
+  GatewayOperationKind operation = 7;
+  AttemptState state = 8;
+  // Unset while the attempt is not COMPLETED.
+  AttemptOutcome outcome = 9;
+  // Deterministic in attempt_id, written BEFORE dispatch. A transport retry to the same
+  // gateway reuses it so the gateway dedupes; a failover creates a new attempt and
+  // therefore a new key, which is correctly a new authorization. Reproducible after a
+  // crash, which is how the reconciler looks the transaction up.
+  string gateway_idempotency_key = 10;
+  // The gateway's transaction identifier, needed for capture, void and reconciliation.
+  string gateway_reference = 11;
+  // Normalized decline reason. NEVER the gateway's raw string.
+  string decline_reason_code = 12;
+  // Whether another gateway could plausibly succeed. Required on DECLINED; the routing
+  // feedback loop keys on it. False means hard decline: no failover, ever.
+  bool decline_is_retryable = 13;
+  // Platform error code from the catalogue, when the attempt errored.
+  string normalized_error_code = 14;
+  // Why this gateway was selected.
+  repeated RoutingReason routing_reasons = 15;
+  int32 latency_ms = 16;
+  // How stale the merchant configuration was when this routing decision was made. The
+  // field that makes a staleness incident diagnosable after the fact.
+  int64 config_snapshot_age_ms = 17;
+  google.protobuf.Timestamp request_sent_at = 18;
+  google.protobuf.Timestamp response_received_at = 19;
+  int64 version = 20;
+
+  reserved 21 to 29;
+  reserved "gateway_payload";
+}
+
+// One candidate considered by the routing engine.
+message RoutingCandidate {
+  string gateway_id = 1;
+  string gateway_code = 2;
+  // Dense from 1 among eligible candidates. Zero marks an excluded candidate, recorded
+  // precisely so the plan explains why a gateway was NOT chosen.
+  int32 rank = 3;
+  double score = 4;
+  bool eligible = 5;
+  repeated RoutingReason reasons = 6;
+}
+
+// An ordered, reason-annotated list of candidate gateways produced for one payment at
+// one instant, persisted with the payment for auditability.
+//
+// IMMUTABLE after creation: a plan is the record of a decision, and amending it
+// destroys the audit trail. An empty candidate list is a legal plan and produces
+// NO_ELIGIBLE_GATEWAY - failing closed is deliberate.
+message RoutingPlan {
+  // `rpl_` + ULID.
+  string id = 1;
+  string merchant_id = 2;
+  string payment_id = 3;
+  // Strategy in force when the plan was produced.
+  string strategy = 4;
+  repeated RoutingCandidate candidates = 5;
+  int32 policy_version = 6;
+  int32 config_version = 7;
+  int64 config_snapshot_age_ms = 8;
+  google.protobuf.Timestamp decided_at = 9;
+  // The routing engine build that produced the plan.
+  string decided_by = 10;
+}
+
+// Money returned to the payer against a captured payment.
+message Refund {
+  // `ref_` + ULID.
+  string id = 1;
+  string payment_id = 2;
+  // This refund only. Its currency must equal the payment's currency - a mismatch is an
+  // error, never a conversion.
+  Money amount = 3;
+  RefundState state = 4;
+  RefundReason reason = 5;
+  string reason_detail = 6;
+  string gateway_id = 7;
+  string gateway_reference = 8;
+  // Cumulative refunded after this refund. Invariant I1 evidence.
+  Money refunded_total = 9;
+  // Cumulative captured. I1: refunded_total <= captured_total.
+  Money captured_total = 10;
+  // Whether the payment is now fully refunded. Carried so a consumer never has to
+  // recompute the difference between PARTIALLY_REFUNDED and REFUNDED.
+  bool is_full_refund = 11;
+  string requested_by = 12;
+  string failure_code = 13;
+  google.protobuf.Timestamp created_at = 14;
+  google.protobuf.Timestamp completed_at = 15;
+
+  reserved 16 to 19;
+}
+
+// What the payer must do next, for a payment in REQUIRES_ACTION.
+message NextAction {
+  // REDIRECT, THREE_DS_CHALLENGE, DISPLAY_VOUCHER or AWAIT_BANK_DEBIT.
+  string type = 1;
+  // Where to send the payer. Single-use and short-lived.
+  string redirect_url = 2;
+  // After this instant the payment moves to EXPIRED rather than remaining stuck.
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+// The merchant's intent to move money.
+//
+// Amount, currency, merchant and tenant are immutable after creation (I4), enforced in
+// the aggregate and by a database trigger. captured <= authorized (I2) and
+// refunded <= captured (I1) hold at all times, in the domain and in the database.
+message Payment {
+  // `pay_` + ULID. Its embedded timestamp is also the partition key derivation, so a
+  // payment and all of its attempts always share one partition.
+  string id = 1;
+  string tenant_id = 2;
+  string merchant_id = 3;
+  PaymentState state = 4;
+  // The requested amount. Immutable.
+  Money amount = 5;
+  // The amount actually held, which may be less than `amount` for a partial
+  // authorization.
+  Money authorized_amount = 6;
+  // Cumulative captured across all captures.
+  Money captured_amount = 7;
+  // Cumulative refunded, including amounts reserved by in-flight refunds.
+  Money refunded_amount = 8;
+  PaymentMethod payment_method = 9;
+  CaptureMode capture_mode = 10;
+  RiskDecision risk_decision = 11;
+  // 0-100. `has_risk_score` distinguishes a genuine zero from an absent score.
+  int32 risk_score = 12;
+  // False when the external scorer was unavailable and the policy default applied.
+  bool has_risk_score = 13;
+  ThreeDsStatus three_ds_status = 14;
+  NextAction next_action = 15;
+  // Empty when routing produced no candidates.
+  string routing_plan_id = 16;
+  // The attempt currently representing this payment's outcome.
+  string current_attempt_id = 17;
+  // All attempts, oldest first. Failover appends; it never rewrites.
+  repeated PaymentAttempt attempts = 18;
+  repeated Refund refunds = 19;
+  // What the payer sees on their statement.
+  string statement_descriptor = 20;
+  // Merchant key-value metadata, echoed on reads. Never inspected, never indexed, and
+  // never republished in events - only its key names are, because a merchant may put
+  // their own customer identifiers in the values.
+  map<string, string> metadata = 21;
+  // True when an attempt ended TIMEOUT_UNKNOWN and a reconciler must resolve it. The
+  // payment stays in PROCESSING until it does.
+  bool reconciliation_required = 22;
+  // Authorization expiry. Drives the auth-expiry sweeper.
+  google.protobuf.Timestamp expires_at = 23;
+  // Monotonic aggregate version (I5).
+  int64 version = 24;
+  google.protobuf.Timestamp created_at = 25;
+  google.protobuf.Timestamp updated_at = 26;
+
+  reserved 27 to 39;
+  reserved "payment_method_token";
+}
+
+// Create and dispatch a payment.
+message CreatePaymentRequest {
+  TenantContext context = 1;
+  // The merchant on whose behalf the payment is made. Must be ACTIVE.
+  string merchant_id = 2;
+  // Minor units and ISO 4217 code. Must be strictly positive.
+  Money amount = 3;
+  PaymentMethod payment_method = 4;
+  PaymentMethodReference payment_method_reference = 5;
+  CaptureMode capture_mode = 6;
+  // Max 22 characters. A recognisable descriptor is the cheapest chargeback prevention
+  // there is.
+  string statement_descriptor = 7;
+  // Payer country, checked against the merchant's allowed and blocked country lists.
+  string payer_country = 8;
+  // The merchant's own order reference. Distinct from the idempotency key: this is
+  // business data, the key is a protocol concern.
+  string reference = 9;
+  map<string, string> metadata = 10;
+  // A request, not an instruction. The risk policy decides.
+  string three_ds_preference = 11;
+  // Routing hint for contractual pinning. Honoured only when the gateway is eligible,
+  // certified and healthy; otherwise routing proceeds and the plan records why the
+  // preference was not taken.
+  string preferred_gateway = 12;
+  // Required. Every unsafe operation carries one.
+  IdempotencyOptions idempotency = 13;
+
+  reserved 14 to 19;
+}
+
+// The payment as it stands after dispatch.
+//
+// A PROCESSING or PENDING state here is a NORMAL response, not a failure: it means the
+// outcome is not yet known and the caller should poll rather than resubmit.
+message CreatePaymentResponse {
+  Payment payment = 1;
+  // The plan that produced the dispatch, for immediate auditability.
+  RoutingPlan routing_plan = 2;
+  IdempotencyResult idempotency = 3;
+}
+
+// Read one payment.
+message GetPaymentRequest {
+  TenantContext context = 1;
+  string payment_id = 2;
+  // Include the routing plan, which is comparatively large and is not embedded by
+  // default.
+  bool include_routing_plan = 3;
+  // Require a read from the primary rather than a replica. Used by a caller that has
+  // just written and needs read-your-writes; costs latency, so it is opt-in.
+  bool consistent_read = 4;
+}
+
+// The payment.
+message GetPaymentResponse {
+  Payment payment = 1;
+  RoutingPlan routing_plan = 2;
+}
+
+// Cursor-paginated payment listing.
+message ListPaymentsRequest {
+  TenantContext context = 1;
+  PageRequest page = 2;
+  string merchant_id = 3;
+  repeated PaymentState states = 4;
+  google.protobuf.Timestamp created_after = 5;
+  google.protobuf.Timestamp created_before = 6;
+  // Only payments parked awaiting reconciliation. This is the reconciler's work queue.
+  bool reconciliation_required_only = 7;
+}
+
+// A page of payments.
+message ListPaymentsResponse {
+  repeated Payment payments = 1;
+  PageResponse page = 2;
+}
+
+// Convert an authorization hold into a debit. Legal only from AUTHORIZED.
+message CapturePaymentRequest {
+  TenantContext context = 1;
+  string payment_id = 2;
+  // Amount to capture. Unset captures the full remaining authorized amount. The
+  // cumulative captured total may never exceed the authorized amount (I2).
+  Money amount = 3;
+  // When false, the remaining authorization stays open for a further partial capture,
+  // subject to the merchant's max_partial_captures. When true, any uncaptured balance
+  // is released.
+  bool is_final_capture = 4;
+  string reference = 5;
+  IdempotencyOptions idempotency = 6;
+}
+
+// The payment after capture.
+message CapturePaymentResponse {
+  Payment payment = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Return money to the payer. Legal from CAPTURED, SETTLED and PARTIALLY_REFUNDED -
+// refunding after settlement is the normal case, not an exception.
+//
+// Refunds remain available while a merchant is SUSPENDED: you must always be able to
+// give money back.
+message RefundPaymentRequest {
+  TenantContext context = 1;
+  string payment_id = 2;
+  // Unset refunds the full remaining refundable balance. Must not push the cumulative
+  // refunded total above the captured total (I1).
+  Money amount = 3;
+  RefundReason reason = 4;
+  // Required when reason is OTHER.
+  string reason_detail = 5;
+  string reference = 6;
+  IdempotencyOptions idempotency = 7;
+}
+
+// The refund, plus the payment's resulting state.
+message RefundPaymentResponse {
+  Refund refund = 1;
+  Payment payment = 2;
+  IdempotencyResult idempotency = 3;
+}
+
+// Reverse an authorization before capture. Legal only from AUTHORIZED.
+//
+// There is no amount: a void always reverses the entire authorization. A partial void
+// is not an operation this platform offers.
+message VoidPaymentRequest {
+  TenantContext context = 1;
+  string payment_id = 2;
+  VoidReason reason = 3;
+  string reason_detail = 4;
+  IdempotencyOptions idempotency = 5;
+}
+
+// The payment after the void.
+message VoidPaymentResponse {
+  Payment payment = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Reconciler callback: resolve an attempt whose outcome was unknown.
+//
+// This is one of only three things that can move a payment out of PROCESSING; the
+// others are a verified gateway webhook and a settlement report. No timer may do it.
+message ResolveUnknownAttemptRequest {
+  TenantContext context = 1;
+  string payment_id = 2;
+  // The TIMEOUT_UNKNOWN attempt.
+  string attempt_id = 3;
+  // The outcome established by the lookup. Must not be TIMEOUT_UNKNOWN.
+  AttemptOutcome resolved_outcome = 4;
+  // The gateway's transaction identifier, if the transaction was found.
+  string gateway_reference = 5;
+  // The amount the gateway reports having authorized or captured. A mismatch with what
+  // we sent opens a reconciliation exception rather than being silently accepted.
+  Money observed_amount = 6;
+  // How the outcome was established: GATEWAY_LOOKUP, WEBHOOK or SETTLEMENT_REPORT.
+  string resolution_source = 7;
+  string normalized_error_code = 8;
+  IdempotencyOptions idempotency = 9;
+}
+
+// The payment after resolution.
+message ResolveUnknownAttemptResponse {
+  Payment payment = 1;
+  PaymentAttempt attempt = 2;
+  IdempotencyResult idempotency = 3;
+}
+
+// Park a payment for reconciliation. Emits payment.reconciliation_required.v1, which
+// is an alerting event.
+message MarkReconciliationRequiredRequest {
+  TenantContext context = 1;
+  string payment_id = 2;
+  string attempt_id = 3;
+  ReconciliationReason reason = 4;
+  // Drives alert severity.
+  Money amount_at_risk = 5;
+  // The SLO deadline. Breaching it opens a CRITICAL reconciliation exception.
+  google.protobuf.Timestamp resolve_by = 6;
+  IdempotencyOptions idempotency = 7;
+}
+
+// The parked payment.
+message MarkReconciliationRequiredResponse {
+  Payment payment = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Apply a state change derived from a signature-verified gateway webhook.
+//
+// The webhook ingress does not call this; it persists and publishes. The asynchronous
+// webhook processor does, after the anti-corruption layer has translated the gateway's
+// vocabulary into ours.
+message ApplyWebhookOutcomeRequest {
+  TenantContext context = 1;
+  string payment_id = 2;
+  string attempt_id = 3;
+  // `whk_` + ULID of the inbound webhook this outcome came from. Used for dedup and
+  // for provenance in the audit trail.
+  string webhook_id = 4;
+  // The domain state the webhook implies. Rejected if it is not a legal transition -
+  // a gateway asserting an impossible transition is a contract violation, not an
+  // instruction.
+  PaymentState target_state = 5;
+  AttemptOutcome attempt_outcome = 6;
+  string gateway_reference = 7;
+  Money observed_amount = 8;
+  ThreeDsStatus three_ds_status = 9;
+  google.protobuf.Timestamp occurred_at = 10;
+  IdempotencyOptions idempotency = 11;
+}
+
+// The payment after the webhook was applied, or the unchanged payment when the webhook
+// was a duplicate.
+message ApplyWebhookOutcomeResponse {
+  Payment payment = 1;
+  // True when this webhook had already been applied. Duplicates are normal, not
+  // exceptional, and are dropped silently apart from a metric.
+  bool duplicate = 2;
+  IdempotencyResult idempotency = 3;
+}
+
+// Read a routing plan directly, for incident analysis.
+message GetRoutingPlanRequest {
+  TenantContext context = 1;
+  string routing_plan_id = 2;
+}
+
+// The plan.
+message GetRoutingPlanResponse {
+  RoutingPlan routing_plan = 1;
+}
+
+// Payment orchestration (BC-6). The money path.
+service PaymentService {
+  // Create, risk-assess, route and dispatch a payment. A PROCESSING or PENDING result
+  // is a normal response.
+  rpc CreatePayment(CreatePaymentRequest) returns (CreatePaymentResponse);
+
+  // Read one payment with its attempts and refunds.
+  rpc GetPayment(GetPaymentRequest) returns (GetPaymentResponse);
+
+  // Cursor-paginated listing, including the reconciler's work queue.
+  rpc ListPayments(ListPaymentsRequest) returns (ListPaymentsResponse);
+
+  // Capture an authorization, in full or in part.
+  rpc CapturePayment(CapturePaymentRequest) returns (CapturePaymentResponse);
+
+  // Refund a captured payment. Available while the merchant is suspended.
+  rpc RefundPayment(RefundPaymentRequest) returns (RefundPaymentResponse);
+
+  // Void an authorization in full. Available while the merchant is suspended.
+  rpc VoidPayment(VoidPaymentRequest) returns (VoidPaymentResponse);
+
+  // Reconciler callback. One of the only three ways out of PROCESSING.
+  rpc ResolveUnknownAttempt(ResolveUnknownAttemptRequest) returns (ResolveUnknownAttemptResponse);
+
+  // Park a payment for reconciliation and raise the alerting event.
+  rpc MarkReconciliationRequired(MarkReconciliationRequiredRequest) returns (MarkReconciliationRequiredResponse);
+
+  // Apply a translated, signature-verified gateway webhook outcome.
+  rpc ApplyWebhookOutcome(ApplyWebhookOutcomeRequest) returns (ApplyWebhookOutcomeResponse);
+
+  // Read a routing plan for incident analysis.
+  rpc GetRoutingPlan(GetRoutingPlanRequest) returns (GetRoutingPlanResponse);
+}

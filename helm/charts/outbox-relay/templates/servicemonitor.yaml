@@ -1,0 +1,47 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "pp-common.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+{{- with .Values.serviceMonitor.labels }}
+{{ toYaml . | indent 4 }}
+{{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+{{- include "pp-common.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: {{ .Values.serviceMonitor.path }}
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      scheme: http
+      honorLabels: {{ .Values.serviceMonitor.honorLabels }}
+      # Exemplars are what turns "p99 is bad" into "here is the trace of a slow
+      # payment" in one hop (observability.md §1.4).
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+          targetLabel: service
+      metricRelabelings:
+        # Cardinality backstop, mirroring scripts/metrics-lint.sh. A label the
+        # code invents at runtime cannot be caught by a static lint.
+        - sourceLabels: [__name__]
+          regex: "pp_.*"
+          action: keep
+        - regex: "merchant_id|payment_id|attempt_id|idempotency_key|email|ip|url|path"
+          action: labeldrop
+  sampleLimit: {{ .Values.serviceMonitor.sampleLimit }}
+{{- end }}

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.terminated.v1.json",
+  "title": "merchant.terminated.v1",
+  "description": "A merchant reached the terminal state TERMINATED. Published by the Merchant Registry (BC-2) on pp.merchants.merchant.v1, keyed by merchant_id, and consumed by every context. The guard requires zero payments in a non-terminal state before termination is permitted; openPaymentCount is carried so a consumer can assert that invariant rather than trust it.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "previousState",
+    "reasonCode",
+    "openPaymentCount",
+    "connectionsRevoked",
+    "dataRetentionUntil",
+    "terminatedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "previousState": {
+      "description": "The state the merchant was in immediately before termination.",
+      "type": "string",
+      "maxLength": 64
+    },
+    "reasonCode": {
+      "type": "string",
+      "enum": [
+        "MERCHANT_REQUEST",
+        "TENANT_REQUEST",
+        "COMPLIANCE",
+        "FRAUD",
+        "ONBOARDING_ABANDONED"
+      ]
+    },
+    "openPaymentCount": {
+      "description": "Always 0 - the termination guard requires it. Carried so consumers can assert the invariant instead of assuming it, which is the difference between catching a guard regression and discovering it in an audit.",
+      "type": "integer",
+      "const": 0
+    },
+    "connectionsRevoked": {
+      "description": "How many gateway connections were revoked as part of termination.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "dataRetentionUntil": {
+      "description": "When this merchant's financial records may be erased. Records are retained under the legal-obligation basis even after a right-to-erasure request, which is satisfied by crypto-shredding the tenant's data key for personal data only.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "terminatedAt": { "type": "string", "format": "date-time" }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "control-plane-api",
+  "x-context": "BC-2 Merchant Registry",
+  "x-consumers": ["All"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "reasonCode": "route-to-dlq" },
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "previousState": "SUSPENDED",
+      "reasonCode": "MERCHANT_REQUEST",
+      "openPaymentCount": 0,
+      "connectionsRevoked": 2,
+      "dataRetentionUntil": "2033-08-27T00:00:00.000Z",
+      "terminatedAt": "2026-08-28T10:15:00.000Z"
+    }
+  ]
+}

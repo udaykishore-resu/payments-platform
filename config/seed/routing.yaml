@@ -1,0 +1,76 @@
+# config/seed/routing.yaml — the default routing policy a seeded or newly-onboarded merchant
+# starts with.
+#
+# `platformctl seed` builds its synthetic merchants from this document, and the onboarding
+# workflow's `apply-configuration` step uses it as the starting point for a merchant who expressed
+# no preference. It is a *default*, not a constraint: every merchant's live policy is versioned in
+# the database and published through `PUT /v1/merchants/{merchantId}/configuration`.
+#
+# # Why PRIORITY_WITH_FALLBACK is the default and not LEAST_COST
+#
+# Cost-optimal routing is the right answer for a merchant with volume on several certified
+# gateways and measured success rates on each. A new merchant has neither. LEAST_COST on a
+# merchant with one week of data optimises against noise, and the failure is invisible: payments
+# route to the cheapest gateway, its authorization rate is two points lower, and nobody notices for
+# a quarter. PRIORITY_WITH_FALLBACK does what the merchant expects — use the primary, fail over
+# when it is unhealthy — and a merchant who wants cost optimisation opts into it with data.
+
+strategy: PRIORITY_WITH_FALLBACK
+
+# The primary and its fallback chain are gateway *codes*, resolved against the catalogue at
+# publish time. A code that names a gateway the merchant has no connection to is an L4 validation
+# failure, not a runtime 503 for the subset of traffic that would have used it.
+primary: stripe
+fallback:
+  - adyen
+
+# Scoring weights, used by the WEIGHTED and LEAST_COST strategies and by the tie-break under
+# PRIORITY_WITH_FALLBACK. They sum to 1.
+#
+# Health is weighted highest because it is the only dimension that changes on the timescale of an
+# incident: cost and latency move over weeks, and a gateway that is down is down now. Success rate
+# is second because it is what the merchant is actually paid on. Cost is third — a two-basis-point
+# saving does not repay a one-point drop in authorizations — and latency last, because on this
+# surface every eligible gateway is within a few hundred milliseconds of every other.
+weights:
+  health: 0.40
+  successRate: 0.35
+  cost: 0.15
+  latency: 0.10
+
+# Conditional rules, evaluated in order; the first match wins and replaces the primary and
+# fallback above.
+#
+# First-match-wins rather than most-specific-wins, because "most specific" requires a specificity
+# metric that operators consistently disagree with, whereas list order is something they can see in
+# their own document.
+rules:
+  # SEPA-region euro card traffic goes to the acquirer with local acquiring, which is worth
+  # several points of authorization rate on domestic cards — the single largest routing lever
+  # available and the reason a rule exists at all rather than one global primary.
+  - when:
+      currency: EUR
+      paymentMethod: CARD
+    then:
+      primary: adyen
+      fallback: [stripe]
+
+  # iDEAL is Dutch-only and only one adapter in the catalogue implements it. The rule exists so
+  # that the *routing plan* records the reason rather than leaving a reader to infer it from a
+  # capability filter.
+  - when:
+      paymentMethod: IDEAL
+    then:
+      primary: adyen
+
+  # High-value card payments prefer the gateway with the better 3-D Secure challenge completion
+  # rate. Above this threshold the cost of a failed challenge exceeds any per-transaction fee
+  # difference by an order of magnitude.
+  - when:
+      paymentMethod: CARD
+      amountAbove:
+        amount: 50000
+        currency: EUR
+    then:
+      primary: adyen
+      fallback: [stripe]

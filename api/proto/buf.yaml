@@ -1,0 +1,30 @@
+version: v2
+
+# The protobuf module for the payments platform's internal gRPC surface.
+#
+# `buf lint` and `buf breaking` both run in CI. Breaking detection compares against the
+# `main` branch, not against a release tag, because a breaking change must be caught in
+# the pull request that introduces it and not at release time when it is already merged.
+modules:
+  - path: .
+    name: buf.build/payments-platform/api
+
+lint:
+  # Every STANDARD rule is enforced. There is no `except` list here on purpose: an
+  # exception is a decision that needs a written reason beside it, and none exists yet.
+  use:
+    - STANDARD
+  enum_zero_value_suffix: _UNSPECIFIED
+  rpc_allow_same_request_response: false
+  rpc_allow_google_protobuf_empty_requests: false
+  rpc_allow_google_protobuf_empty_responses: false
+  service_suffix: Service
+  disallow_comment_ignores: true
+
+breaking:
+  use:
+    - FILE
+  except:
+    # EXTENSION_NO_DELETE is not applicable - we use no extensions.
+    - EXTENSION_NO_DELETE
+  ignore_unstable_packages: false

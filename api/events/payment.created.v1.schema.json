@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.created.v1.json",
+  "title": "payment.created.v1",
+  "description": "A payment intent was accepted, risk-assessed and routed. Published by Payment Orchestration (BC-6) on pp.payments.payment.v1, keyed by payment_id. Creation does not mean money moved - it means the intent exists and a routing decision was made. The idempotency key is carried only as a HASH: the key is client-opaque and may embed the merchant's own identifiers, so republishing it would leak their data into every downstream consumer.",
+  "type": "object",
+  "required": ["paymentId", "amount", "paymentMethod", "captureMode", "riskDecision", "idempotencyKeyHash", "createdAt"],
+  "additionalProperties": false,
+  "properties": {
+    "paymentId": { "type": "string", "pattern": "^pay_[0-9A-Z]{26}$" },
+    "amount": {
+      "$ref": "#/$defs/money",
+      "description": "Immutable for the life of the payment (invariant I4), enforced in the aggregate and by a database trigger."
+    },
+    "paymentMethod": {
+      "description": "Domain vocabulary, never a gateway's. A gateway method string reaching this field is an anti-corruption-layer failure.",
+      "type": "string",
+      "enum": ["CARD", "APPLE_PAY", "GOOGLE_PAY", "PAYPAL", "IDEAL", "SEPA_DEBIT", "ACH_DEBIT", "BANCONTACT", "SOFORT", "KLARNA"]
+    },
+    "captureMode": { "type": "string", "enum": ["AUTOMATIC", "MANUAL"] },
+    "riskDecision": { "type": "string", "enum": ["ALLOW", "REQUIRE_3DS", "DECLINE"] },
+    "riskScore": {
+      "description": "0-100. ABSENT when the external scorer was unavailable and the policy default applied - which is why it is optional rather than defaulting to 0, a value that would be indistinguishable from a genuine zero-risk score.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "routingPlanId": {
+      "description": "Absent when routing produced no candidates, which is a legal outcome and yields NO_ELIGIBLE_GATEWAY.",
+      "type": "string",
+      "pattern": "^rpl_[0-9A-Z]{26}$"
+    },
+    "candidateGateways": {
+      "description": "Ordered gateway codes from the routing plan.",
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" }
+    },
+    "idempotencyKeyHash": {
+      "description": "sha256 of the client's idempotency key. Hash, never the key.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "metadataKeys": {
+      "description": "Key NAMES only. Merchant metadata values are not republished, because a merchant may put their own customer identifiers in them.",
+      "type": "array",
+      "maxItems": 50,
+      "items": { "type": "string", "maxLength": 128 }
+    },
+    "createdAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer", "minimum": 1 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-6 Payment Orchestration",
+  "x-consumers": ["Ledger", "Analytics", "Audit"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "paymentMethod": "route-to-dlq", "riskDecision": "route-to-dlq" },
+  "examples": [
+    {
+      "paymentId": "pay_01JB8Z9K2QW3E4R5T6Y7V8J9N0",
+      "amount": { "amount": 1050, "currency": "USD" },
+      "paymentMethod": "CARD",
+      "captureMode": "MANUAL",
+      "riskDecision": "ALLOW",
+      "riskScore": 12,
+      "routingPlanId": "rpl_01JB8ZEEEEEEEEEEEEEEEEEEEE",
+      "candidateGateways": ["stripe", "adyen"],
+      "idempotencyKeyHash": "3a7fc001e5b2d4a6f8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4",
+      "metadataKeys": ["orderId"],
+      "createdAt": "2026-08-26T14:03:10.980Z"
+    }
+  ]
+}

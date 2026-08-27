@@ -1,0 +1,33 @@
+{{- if .Values.smoke.enabled }}
+{{/*
+PostSync smoke test. Verifies the deployment end to end; a failure fails the sync
+and triggers the rollback path. backoffLimit: 1 because a smoke test that failed
+once may have raced a not-yet-warm pod, but a smoke test that failed twice is a
+real signal.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "pp-common.fullname" . }}-smoke
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+    pp.job: smoke
+  annotations:
+    argocd.argoproj.io/hook: {{ .Values.smoke.hook }}
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+    argocd.argoproj.io/sync-wave: {{ .Values.smoke.syncWave | quote }}
+spec:
+  backoffLimit: {{ .Values.smoke.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.smoke.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+{{- include "pp-common.labels" . | nindent 8 }}
+        pp.job: smoke
+    spec:
+{{- include "platformctl.jobPodSpec" (dict "ctx" . "args" (list
+      "smoke"
+      (printf "--env=%s" .Values.global.environment)
+      (printf "--assert=%s" .Values.smoke.assertions))) | nindent 6 }}
+{{- end }}

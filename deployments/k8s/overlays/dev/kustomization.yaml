@@ -1,0 +1,66 @@
+# dev overlay — pp-dev account, one cluster, Spot-first, synthetic data only.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - preview-namespace-quota.yaml
+
+patches:
+  # Dev clusters are small. The quotas are the cost cap, not a capacity plan:
+  # the dev account has a hard AWS Budget action that stops preview creation at
+  # 100% of the monthly forecast.
+  - target:
+      kind: ResourceQuota
+    patch: |-
+      - op: replace
+        path: /spec/hard/requests.cpu
+        value: "40"
+      - op: replace
+        path: /spec/hard/requests.memory
+        value: 80Gi
+      - op: replace
+        path: /spec/hard/limits.memory
+        value: 120Gi
+      - op: replace
+        path: /spec/hard/pods
+        value: "120"
+  # One otel-gateway replica: dev traces at 100% but the volume is trivial, and
+  # a 3-replica hash ring over ~40 traces/minute samples nothing usefully anyway.
+  - target:
+      kind: Deployment
+      name: otel-gateway
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/priorityClassName
+        value: pp-preview
+  # A minAvailable: 2 PDB over a single replica blocks every node drain, and a
+  # Spot-first cluster drains constantly.
+  - target:
+      kind: PodDisruptionBudget
+      name: otel-gateway
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 1
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: otel-gateway
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 3
+  - target:
+      kind: ServiceAccount
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/eks.amazonaws.com~1role-arn
+        value: arn:aws:iam::444455556666:role/pp-dev-workload
+
+replacements: []

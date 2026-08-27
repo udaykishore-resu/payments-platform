@@ -1,0 +1,79 @@
+# deploy/otel/collector.dev.yaml — local OpenTelemetry collector configuration.
+#
+# Mirrors the shape of the production otel-gateway (deployment.md §2.6) at one-hundredth
+# the scale: the same receiver, the same processor order, the same resource attributes.
+# The point of matching the shape rather than writing the simplest thing that works is
+# that a pipeline bug — a dropped attribute, a processor in the wrong order — reproduces
+# locally instead of being discovered from a gap in a production dashboard.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # memory_limiter MUST be first in every pipeline. It is the only processor that can shed
+  # load, and a processor placed after it has already allocated the memory it was meant to
+  # prevent.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: development
+        action: upsert
+      - key: service.namespace
+        value: payments-platform
+        action: upsert
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Local only. A debug exporter in production would be an unbounded log volume; here it
+  # is how you find out that a span never left the process.
+  debug:
+    verbosity: basic
+
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Exemplars carry the trace ID from a histogram bucket to the trace, which is the
+    # mechanism baseline §22.3 names when it says payment_id lives in exemplars rather
+    # than in labels.
+    enable_open_metrics: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug]

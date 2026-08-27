@@ -1,0 +1,362 @@
+# deploy/docker-compose.dev.yml — the local development stack.
+#
+# Brought up by scripts/dev-up.sh and torn down by scripts/dev-down.sh. It exists so that
+# `make test-integration` and `make test-e2e` have somewhere to run that is not a shared
+# environment, and so that the first hour of a new engineer's week is spent reading code
+# rather than installing Kafka.
+#
+# Design notes, because a compose file is where undocumented decisions accumulate:
+#
+#   * Every service has a healthcheck and every dependant declares
+#     `condition: service_healthy`. Compose's default `depends_on` waits for the container
+#     to *start*, which for Postgres means "the process exists", not "it accepts
+#     connections" — and a test suite that races the database produces a flake that looks
+#     like a product bug. The health gate is the difference.
+#
+#   * Redpanda rather than Kafka + ZooKeeper/KRaft: one process, one port, ~200 MB of RAM
+#     instead of ~2 GB, and the same wire protocol. The production broker is MSK; the
+#     franz-go client cannot tell the difference, and the properties the integration tests
+#     assert (partition ordering, consumer-group rebalance, offset commit semantics) hold
+#     on both. Where a test needs a broker behaviour Redpanda does not reproduce, it is an
+#     integration test against MSK in the staging environment, not a local one.
+#
+#   * No production secret ever appears here. Every credential is `dev`-scoped, weak on
+#     purpose, and named so that a copy-paste into a real environment is obvious.
+#
+#   * The gateway simulator is the only "gateway" reachable from this stack. There are no
+#     sandbox credentials in a local environment (deployment.md §6, preview environments):
+#     a laptop is the least-controlled compute in the estate.
+#
+#   * `tmpfs` for Postgres data. A local stack is disposable by definition, and running
+#     the WAL in RAM roughly halves integration-suite runtime. `dev-down.sh --keep-data`
+#     is deliberately not offered for this reason — if state must survive, it belongs in a
+#     migration or a seed profile, not in a stray volume.
+
+name: pp-dev
+
+x-pp-labels: &pp-labels
+  com.payments-platform.stack: dev
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # --- data stores --------------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16.6-alpine
+    container_name: pp-dev-postgres
+    labels: *pp-labels
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: pp_dev
+      POSTGRES_PASSWORD: pp_dev_not_a_real_password
+      POSTGRES_DB: pp
+      # C collation and UTF-8: the production cluster uses the same, and a collation
+      # difference silently changes ORDER BY results on merchant names between local and
+      # production — which surfaces as a cursor-pagination bug that reproduces nowhere.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - postgres
+      # Row-level security is the tenant-isolation control (baseline §16.2). The migrations
+      # create the policies; these settings make the local server behave like the
+      # production one, where the application role is NOT a superuser and therefore cannot
+      # bypass RLS. Without this, every local tenant-isolation test passes vacuously.
+      - -c
+      - log_statement=none
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - fsync=off               # disposable data; see the tmpfs note above
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+    ports:
+      - "${PP_DEV_POSTGRES_PORT:-5432}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data:rw,size=2g
+    healthcheck:
+      # pg_isready reports "accepting connections", which is the property that matters.
+      test: ["CMD-SHELL", "pg_isready -U pp_dev -d pp -q"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: pp-dev-redis
+    labels: *pp-labels
+    logging: *default-logging
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      # maxmemory-policy noeviction, not allkeys-lru: the idempotency records in Redis are
+      # a correctness structure, not a cache (baseline §14). An eviction under memory
+      # pressure would silently turn a replay into a second charge. Production sets the
+      # same policy; the local stack must not be more forgiving than production about the
+      # one thing that would cost money.
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "${PP_DEV_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redpanda:
+    image: redpandadata/redpanda:v24.3.6
+    container_name: pp-dev-redpanda
+    labels: *pp-labels
+    logging: *default-logging
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
+      # Two advertised listeners because the address that works from inside the compose
+      # network (redpanda:9092) is not the address that works from the host (localhost:
+      # 19092), and a Kafka client follows the advertised address after metadata discovery
+      # rather than the one it dialled. Getting this wrong produces a client that connects,
+      # fetches metadata, then hangs — the single most common local-Kafka failure.
+      - --advertise-kafka-addr=INTERNAL://redpanda:9092,EXTERNAL://localhost:19092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "${PP_DEV_KAFKA_PORT:-19092}:19092"
+      - "${PP_DEV_REDPANDA_ADMIN_PORT:-9644}:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health -X admin.hosts=localhost:9644 | grep -q 'Healthy:.*true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+  # --- the fake outside world ----------------------------------------------------------------
+
+  gateway-simulator:
+    # Built from this repository: it is the only gateway a local stack may talk to, and it
+    # is the same binary the contract suite runs against (testing.md §5.1), so a scenario
+    # reproduced locally is reproducible in CI.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE: gateway-simulator
+        VERSION: dev
+    container_name: pp-dev-gateway-simulator
+    labels: *pp-labels
+    logging: *default-logging
+    environment:
+      PP_SERVICE_NAME: gateway-simulator
+      # `development` is not a legal environment: runtime.ParseEnvironment accepts `sandbox` and
+      # `production` only, and this container exited before binding a port until it said sandbox.
+      # sandbox is also what permits the simulator at all — the composition roots refuse it
+      # outside sandbox, and the image has its own guard stage.
+      PP_ENVIRONMENT: sandbox
+      PP_REGION: local
+      PP_LOG_LEVEL: debug
+      PP_HTTP_ADDR: ":8090"
+      PP_ADMIN_ADDR: ":8091"
+      # Required with no default, even here: an unauthenticated simulator on a shared network is
+      # an endpoint anything can drive, and a test that can be driven by anything is a test whose
+      # failures nobody can attribute. A local fixture value, not a credential.
+      PP_SIMULATOR_API_KEY: dev-simulator-not-a-real-key
+      # Deterministic by default. A simulator that injects random latency turns every
+      # failing test into a coin toss; scenarios are selected explicitly by the
+      # `pp_sim_scenario` metadata key on a request (internal/adapters/gateway/simulator).
+      PP_SIM_SEED: "1724680000000000000"
+      PP_SIM_DEFAULT_LATENCY_MS: "25"
+      PP_SIM_WEBHOOK_TARGET: "http://webhook-ingress:8083/v1/webhooks"
+    ports:
+      - "${PP_DEV_SIMULATOR_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD", "/app/gateway-simulator", "-healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  dev-issuer:
+    # The local OIDC issuer. config/dev.yaml and .env.dev both point PP_AUTH_JWKS_URL at :8088,
+    # and until this service existed nothing served it — so every authenticated local request
+    # failed at startup (the JWKS warm-up is a startup failure by design) or with a 401.
+    #
+    # It is built from this repository rather than pulled, for the same reason the simulator is:
+    # the tokens it mints must satisfy internal/platform/authn exactly, and its own test drives
+    # that validator against it.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE: devissuer
+        SERVICE_PATH: ./scripts/devissuer
+        VERSION: dev
+        ALLOW_TEST_SERVICE: "1"
+    container_name: pp-dev-issuer
+    labels: *pp-labels
+    logging: *default-logging
+    environment:
+      PP_DEV_ISSUER_ADDR: ":8088"
+      # The `iss` claim is compared for exact string equality against PP_AUTH_ISSUER, trailing
+      # slash included. Localhost rather than the service name because the token is minted for a
+      # developer on the host, and both sides must agree on one spelling.
+      PP_DEV_ISSUER_URL: "http://localhost:8088/"
+      PP_DEV_ISSUER_AUDIENCE: payments-platform-dev
+      PP_DEV_ISSUER_ENV: sandbox
+      PP_DEV_ISSUER_TTL: 8h
+      # Persisted so a restart of this container does not invalidate every token a developer
+      # holds: services cache the JWKS in the background, so a new key means UNKNOWN_KEY until
+      # the next refresh.
+      PP_DEV_ISSUER_KEY_FILE: /var/lib/devissuer/issuer-key.pem
+    volumes:
+      # A bind mount into the repo's gitignored .dev/ rather than a named volume, so that the
+      # containerised issuer and `make run-dev-issuer` share one signing key. Two issuers with
+      # two keys is two sets of tokens, and the second one you try always fails with UNKNOWN_KEY.
+      - ../.dev:/var/lib/devissuer
+    ports:
+      - "${PP_DEV_ISSUER_PORT:-8088}:8088"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8088/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+
+  # --- observability ---------------------------------------------------------------------------
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.118.0
+    container_name: pp-dev-otel-collector
+    labels: *pp-labels
+    logging: *default-logging
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./otel/collector.dev.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "${PP_DEV_OTLP_GRPC_PORT:-4317}:4317"
+      - "${PP_DEV_OTLP_HTTP_PORT:-4318}:4318"
+      - "13133:13133"   # health_check extension
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:13133/ >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.65.0
+    container_name: pp-dev-jaeger
+    labels: *pp-labels
+    logging: *default-logging
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${PP_DEV_JAEGER_UI_PORT:-16686}:16686"
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: pp-dev-prometheus
+    labels: *pp-labels
+    logging: *default-logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2h
+      - --web.enable-lifecycle
+      # Exemplars are what connect the p99 on a dashboard to the trace of the request that
+      # produced it — the mechanism baseline §22.3 relies on when it says merchant_id and
+      # payment_id live "in logs, traces and exemplars" instead of in labels. Off by
+      # default in Prometheus; on here, so the local stack demonstrates the pattern the
+      # production one depends on.
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./prometheus/prometheus.dev.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${PP_DEV_PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:9090/-/healthy >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: pp-dev-grafana
+    labels: *pp-labels
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # No sign-in on a local stack. The alternative is a password everyone shares, which
+      # is a password that eventually gets typed into something that matters.
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: traceToMetrics
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${PP_DEV_GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+
+  # --- migrations -------------------------------------------------------------------------------
+
+  migrate:
+    # A one-shot job, not a long-running service. It exits 0 when the schema is current;
+    # dev-up.sh waits on that exit status before declaring the stack ready, so no service
+    # ever starts against a schema that does not have what it needs — the same ordering
+    # ArgoCD enforces with sync wave -1 in a cluster (deployment.md §3.3).
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE: platformctl
+        VERSION: dev
+    container_name: pp-dev-migrate
+    labels: *pp-labels
+    logging: *default-logging
+    command: ["migrate", "up"]
+    environment:
+      PP_DSN: "postgres://pp_dev:pp_dev_not_a_real_password@postgres:5432/pp?sslmode=disable"
+      # See the note on gateway-simulator: `development` is not a legal environment.
+      PP_ENVIRONMENT: sandbox
+      PP_REGION: local
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  default:
+    name: pp-dev
+    labels:
+      com.payments-platform.stack: dev

@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.settled.v1.json",
+  "title": "payment.settled.v1",
+  "description": "Settlement of a captured payment was OBSERVED in a gateway report. Published by Ledger & Reconciliation (BC-8) - not by the orchestrator - on pp.payments.payment.v1, keyed by payment_id, because settlement is observed from gateway reports rather than decided by us. The platform takes no custody of funds and does not compute settlement: every figure here is as REPORTED, and a gross/fee/net arithmetic mismatch opens a reconciliation exception rather than being silently corrected.",
+  "type": "object",
+  "required": [
+    "settlementId",
+    "gatewayCode",
+    "grossAmount",
+    "feeAmount",
+    "netAmount",
+    "settlementCurrency",
+    "settlementDate",
+    "reportUri",
+    "observedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "settlementId": {
+      "description": "The gateway's settlement batch reference.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "grossAmount": { "$ref": "#/$defs/money" },
+    "feeAmount": { "$ref": "#/$defs/money", "description": "The gateway fee as reported. We do not compute it." },
+    "netAmount": {
+      "$ref": "#/$defs/money",
+      "description": "gross - fee, as reported. A mismatch with our own subtraction opens a reconciliation exception; it is never silently corrected, because a report we quietly 'fix' is a report we can no longer reconcile against."
+    },
+    "settlementCurrency": {
+      "description": "May differ from the payment currency on cross-currency settlement.",
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "fxRate": {
+      "description": "Present only on cross-currency settlement. A DECIMAL STRING, not a float and not Money - it is a rate rather than an amount, and its precision matters in a way that binary floating point cannot preserve.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "settlementDate": {
+      "description": "The value date the gateway reports, as a calendar date rather than an instant - settlement is a banking-day concept, not a timestamp.",
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "reportUri": {
+      "description": "The ingested gateway report, retained so a disputed figure can be traced to the bytes we received.",
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048
+    },
+    "observedAt": {
+      "description": "When WE observed the settlement, distinct from settlementDate. The gap between the two is the reconciliation lag.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "event-consumer",
+  "x-context": "BC-8 Ledger & Reconciliation",
+  "x-consumers": ["Ledger", "Reconciliation"],
+  "x-revision": 1,
+  "examples": [
+    {
+      "settlementId": "po_1Oq7xL2eZvKY",
+      "gatewayCode": "stripe",
+      "grossAmount": { "amount": 600, "currency": "USD" },
+      "feeAmount": { "amount": 27, "currency": "USD" },
+      "netAmount": { "amount": 573, "currency": "USD" },
+      "settlementCurrency": "USD",
+      "settlementDate": "2026-08-29",
+      "reportUri": "s3://pp-settlement/stripe/2026-08-29/po_1Oq7xL.csv",
+      "observedAt": "2026-08-29T06:12:44.000Z"
+    },
+    {
+      "settlementId": "po_1Oq8aB3fCwMZ",
+      "gatewayCode": "adyen",
+      "grossAmount": { "amount": 89900, "currency": "EUR" },
+      "feeAmount": { "amount": 1798, "currency": "EUR" },
+      "netAmount": { "amount": 88102, "currency": "EUR" },
+      "settlementCurrency": "USD",
+      "fxRate": "1.0842",
+      "settlementDate": "2026-08-31",
+      "reportUri": "s3://pp-settlement/adyen/2026-08-31/po_1Oq8aB.csv",
+      "observedAt": "2026-08-31T05:44:10.000Z"
+    }
+  ]
+}

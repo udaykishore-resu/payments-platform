@@ -1,0 +1,54 @@
+apiVersion: v2
+name: payments-platform
+description: |
+  Umbrella chart for the payments-platform deployables. One subchart per
+  deployable of baseline §5, plus platformctl for migrations and scheduled
+  sweeps, over the pp-common library chart.
+
+  The umbrella exists for local rendering, CI validation and preview
+  environments. In prod each Application in the ApplicationSet points at ONE
+  subchart, so a broken chart for one deployable cannot block the sync of
+  another (deployments/argocd/README.md).
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0-0"
+keywords:
+  - payments
+  - orchestration
+dependencies:
+  - name: pp-common
+    version: 1.0.0
+    repository: "file://../charts/pp-common"
+  - name: control-plane-api
+    version: 1.0.0
+    repository: "file://../charts/control-plane-api"
+    condition: control-plane-api.enabled
+  - name: payment-api
+    version: 1.0.0
+    repository: "file://../charts/payment-api"
+    condition: payment-api.enabled
+  - name: payment-orchestrator
+    version: 1.0.0
+    repository: "file://../charts/payment-orchestrator"
+    condition: payment-orchestrator.enabled
+  - name: workflow-worker
+    version: 1.0.0
+    repository: "file://../charts/workflow-worker"
+    condition: workflow-worker.enabled
+  - name: webhook-ingress
+    version: 1.0.0
+    repository: "file://../charts/webhook-ingress"
+    condition: webhook-ingress.enabled
+  - name: outbox-relay
+    version: 1.0.0
+    repository: "file://../charts/outbox-relay"
+    condition: outbox-relay.enabled
+  - name: event-consumer
+    version: 1.0.0
+    repository: "file://../charts/event-consumer"
+    condition: event-consumer.enabled
+  - name: platformctl
+    version: 1.0.0
+    repository: "file://../charts/platformctl"
+    condition: platformctl.enabled

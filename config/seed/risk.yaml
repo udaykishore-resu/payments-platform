@@ -1,0 +1,104 @@
+# config/seed/risk.yaml — the default risk policy a seeded or newly-onboarded merchant starts with.
+#
+# Every number here is a starting point that a merchant's own configuration overrides. What is not
+# negotiable is the *shape*: the per-check failure postures below decide what happens when a risk
+# input is unavailable, and getting one of those wrong is how a Redis blip becomes either a total
+# payment outage or an undetected card-testing run.
+
+# Per-payment ceiling. Exceeding it is a decline, never a review: this is a contractual limit
+# rather than a risk signal, and there is nothing for a human to decide.
+max_transaction_amount:
+  amount: 500000
+  currency: EUR
+
+# The amount above which the merchant forces authentication regardless of risk signals. It is
+# below the EEA's own SCA threshold on purpose: a challenge the merchant chose is cheaper than a
+# soft decline the issuer chose.
+require_3ds_above:
+  amount: 25000
+  currency: EUR
+
+# Daily money ceiling. A new merchant's declared volume is an estimate; this bounds the damage of
+# an estimate that was wrong by two orders of magnitude, which is what a compromised API key looks
+# like on the first day.
+daily_volume_limit:
+  amount: 10000000
+  currency: EUR
+
+velocity:
+  # The blunt instrument: it catches a compromised API key before the per-card checks have enough
+  # data to notice.
+  max_payments_per_minute: 100
+  # The single most effective card-testing control. Five attempts on one card fingerprint in an
+  # hour is generous for a real customer correcting a typo and hostile to an attacker walking a
+  # BIN range.
+  max_per_card_per_hour: 5
+  max_per_customer_per_day: 20
+
+# Distinct card fingerprints per customer per day. This is the card-testing check that survives an
+# attacker rotating customer identifiers less often than they rotate cards.
+max_cards_per_customer_per_day: 3
+
+# External scorer thresholds, 0..100, higher is riskier.
+decline_score_at_or_above: 90
+review_score_at_or_above: 75
+three_ds_score_at_or_above: 60
+
+# The merchant's own blocked set. The platform's mandatory sanctions list is unioned with it at
+# compile time and is checked *before* any allowlist, so a merchant cannot allowlist their way past
+# a sanction.
+blocked_countries: []
+
+# Empty means "all countries". A merchant selling in three countries declares those three.
+allowed_countries: []
+
+# Per-check failure postures: what happens when a check's data is unavailable.
+#
+# These are per check rather than one global setting because the safe answer genuinely differs.
+# When the velocity store is unreachable, declining every payment turns a Redis blip into a total
+# outage — so the posture is REQUIRE_3DS, which keeps money moving under authentication. When the
+# sanctions screen is unreachable, allowing is not an option at any cost — so it is FAIL_CLOSED.
+# A single knob would force one of those two to be wrong.
+postures:
+  L5.CUSTOMER_COUNTRY_NOT_BLOCKED: FAIL_CLOSED
+  L5.IP_COUNTRY_NOT_SANCTIONED: FAIL_CLOSED
+  L5.AMOUNT_WITHIN_MERCHANT_LIMIT: FAIL_CLOSED
+  L5.DAILY_VOLUME_WITHIN_LIMIT: FAIL_CLOSED
+  L5.VELOCITY_PAYMENTS_PER_MINUTE: REQUIRE_3DS
+  L5.VELOCITY_PER_CARD_PER_HOUR: REQUIRE_3DS
+  L5.VELOCITY_PER_CUSTOMER_PER_DAY: REQUIRE_3DS
+  L5.VELOCITY_DISTINCT_CARDS_PER_CUSTOMER: REQUIRE_3DS
+  # The external scorer is a genuinely additive signal: its absence means the decision is made
+  # without it, not that the check was skipped. This is the one check where FAIL_OPEN is defensible.
+  L5.RISK_SCORE_BELOW_DECLINE_THRESHOLD: FAIL_OPEN
+  L5.NOT_ON_PLATFORM_BLOCKLIST: FAIL_CLOSED
+  L5.NOT_ON_MERCHANT_BLOCKLIST: REQUIRE_3DS
+
+limits:
+  # Six months. Long enough for the refund windows the card schemes mandate, short enough that a
+  # gateway's own window has not expired underneath it.
+  max_refund_window_days: 180
+  max_partial_captures: 5
+  max_refunds_per_payment: 20
+  authorization_validity_hours: 168
+
+settlement:
+  schedule: DAILY
+  currency: EUR
+  # Two days. It covers the dispute-initiation window on the fastest schemes without holding a
+  # merchant's money longer than the risk warrants.
+  hold_days: 2
+
+webhooks:
+  # Eight attempts with exponential backoff and jitter spans roughly a day, which covers a
+  # merchant endpoint's deploy window without retrying into a permanently dead endpoint forever.
+  max_attempts: 8
+  backoff: EXPONENTIAL_JITTER
+  initial_delay_seconds: 5
+  max_delay_seconds: 3600
+
+feature_flags:
+  network_tokens: false
+  partial_capture: true
+  multi_capture: false
+  three_ds_exemptions: false

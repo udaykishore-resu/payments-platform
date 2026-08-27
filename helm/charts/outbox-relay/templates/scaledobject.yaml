@@ -1,0 +1,35 @@
+{{- if and .Values.autoscaling.enabled (eq .Values.autoscaling.type "keda") }}
+{{/*
+KEDA, because CPU is a terrible proxy for "there is a backlog". The ScaledObject
+owns a generated HPA; the behavior block below is passed through to it so the
+same scale-up/scale-down asymmetry applies.
+*/}}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "pp-common.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  scaleTargetRef:
+{{- if .Values.rollout.enabled }}
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+{{- end }}
+    name: {{ include "pp-common.fullname" . }}
+  # Nothing scales to zero on the money path.
+  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  pollingInterval: {{ .Values.autoscaling.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.autoscaling.keda.cooldownPeriod }}
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+{{- toYaml .Values.autoscaling.behavior | nindent 8 }}
+  triggers:
+{{- toYaml .Values.autoscaling.keda.triggers | nindent 4 }}
+{{- end }}

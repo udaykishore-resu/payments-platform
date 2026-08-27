@@ -1,0 +1,159 @@
+# SLO burn-rate alerting (observability.md §4).
+#
+# | Window pair | Burn | Budget spent before firing | Time to exhaustion | Action |
+# |---|---|---|---|---|
+# | 1h / 5m     | 14.4x | 2%  | ~2d 1h | Page (P1)   |
+# | 6h / 30m    | 6x    | 5%  | ~5d    | Ticket (P2) |
+# | 3d budget   | —     | —   | —      | Freeze policy |
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pp-slo-burn-rules
+  namespace: pp-observability
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+    prometheus: pp
+    role: alert-rules
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  groups:
+    - name: pp.slo.availability.burn
+      interval: 30s
+      rules:
+        # Multi-window, multi-burn-rate. The LONG window says "this is a real,
+        # sustained problem"; the SHORT window says "it is still happening right
+        # now". Requiring both is what stops a five-minute blip from paging and
+        # stops a recovered incident from paging for another hour.
+        #
+        # Budget for 99.99% over 30 days = 0.01% of requests = 4m23s of full
+        # outage equivalent. Burning at 1x exhausts it in exactly 30 days.
+        - alert: PaymentAPIFastBurn
+          expr: |
+            (
+              pp:payment_api_error:ratio_rate1h > (14.4 * 0.0001)
+              and
+              pp:payment_api_error:ratio_rate5m > (14.4 * 0.0001)
+            )
+          for: 2m
+          labels:
+            severity: P1
+            slo: payment_api_availability
+            plane: data
+            service: payment-api
+            page: "true"
+          annotations:
+            summary: 'payment-api is burning its error budget at {{ printf "%.1f" (div $value 0.0001) }}x'
+            description: >-
+              14.4x burn over both 1h and 5m windows: 2% of the 30-day error
+              budget is already gone and at this rate the whole budget is
+              exhausted in about 2 days. Current 5m error ratio
+              {{ printf "%.4f" $value }} on {{ $labels.service }}.
+            runbook_url: https://docs.example.com/runbooks/payment-api-availability
+            dashboard_url: https://grafana.example.com/d/pp-service-health?var-service=payment-api
+            query: pp:payment_api_error:ratio_rate5m
+
+        - alert: PaymentAPISlowBurn
+          expr: |
+            (
+              pp:payment_api_error:ratio_rate6h > (6 * 0.0001)
+              and
+              pp:payment_api_error:ratio_rate30m > (6 * 0.0001)
+            )
+          for: 15m
+          labels:
+            severity: P2
+            slo: payment_api_availability
+            plane: data
+            service: payment-api
+            page: "false"
+          annotations:
+            summary: 'payment-api error budget burning at 6x, sustained over 6h'
+            description: >-
+              6x burn over both 6h and 30m windows: 5% of the 30-day budget is
+              gone and exhaustion is about 5 days away. Ticket, not a page — but
+              a deploy freeze becomes likely if this continues.
+            runbook_url: https://docs.example.com/runbooks/payment-api-availability
+            dashboard_url: https://grafana.example.com/d/pp-service-health?var-service=payment-api
+            query: pp:payment_api_error:ratio_rate30m
+
+    - name: pp.slo.latency.burn
+      interval: 30s
+      rules:
+        # The latency SLO is expressed as a good-events ratio against the 0.25s
+        # histogram bucket, so budget arithmetic works. Budget = 1%.
+        - alert: PaymentAPILatencyFastBurn
+          expr: |
+            (
+              pp:payment_api_latency_bad:ratio_rate1h > (14.4 * 0.01)
+              and
+              pp:payment_api_latency_bad:ratio_rate5m > (14.4 * 0.01)
+            )
+          for: 2m
+          labels:
+            severity: P1
+            slo: payment_api_latency
+            plane: data
+            service: payment-api
+            page: "true"
+          annotations:
+            summary: 'payment-api p99 latency budget burning at 14.4x'
+            description: >-
+              {{ printf "%.1f" (mul $value 100) }}% of requests are slower than
+              the 250ms SLO over the last 5m and the last 1h. Check panel 7 of
+              the service-health dashboard first: CPU throttling on a
+              latency-sensitive service means someone added a CPU limit.
+            runbook_url: https://docs.example.com/runbooks/payment-api-latency
+            dashboard_url: https://grafana.example.com/d/pp-service-health?var-service=payment-api
+            query: pp:payment_api_latency_bad:ratio_rate5m
+
+        - alert: PaymentAPILatencySlowBurn
+          expr: |
+            (
+              pp:payment_api_latency_bad:ratio_rate6h > (6 * 0.01)
+              and
+              pp:payment_api_latency_bad:ratio_rate30m > (6 * 0.01)
+            )
+          for: 15m
+          labels:
+            severity: P2
+            slo: payment_api_latency
+            plane: data
+            service: payment-api
+            page: "false"
+          annotations:
+            summary: 'payment-api latency budget burning at 6x, sustained'
+            description: >-
+              {{ printf "%.1f" (mul $value 100) }}% of requests exceeded 250ms
+              over 6h and 30m. Usually a slow dependency or a pool starving, not
+              a code regression.
+            runbook_url: https://docs.example.com/runbooks/payment-api-latency
+            dashboard_url: https://grafana.example.com/d/pp-service-health?var-service=payment-api
+            query: pp:payment_api_latency_bad:ratio_rate30m
+
+    - name: pp.slo.policy
+      interval: 1m
+      rules:
+        - alert: ErrorBudgetPolicyFreeze
+          expr: pp:error_budget_remaining:payment_api < 0.25
+          for: 30m
+          labels:
+            severity: P3
+            slo: payment_api_availability
+            plane: data
+            service: payment-api
+            policy: freeze
+            page: "false"
+          annotations:
+            summary: >-
+              payment-api error budget at {{ printf "%.0f" (mul $value 100) }}% —
+              deploy freeze tier {{ if lt $value 0.10 }}HARD{{ else }}SOFT{{ end }}
+            description: >-
+              Soft freeze below 25%: only bug fixes, reliability work and security
+              patches merge. Hard freeze below 10%: the reliability backlog
+              becomes the sprint. The gate is enforced by scripts/slo-gate.sh as
+              a required check, and exemptions need SRE-lead approval recorded on
+              the PR.
+            runbook_url: https://docs.example.com/runbooks/error-budget-policy
+            dashboard_url: https://grafana.example.com/d/pp-executive
+            query: pp:error_budget_remaining:payment_api

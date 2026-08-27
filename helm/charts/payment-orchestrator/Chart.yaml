@@ -1,0 +1,19 @@
+apiVersion: v2
+name: payment-orchestrator
+description: Owns the payment FSM and the gateway calls. Bulkheaded per gateway. The only caller of the gateways.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0-0"
+keywords:
+  - payments
+  - data-plane
+annotations:
+  pp.plane: data
+  pp.namespace: pp-data-plane
+  pp.node-group: data
+  pp.availability-target: "99.99%"
+dependencies:
+  - name: pp-common
+    version: 1.0.0
+    repository: "file://../pp-common"

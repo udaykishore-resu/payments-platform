@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.refunded.v1.json",
+  "title": "payment.refunded.v1",
+  "description": "A refund succeeded and money was returned to the payer. Published by Payment Orchestration (BC-6) on pp.payments.payment.v1, keyed by payment_id, and emitted only on the refund reaching SUCCEEDED. Both cumulative totals are carried as invariant I1 evidence (refundedTotal <= capturedTotal) so a ledger consumer can assert the invariant rather than recompute it from an event history it may not hold in full.",
+  "type": "object",
+  "required": [
+    "refundId",
+    "attemptId",
+    "gatewayCode",
+    "gatewayReference",
+    "refundedAmount",
+    "refundedTotal",
+    "capturedTotal",
+    "isFullRefund",
+    "reason",
+    "requestedBy",
+    "refundedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "refundId": { "type": "string", "pattern": "^ref_[0-9A-Z]{26}$" },
+    "attemptId": { "type": "string", "pattern": "^att_[0-9A-Z]{26}$" },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "gatewayReference": { "type": "string", "maxLength": 128 },
+    "refundedAmount": { "$ref": "#/$defs/money", "description": "This refund only." },
+    "refundedTotal": { "$ref": "#/$defs/money", "description": "Cumulative refunded. Invariant I1 evidence." },
+    "capturedTotal": { "$ref": "#/$defs/money", "description": "Cumulative captured. I1: refundedTotal <= capturedTotal." },
+    "isFullRefund": {
+      "description": "Distinguishes REFUNDED from PARTIALLY_REFUNDED without the consumer recomputing the difference between two Money values in possibly different currencies.",
+      "type": "boolean"
+    },
+    "reason": {
+      "type": "string",
+      "enum": ["DUPLICATE", "FRAUDULENT", "REQUESTED_BY_CUSTOMER", "OTHER"]
+    },
+    "requestedBy": {
+      "description": "Actor identifier. Refunds are the one money-moving operation a human principal can reach, and only under dual control, so the actor matters here more than on most events.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "refundedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer", "minimum": 0 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-6 Payment Orchestration",
+  "x-consumers": ["Ledger", "Notification"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "reason": "route-to-dlq" },
+  "examples": [
+    {
+      "refundId": "ref_01JB8ZGGGGGGGGGGGGGGGGGGGG",
+      "attemptId": "att_01JB8Z44444444444444444444",
+      "gatewayCode": "stripe",
+      "gatewayReference": "re_3OqZ4L2eZvKYlo2C",
+      "refundedAmount": { "amount": 300, "currency": "USD" },
+      "refundedTotal": { "amount": 300, "currency": "USD" },
+      "capturedTotal": { "amount": 600, "currency": "USD" },
+      "isFullRefund": false,
+      "reason": "REQUESTED_BY_CUSTOMER",
+      "requestedBy": "cli_01JB8Z55555555555555555555",
+      "refundedAt": "2026-08-28T09:31:02.884Z"
+    }
+  ]
+}

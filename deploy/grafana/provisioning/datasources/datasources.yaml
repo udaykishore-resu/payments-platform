@@ -1,0 +1,33 @@
+# Provisioned datasources for the local Grafana. Provisioned rather than clicked so that
+# every engineer's local Grafana is identical and a dashboard exported from one opens on
+# another.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: pp-prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      # exemplarTraceIdDestinations is what makes a p99 spike on a latency panel clickable
+      # through to the trace of a request in that bucket. Without it the exemplar is stored
+      # and never surfaced, which is the same as not collecting it.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: pp-jaeger
+
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    uid: pp-jaeger
+    url: http://jaeger:16686
+    jsonData:
+      tracesToMetrics:
+        datasourceUid: pp-prometheus
+        tags:
+          - key: service.name
+            value: service

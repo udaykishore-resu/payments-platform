@@ -1,0 +1,102 @@
+{
+  "Version": "2012-10-17",
+  "Comment": "Session policy attached at AssumeRole time by the IdP. It INTERSECTS with the break-glass role's own policy, so it can only narrow, never widen. Applied outside this repository. security.md 1.1: break-glass is 60 minutes, non-renewable, hardware-MFA, dual-approved, session-recorded, and every issuance pages the security channel.",
+  "Statement": [
+    {
+      "Sid": "RequireHardwareMfaOnEveryCall",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "BoolIfExists": {
+          "aws:MultiFactorAuthPresent": "false"
+        }
+      }
+    },
+    {
+      "Sid": "ExpireTheSessionEvenIfTheRoleWouldNot",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "NumericGreaterThan": {
+          "aws:MultiFactorAuthAge": "3600"
+        }
+      }
+    },
+    {
+      "Sid": "RequireTheChangeRecordAsASessionTag",
+      "Comment": "The session cannot be minted without a ticket reference, so the CloudTrail record of every break-glass action carries the reason.",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:PrincipalTag/ChangeRecord": "true"
+        }
+      }
+    },
+    {
+      "Sid": "TheThingsBreakGlassExistsFor",
+      "Effect": "Allow",
+      "Action": [
+        "rds:FailoverGlobalCluster",
+        "rds:RemoveFromGlobalCluster",
+        "rds:FailoverDBCluster",
+        "rds:ModifyDBCluster",
+        "rds:DescribeDBClusters",
+        "rds:DescribeGlobalClusters",
+        "rds:CreateDBClusterSnapshot",
+        "rds:RestoreDBClusterToPointInTime",
+        "dynamodb:UpdateItem",
+        "dynamodb:GetItem",
+        "eks:DescribeCluster",
+        "eks:ListClusters",
+        "eks:AccessKubernetesApi",
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:TestFailover",
+        "kafka:DescribeCluster",
+        "kafka:GetBootstrapBrokers",
+        "route53:ChangeResourceRecordSets",
+        "route53:GetHealthCheckStatus",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:PutObject",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecretVersionStage",
+        "kms:Decrypt",
+        "kms:Encrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:GetMetricData",
+        "logs:FilterLogEvents",
+        "logs:StartQuery",
+        "logs:GetQueryResults",
+        "ssm:StartSession",
+        "ssm:TerminateSession",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EvenBreakGlassMayNotDestroyEvidenceOrKeyMaterial",
+      "Comment": "Break-glass is for recovering from an incident, not for erasing one. Removing an Object Lock retention or a KMS key is a separate, slower, board-level procedure.",
+      "Effect": "Deny",
+      "Action": [
+        "s3:BypassGovernanceRetention",
+        "s3:PutBucketVersioning",
+        "kms:ScheduleKeyDeletion",
+        "kms:DisableKey",
+        "cloudtrail:StopLogging",
+        "cloudtrail:DeleteTrail",
+        "backup:DeleteBackupVaultLockConfiguration",
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "organizations:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

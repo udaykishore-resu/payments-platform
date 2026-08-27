@@ -1,0 +1,20 @@
+platformctl — {{ .Chart.Description }}
+
+  environment : {{ .Values.global.environment }} / {{ .Values.global.region }} (active: {{ .Values.global.regionActive }})
+  image       : {{ include "pp-common.image" . }}
+  migration   : {{ if .Values.migration.enabled }}{{ .Values.migration.hook }} hook, expect-version {{ .Values.migration.expectVersion }}, backoffLimit {{ .Values.migration.backoffLimit }}{{ else }}disabled{{ end }}
+  cronjobs    : {{ range $n, $c := .Values.cronJobs }}{{ if $c.enabled }}{{ $n }} ({{ $c.schedule }}) {{ end }}{{ end }}
+
+If the migration Job failed:
+
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "pp-common.fullname" . }}-migrate
+
+The sync failed, so the new pods never started and the previous version is still
+serving. Do NOT re-run it blindly and do NOT run `migrate down` — production
+rollback is forward-only, with a new, higher-numbered compensating migration
+(deployment.md §5.4). Down migrations exist for local resets and for CI to test
+both directions; running one on production data during an incident is the
+highest-risk action available.
+
+An `--expect-version` mismatch means a migration was skipped or re-ordered. Fix
+the release manifest, not the database.

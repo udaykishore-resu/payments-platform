@@ -1,0 +1,19 @@
+apiVersion: v2
+name: workflow-worker
+description: Leases workflow instances; runs onboarding activities and compensations.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0-0"
+keywords:
+  - payments
+  - automation-plane
+annotations:
+  pp.plane: automation
+  pp.namespace: pp-automation
+  pp.node-group: control
+  pp.availability-target: "99.9%"
+dependencies:
+  - name: pp-common
+    version: 1.0.0
+    repository: "file://../pp-common"

@@ -1,0 +1,24 @@
+# prod overlay — pp-prod account, eu-west-1 (active) and eu-central-1 (passive).
+#
+# The base is already production-shaped, so this overlay is small on purpose: a
+# large prod overlay means the base encodes some other environment's assumptions
+# and prod is the exception, which is the wrong way round for the environment
+# whose failures cost money.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - kyverno-gateway-simulator-deny.yaml
+
+patches:
+  # The passive region runs a warm 10% floor. Everything else about it is
+  # identical, including the image digest — a DR region running a different build
+  # is a DR plan that has not been tested.
+  - target:
+      kind: Deployment
+      name: otel-gateway
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3

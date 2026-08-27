@@ -1,0 +1,281 @@
+# platformctl — the ops binary. Runs as a PreSync migration Job, a PostSync smoke
+# Job, and a set of CronJobs. Never as a Deployment: it has no steady state.
+
+global:
+  environment: prod
+  region: eu-west-1
+  regionActive: "true"
+  imageRegistry: 111122223333.dkr.ecr.eu-west-1.amazonaws.com/payments-platform
+  accountId: "111122223333"
+  clusterDomain: cluster.local
+  networkCidrs:
+    pods:      ["10.20.16.0/20", "10.20.80.0/20", "10.20.96.0/20"]
+    database:  ["10.20.32.0/22", "10.20.36.0/22", "10.20.40.0/22"]
+    streaming: ["10.20.48.0/22", "10.20.52.0/22", "10.20.56.0/22"]
+    egress:    ["10.20.64.0/22", "10.20.68.0/22", "10.20.72.0/22"]
+  namespaces:
+    platform: pp-platform
+    observability: pp-observability
+    ingress: pp-platform
+
+nameOverride: ""
+fullnameOverride: ""
+component: ops
+plane: control
+nodeGroup: control
+tenantTier: pooled
+
+image:
+  repository: platformctl
+  registry: ""
+  digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: platformctl-migrator
+  automountServiceAccountToken: false
+  needsKubeAPI: false
+  tokenAudience: sts.amazonaws.com
+  # A dedicated, more privileged role than any runtime service: it is the only
+  # identity permitted to run DDL. It is also the only one that exists for
+  # minutes rather than continuously, which is the point.
+  roleArnTemplate: "arn:aws:iam::{{ .Values.global.accountId }}:role/pp-{{ .Values.global.environment }}-platformctl"
+  annotations: {}
+
+ports:
+  http: 0
+  grpc: 0
+  health: 8081
+  metrics: 9090
+
+resources:
+  # A limit is set on both dimensions: a migration Job is batch work with a hard
+  # deadline, and a runaway backfill competing with the money path for CPU is
+  # exactly the failure this bounds.
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2000m"
+    memory: "1Gi"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+volumes:
+  tmpSizeLimit: 64Mi
+  cacheSizeLimit: 256Mi
+
+# Jobs get no probes: there is no traffic to gate and no wedged-forever state a
+# restart would fix. activeDeadlineSeconds is the liveness equivalent for a Job.
+probes:
+  startup: { path: /healthz, periodSeconds: 2, timeoutSeconds: 2, failureThreshold: 45 }
+  readiness: { path: /readyz, periodSeconds: 5, timeoutSeconds: 2, successThreshold: 1, failureThreshold: 2 }
+  liveness: { path: /livez, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 6 }
+
+terminationGracePeriodSeconds: 60
+lifecycle:
+  preStopSleepSeconds: 0
+
+priorityClassName: pp-batch    # evicted first under node pressure: a sweep can wait
+
+topologySpread:
+  zoneMaxSkew: 1
+  hostMaxSkew: 2
+extraTolerations: []
+extraVolumes: []
+extraVolumeMounts: []
+podAnnotations: {}
+args: []
+env: {}
+
+config:
+  PP_LOG_LEVEL: "info"
+  PP_LOG_FORMAT: "json"
+  PP_DB_HOST: "pp-{{ .Values.global.environment }}-aurora.cluster-internal"
+  PP_DB_SSLMODE: "verify-full"
+  PP_DB_IAM_AUTH: "true"
+
+externalSecrets:
+  enabled: true
+  secretStore:
+    name: pp-secrets-manager
+    kind: ClusterSecretStore
+  refreshInterval: 15m
+  mountPath: /var/run/secrets/pp
+  pathPrefix: "platform/platformctl"
+  remoteRefs:
+    - secretKey: migrator-db-breakglass-ref
+      remoteKey: migrator-db-breakglass-ref
+
+# Unused by Jobs, present so the shared templates and the values-key checker have
+# a complete surface.
+autoscaling:
+  enabled: false
+  type: hpa
+  minReplicas: 1
+  maxReplicas: 1
+  metrics: []
+  behavior: {}
+  keda: { pollingInterval: 30, cooldownPeriod: 300, scaleDownStabilization: 300, triggers: [] }
+pdb:
+  enabled: false
+  minAvailable: null
+  maxUnavailable: null
+rollout:
+  enabled: false
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  maxSurge: "25%"
+  maxUnavailable: 0
+  trafficRouting: { alb: false, ingressName: "" }
+  steps: []
+  analysis:
+    enabled: false
+    startingStep: 2
+    prometheusAddress: ""
+    errorRate: { threshold: 0.001, interval: 1m, count: 10, failureLimit: 2 }
+    latencyP99: { threshold: 0.25, interval: 1m, count: 10, failureLimit: 2 }
+    authorizationRate: { enabled: false, threshold: -0.02, interval: 2m, count: 5, failureLimit: 1 }
+    errorBudget: { enabled: false, threshold: 0.10, interval: 5m, count: 8, failureLimit: 1 }
+service:
+  enabled: false
+  type: ClusterIP
+  annotations: {}
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  path: /metrics
+  honorLabels: false
+  sampleLimit: 20000
+  labels: {}
+replicaCount: 1
+
+networkPolicy:
+  enabled: true
+  dns: { enabled: true, namespace: kube-system }
+  ingress:
+    fromIngressController: false
+    fromPaymentAPI: false
+    fromPrometheus: false
+  egress:
+    database: true
+    redis: false
+    kafka: true
+    toOrchestrator: false
+    gatewayProxy: false
+    natEgress: false
+    otelAgent: true
+    awsEndpoints: true
+  ports:
+    database: 5432
+    redis: 6379
+    kafka: [9094, 9098]
+    egressProxy: 3128
+    otel: 4317
+    https: 443
+  gateways: []
+
+# ---------------------------------------------------------------- migrations
+migration:
+  enabled: true
+  # PreSync, not PostSync, and NEVER an init container. PreSync runs the
+  # migration once per sync in a single Job before any new pod starts. An init
+  # container would run it once per pod: N concurrent migrations racing for the
+  # advisory lock, with N-1 blocking pod startup while they wait.
+  hook: PreSync
+  syncWave: "0"
+  # A failed migration must NOT be retried blindly: a partially-applied migration
+  # retried automatically is how a bad deploy becomes a data incident. It blocks
+  # the sync and pages a human, which is correct — and because the sync fails,
+  # the new pods never start and the previous version keeps serving. A failed
+  # migration is a non-event for traffic.
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  lockTimeout: 30s
+  statementTimeout: 60s
+  # Passed from the release manifest. If the database is at an unexpected version
+  # the job fails before applying anything, which catches a re-ordered or skipped
+  # migration.
+  expectVersion: "0015"
+  ttlSecondsAfterFinished: 86400
+
+smoke:
+  enabled: true
+  hook: PostSync
+  syncWave: "5"
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  assertions: "payment-canary,config-propagation,webhook-roundtrip"
+
+# ------------------------------------------------------------- scheduled work
+cronJobs:
+  reconciliation-sweep:
+    enabled: true
+    schedule: "*/15 * * * *"
+    args: ["reconcile", "sweep", "--older-than=15m"]
+    concurrencyPolicy: Forbid      # overlapping sweeps double-resolve exceptions
+    startingDeadlineSeconds: 300
+    activeDeadlineSeconds: 600
+    backoffLimit: 2
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    suspendInPassiveRegion: true   # the passive region must not resolve money state
+  dlq-triage-report:
+    enabled: true
+    schedule: "0 7 * * 1-5"
+    args: ["dlq", "report", "--since=24h"]
+    concurrencyPolicy: Forbid
+    startingDeadlineSeconds: 600
+    activeDeadlineSeconds: 900
+    backoffLimit: 1
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    suspendInPassiveRegion: true
+  credential-age-audit:
+    enabled: true
+    schedule: "0 3 * * *"
+    args: ["credentials", "audit", "--warn-after=80d", "--fail-after=90d"]
+    concurrencyPolicy: Forbid
+    startingDeadlineSeconds: 600
+    activeDeadlineSeconds: 600
+    backoffLimit: 1
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    suspendInPassiveRegion: false  # credential ageing is a fact in both regions
+  partition-maintenance:
+    enabled: true
+    schedule: "0 2 * * *"
+    args: ["db", "partitions", "ensure", "--months-ahead=3"]
+    concurrencyPolicy: Forbid
+    startingDeadlineSeconds: 600
+    activeDeadlineSeconds: 1800
+    backoffLimit: 1
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    suspendInPassiveRegion: true
+  audit-chain-verify:
+    enabled: true
+    schedule: "0 * * * *"
+    args: ["audit", "verify-chain", "--window=1h"]
+    concurrencyPolicy: Forbid
+    startingDeadlineSeconds: 300
+    activeDeadlineSeconds: 900
+    backoffLimit: 1
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    suspendInPassiveRegion: false  # verify the replica's chain too

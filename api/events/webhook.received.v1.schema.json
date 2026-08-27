@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/webhook.received.v1.json",
+  "title": "webhook.received.v1",
+  "description": "A gateway webhook was received, signature-verified and persisted. Published by Webhook Ingestion (BC-7) on pp.webhooks.inbound.v1, keyed by gateway_ref. The ingress does nothing else: verify, deduplicate, persist, publish, return 202 inside a 50 ms budget. All interpretation happens asynchronously, because returning quickly is what stops a gateway's retry policy from amplifying an incident. This is the ONE place a foreign vocabulary is legal in a payload - gatewayEventType and body are the gateway's own shapes, because the anti-corruption layer has not run yet.",
+  "type": "object",
+  "required": [
+    "webhookId",
+    "gatewayCode",
+    "gatewayRef",
+    "gatewayEventType",
+    "signatureValid",
+    "signatureScheme",
+    "bodySha256",
+    "bodySize",
+    "receivedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "webhookId": { "type": "string", "pattern": "^whk_[0-9A-Z]{26}$" },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "gatewayRef": {
+      "description": "The gateway's own event identifier. Both the deduplication key and the partition key, so all deliveries of one gateway event are ordered and land on one consumer.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "gatewayEventType": {
+      "description": "The gateway's own type string, untranslated.",
+      "type": "string",
+      "maxLength": 256
+    },
+    "signatureValid": {
+      "description": "Always true. An invalid signature is rejected at ingress and never published - publishing an unverified webhook would put an attacker's payload on the same topic as a genuine one.",
+      "type": "boolean",
+      "const": true
+    },
+    "signatureScheme": {
+      "type": "string",
+      "enum": ["HMAC_SHA256", "ED25519", "JWS"]
+    },
+    "bodySha256": {
+      "description": "Digest of the exact bytes received, letting the processor re-verify against the stored body rather than trusting a re-encoded parse.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "bodySize": { "type": "integer", "minimum": 0 },
+    "payloadRef": {
+      "description": "Object-storage URI, present when the body exceeds the 256 KiB envelope cap. In practice this is the only event type that approaches it.",
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048
+    },
+    "body": {
+      "description": "The parsed body when it is under the cap, redacted through the same allowlist as logs. Absent when payloadRef is used.",
+      "type": "object"
+    },
+    "receivedAt": { "type": "string", "format": "date-time" }
+  },
+  "x-topic": "pp.webhooks.inbound.v1",
+  "x-partition-key": "gateway_ref",
+  "x-producer": "webhook-ingress",
+  "x-context": "BC-7 Webhook Ingestion",
+  "x-consumers": ["Webhook processor"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "signatureScheme": "route-to-dlq" },
+  "examples": [
+    {
+      "webhookId": "whk_01JB8ZJJJJJJJJJJJJJJJJJJJJ",
+      "gatewayCode": "stripe",
+      "gatewayRef": "evt_1Oq9zN4gBxMa",
+      "gatewayEventType": "payment_intent.succeeded",
+      "signatureValid": true,
+      "signatureScheme": "HMAC_SHA256",
+      "bodySha256": "e10a77cd2b4f6a8c0e2d4b6f8a0c2e4d6b8f0a2c4e6d8b0f2a4c6e8d0b2f4a6c",
+      "bodySize": 2841,
+      "body": {
+        "id": "evt_1Oq9zN4gBxMa",
+        "type": "payment_intent.succeeded",
+        "data": {
+          "object": {
+            "id": "pi_3OqZ4L2eZvKYlo2C",
+            "amount": 1050,
+            "currency": "usd",
+            "status": "succeeded"
+          }
+        }
+      },
+      "receivedAt": "2026-08-26T14:03:12.880Z"
+    },
+    {
+      "webhookId": "whk_01JB8ZKKKKKKKKKKKKKKKKKKKK",
+      "gatewayCode": "adyen",
+      "gatewayRef": "9915toolarge0001",
+      "gatewayEventType": "NOTIFICATION_BATCH",
+      "signatureValid": true,
+      "signatureScheme": "HMAC_SHA256",
+      "bodySha256": "1f3d5b7a9c1e30f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0",
+      "bodySize": 412889,
+      "payloadRef": "s3://pp-webhooks-eu/adyen/2026-08-26/9915toolarge0001.json",
+      "receivedAt": "2026-08-26T14:04:01.220Z"
+    }
+  ]
+}

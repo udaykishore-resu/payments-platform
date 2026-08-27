@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.kyc_approved.v1.json",
+  "title": "merchant.kyc_approved.v1",
+  "description": "The KYC/KYB vendor returned an approval and the merchant moved KYC_PENDING -> KYC_APPROVED. Published by Onboarding (BC-3) on pp.merchants.merchant.v1, keyed by merchant_id. This payload carries the vendor's CASE REFERENCE and an object-storage pointer to the evidence - never the evidence itself, and never personal data. The evidence lives under Object Lock in the tenant's residency region and is retained at least five years under the AML legal-obligation basis.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "caseId",
+    "kycReference",
+    "provider",
+    "decidedAt",
+    "principalsVerified",
+    "ubosVerified",
+    "evidenceRef"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "caseId": { "type": "string", "pattern": "^onb_[0-9A-Z]{26}$" },
+    "kycReference": {
+      "description": "Vendor case reference only. A pointer, never the decision evidence and never PII.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "provider": {
+      "description": "Vendor code. Carried so a vendor-specific incident can be scoped to the merchants it touched.",
+      "type": "string",
+      "maxLength": 64
+    },
+    "decidedAt": {
+      "description": "The vendor's decision time, not ours. Distinct from the envelope `time`, which is when we recorded it.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "principalsVerified": {
+      "description": "How many merchant principals the vendor verified.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "ubosVerified": {
+      "description": "Of those, how many were ultimate beneficial owners. At least one is required before onboarding may proceed.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "evidenceRef": {
+      "description": "Object-storage URI under Object Lock. NOT the evidence itself - a consumer that needs the evidence must be separately authorized to read it.",
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048
+    },
+    "refreshDueAt": {
+      "description": "When periodic KYC refresh falls due, per the compliance policy's refresh interval. Absent when the policy sets no refresh.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "workflow-worker",
+  "x-context": "BC-3 Onboarding",
+  "x-consumers": ["Onboarding", "Audit", "Compliance"],
+  "x-revision": 1,
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "caseId": "onb_01JB8Z66666666666666666666",
+      "kycReference": "kyc-8f21ba",
+      "provider": "vendor-a",
+      "decidedAt": "2026-08-27T11:40:02.000Z",
+      "principalsVerified": 3,
+      "ubosVerified": 2,
+      "evidenceRef": "s3://pp-kyc-eu/ten_01JB8Z00000000000000000000/mrc_01JB8Z11111111111111111111/kyc-8f21ba.json",
+      "refreshDueAt": "2027-08-27T00:00:00.000Z"
+    }
+  ]
+}

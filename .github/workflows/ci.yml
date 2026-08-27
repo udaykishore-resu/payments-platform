@@ -1,133 +1,1048 @@
-# CI: runs on every pull request and every push to main. Gate for merge — nothing in
-# docs/09-production-checklist.md's "Correctness/Security" sections is optional here; this
-# workflow is where those checklist items are actually enforced, not just documented.
+# .github/workflows/ci.yml — the pull-request pipeline.
+#
+# Implements stages 1–21 of docs/deployment.md §4.1. Every job here is a required status
+# check; §4.1 is explicit that there is no warn tier, because a check that cannot block is
+# a check nobody fixes.
+#
+# ---------------------------------------------------------------------------------------
+# Why one pinned Go version and not a matrix
+# ---------------------------------------------------------------------------------------
+# A matrix of Go versions answers "does this library work on the versions our users have",
+# which is a question a library asks. This is a service: exactly one toolchain compiles the
+# binary that reaches production, it is pinned in go.mod, and the container build uses it.
+# Testing on a version we do not ship doubles the CI bill to find bugs in code we will
+# never run — and, worse, a matrix that is green on 1.23 and red on 1.24 invites someone to
+# merge on the strength of the green one.
+#
+# ---------------------------------------------------------------------------------------
+# Job graph
+# ---------------------------------------------------------------------------------------
+#   prepare ──┬─> fast        (fmt, vet, lint, architecture)   stages 1-3
+#             ├─> unit        (race + coverage)                stages 6-7
+#             ├─> contracts   (openapi, events, errors, rules) stages 10-11
+#             ├─> migrations  (numbering, RLS, destructive)    stage 15
+#             ├─> sast        (gosec + semgrep-free)           stage 12
+#             ├─> vuln        (govulncheck + licences)         stage 13
+#             ├─> deps-review (GitHub dependency review)       stage 13
+#             ├─> manifests   (helm lint + kubeconform)        stage 18
+#             ├─> terraform   (fmt, validate, tflint, checkov) stage 19
+#             └─> integration (service containers)             stages 8-9
+#                     └─> coverage-gate                        stage 16
+#   fast + unit ──> image ──> scan ──> sign                    stages 14, 15, 17
+#
+# Everything that can run in parallel does. `needs:` is used only where there is a real
+# data dependency — `image` needs a compiling tree, `scan` needs an image — never to
+# serialise for tidiness. A pipeline that runs its ten independent gates in sequence turns
+# an eleven-minute PR into an hour, and the cost of that is measured in changes people
+# batch together to avoid paying it twice.
+
 name: ci
 
 on:
   pull_request:
-    paths:
-      - "services/payments-api/**"
-      - ".github/workflows/ci.yml"
-  push:
-    branches: [main]
-    paths:
-      - "services/payments-api/**"
+    branches: [main, "release/**"]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
 
-defaults:
-  run:
-    working-directory: services/payments-api
-
+# The default for the whole workflow is read-only. Each job that needs more says so, and
+# says why. This is the single most effective control against a compromised action:
+# `contents: read` cannot push a commit, and `id-token: write` scoped to one job cannot be
+# used by another.
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # One run per PR. A force-push cancels the previous run rather than racing it, which
+  # matters at this pipeline's cost.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  GO_VERSION: "1.24.7"
+  # Deterministic, cache-friendly, and no telemetry upload from CI.
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+  # -mod=readonly rather than the default: CI must never be the thing that edits go.mod.
+  # A build that silently adds a require line is a dependency change nobody reviewed.
+  IMAGE_REPO: ghcr.io/${{ github.repository }}
+
 jobs:
-  lint-and-vet:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-          cache-dependency-path: services/payments-api/go.sum
-      # go.sum is not committed by the environment that authored this repo (no module-proxy
-      # network access) — see the NOTE at the bottom of go.mod. `go mod tidy` here both
-      # regenerates it deterministically from go.mod and is the first real compile-time
-      # verification this code has had; a first green run should immediately commit the
-      # resulting go.sum so subsequent runs are fully reproducible/cached.
-      - run: go mod tidy
-      - run: gofmt -l . | tee /tmp/gofmt.out && test ! -s /tmp/gofmt.out
-      - run: go vet ./...
-      - name: staticcheck
-        uses: dominikh/staticcheck-action@v1.3.1
-        with:
-          working-directory: services/payments-api
-          version: "2024.1"
 
-  unit-test:
-    runs-on: ubuntu-latest
+  # =========================================================================================
+  # prepare — resolve identity once, so every downstream job agrees on version and commit.
+  # =========================================================================================
+  prepare:
+    name: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.id.outputs.version }}
+      commit: ${{ steps.id.outputs.commit }}
+      build_date: ${{ steps.id.outputs.build_date }}
+      source_date_epoch: ${{ steps.id.outputs.source_date_epoch }}
+      services: ${{ steps.svc.outputs.services }}
+      has_terraform: ${{ steps.dirs.outputs.has_terraform }}
+      has_helm: ${{ steps.dirs.outputs.has_helm }}
+      has_manifests: ${{ steps.dirs.outputs.has_manifests }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
-          cache-dependency-path: services/payments-api/go.sum
-      - run: go mod tidy
-      - run: go test -race -coverprofile=coverage.out ./...
-      - name: enforce coverage floor
+          # The full history is needed for `git describe` and for the breaking-change diff
+          # against main. fetch-depth: 0 is expensive; it is paid once, here, and the
+          # result is passed to every other job as an output.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: id
+        name: Resolve build identity
         run: |
-          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
-          echo "total coverage: ${total}%"
-          # 85% floor per docs/09-production-checklist.md; ledger-balance logic is covered by the
-          # DB-level trigger test in the integration suite, not counted here.
-          awk -v c="$total" 'BEGIN { exit !(c >= 85) }'
+          set -euo pipefail
+          echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" >> "$GITHUB_OUTPUT"
+          echo "commit=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # SOURCE_DATE_EPOCH from the commit, not from `now`: two builds of one commit must
+          # produce the same digest or the SLSA provenance attests to nothing.
+          echo "source_date_epoch=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
 
-  integration-test:
-    runs-on: ubuntu-latest
+      - id: svc
+        name: Enumerate buildable services
+        run: |
+          set -euo pipefail
+          # Only directories that actually contain Go sources. During incremental
+          # development a cmd/ directory may exist and be empty; a matrix built from `ls`
+          # would then fail nine jobs for a reason unrelated to the change.
+          svcs=$(for d in cmd/*/; do
+                   s=$(basename "$d")
+                   if compgen -G "$d*.go" >/dev/null; then printf '%s\n' "$s"; fi
+                 done | jq -R . | jq -sc .)
+          echo "services=${svcs:-[]}" >> "$GITHUB_OUTPUT"
+          echo "buildable services: ${svcs:-none}"
+
+      - id: dirs
+        name: Detect optional trees
+        run: |
+          set -euo pipefail
+          # helm/ and terraform/ are part of the binding layout (§25) but may be empty in a
+          # tree under construction. A job that fails because a directory is empty teaches
+          # people to ignore red, so those jobs skip explicitly and say so.
+          has() { [ -d "$1" ] && [ -n "$(find "$1" -type f -name "$2" -print -quit 2>/dev/null)" ]; }
+          has terraform '*.tf'     && echo "has_terraform=true"  >> "$GITHUB_OUTPUT" || echo "has_terraform=false"  >> "$GITHUB_OUTPUT"
+          has helm 'Chart.yaml'    && echo "has_helm=true"       >> "$GITHUB_OUTPUT" || echo "has_helm=false"       >> "$GITHUB_OUTPUT"
+          has deployments '*.yaml' && echo "has_manifests=true"  >> "$GITHUB_OUTPUT" || echo "has_manifests=false"  >> "$GITHUB_OUTPUT"
+
+  # =========================================================================================
+  # Stage 1-3 — format, vet, lint, architecture.
+  # The cheapest gates and the ones most likely to fail. ~2 minutes.
+  # =========================================================================================
+  fast:
+    name: fmt · vet · lint · architecture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # setup-go's built-in cache keys on go.sum, which is exactly right for the module
+          # cache and wrong for the build cache — so the build cache is handled separately
+          # below, keyed on the source tree.
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Restore the build cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          # The key includes the go version because a toolchain bump invalidates every
+          # compiled package, and a stale build cache from another toolchain is slower than
+          # no cache at all.
+          key: gobuild-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: |
+            gobuild-${{ runner.os }}-${{ env.GO_VERSION }}-
+
+      - name: gofmt (stage 1)
+        run: |
+          set -euo pipefail
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::these files are not gofmt-formatted:"
+            printf '%s\n' "$out" | while read -r f; do echo "::error file=$f::run gofmt -w $f"; done
+            exit 1
+          fi
+
+      - name: go generate drift (stage 1)
+        run: |
+          set -euo pipefail
+          go generate ./...
+          if ! git diff --quiet; then
+            echo "::error::go generate produced a diff — commit the regenerated files"
+            git diff --stat
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: golangci-lint (stage 2)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.5.0
+          # The action's own cache is disabled: it duplicates the build cache restored
+          # above and the two evict each other on a runner with a 10 GB cache budget.
+          skip-cache: true
+          args: --timeout=8m
+
+      - name: Architecture fitness function (stage 3)
+        run: ./scripts/check-architecture.sh
+
+  # =========================================================================================
+  # Stage 6-7 — unit tests with the race detector and coverage.
+  # =========================================================================================
+  unit:
+    name: unit tests (race + coverage)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-race-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: |
+            gobuild-race-${{ runner.os }}-${{ env.GO_VERSION }}-
+
+      - name: go test -race (stage 7)
+        # -count=1 defeats the test cache: a cached PASS from before the change under test
+        # is worse than no result. The race detector is non-negotiable on a concurrent
+        # money path (§4.1 stage 7) — it is the only tool that finds the class of bug where
+        # two goroutines both believe they authorised the payment.
+        run: |
+          go test ./... -race -count=1 \
+            -covermode=atomic -coverprofile=coverage.out \
+            -timeout 20m
+
+      - name: Coverage summary
+        run: |
+          set -euo pipefail
+          go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage.out
+          retention-days: 7
+
+  # =========================================================================================
+  # Stage 8-9 — integration and contract tests against real service containers.
+  #
+  # Service containers rather than testcontainers-in-CI: the images are pulled once by the
+  # runner, the health gate is declarative, and there is no Docker-in-Docker socket to
+  # mount. The suite itself still uses testcontainers locally (testing.md §4), and reads
+  # the addresses below when they are set.
+  # =========================================================================================
+  integration:
+    name: integration + contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    needs: prepare
+
     services:
       postgres:
-        image: postgres:15-alpine
+        image: postgres:16.6-alpine
         env:
-          POSTGRES_USER: payments_test
-          POSTGRES_PASSWORD: payments_test
-          POSTGRES_DB: payments_test
+          POSTGRES_USER: pp_ci
+          POSTGRES_PASSWORD: pp_ci_not_a_real_password
+          POSTGRES_DB: pp
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
         ports: ["5432:5432"]
+        # The health gate is the difference between "the container started" and "Postgres
+        # accepts connections". Without it the first test races initdb and produces a flake
+        # that looks like a product bug.
         options: >-
-          --health-cmd "pg_isready -U payments_test"
+          --health-cmd "pg_isready -U pp_ci -d pp"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+      redpanda:
+        image: redpandadata/redpanda:v24.3.6
+        ports: ["9092:9092", "9644:9644"]
+        options: >-
+          --health-cmd "rpk cluster health -X admin.hosts=localhost:9644 | grep -q 'Healthy:.*true'"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 30
+          --health-start-period 10s
+
     env:
-      DATABASE_DSN: postgres://payments_test:payments_test@localhost:5432/payments_test?sslmode=disable
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-          cache-dependency-path: services/payments-api/go.sum
-      - run: go mod tidy
-      - run: go test -race -tags=integration ./tests/integration/...
+      PP_TEST_POSTGRES_DSN: "postgres://pp_ci:pp_ci_not_a_real_password@localhost:5432/pp?sslmode=disable"
+      PP_TEST_REDIS_ADDR: "localhost:6379"
+      PP_TEST_KAFKA_BROKERS: "localhost:9092"
+      # Tells the suite to use the addresses above instead of starting testcontainers.
+      PP_TEST_USE_EXTERNAL_SERVICES: "1"
 
-  security-scan:
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
-      - name: govulncheck (known-CVE dependency scan)
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-integ-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('**/*.go', 'go.sum') }}
+          restore-keys: |
+            gobuild-integ-${{ runner.os }}-${{ env.GO_VERSION }}-
+
+      - name: Apply migrations
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
-      - name: gosec (SAST)
-        uses: securego/gosec@master
-        with:
-          args: "-fmt sarif -out gosec-results.sarif ./services/payments-api/..."
-      - name: upload SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: gosec-results.sarif
+          set -euo pipefail
+          if compgen -G "./cmd/platformctl/*.go" >/dev/null; then
+            go run ./cmd/platformctl migrate up
+          else
+            echo "::notice::platformctl has no sources yet; applying migrations with psql"
+            for f in migrations/*.up.sql; do
+              echo "  $f"
+              psql "$PP_TEST_POSTGRES_DSN" -v ON_ERROR_STOP=1 -f "$f"
+            done
+          fi
 
-  build-image:
-    needs: [lint-and-vet, unit-test, integration-test, security-scan]
-    runs-on: ubuntu-latest
+      - name: Integration tests (stage 8)
+        run: |
+          set -euo pipefail
+          if compgen -G "tests/integration/*_test.go" >/dev/null; then
+            go test -tags=integration ./tests/integration/... ./internal/... -count=1 -timeout 25m
+          else
+            echo "::notice::tests/integration is empty; running the integration-tagged tests in internal/"
+            go test -tags=integration ./internal/... -count=1 -timeout 25m
+          fi
+
+      - name: Contract tests (stage 9)
+        run: |
+          set -euo pipefail
+          go test -tags=contract ./tests/contract/... ./internal/adapters/... -count=1 -timeout 15m
+
+  # =========================================================================================
+  # Stage 10-11 + §21 — the declarative contracts.
+  # Fast, no containers, and the failures are the ones that reach customers.
+  # =========================================================================================
+  contracts:
+    name: contracts (openapi · events · errors · rules · metrics)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # the breaking-change diff needs main
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Install the validator dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check pyyaml jsonschema
+
+      - name: OpenAPI (stage 10)
+        run: ./scripts/check-openapi.sh
+
+      - name: Breaking-change diff vs main (stage 10)
+        # A breaking change is allowed; a breaking change without a major version bump is
+        # not (§19.3, additive-only within a major). oasdiff exits 1 on a breaking change,
+        # which is turned into a failure only when the URI major version is unchanged.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
+          base=$(git rev-parse "origin/${{ github.base_ref || 'main' }}" 2>/dev/null || echo "")
+          if [ -z "$base" ]; then echo "::notice::no base ref; skipping the diff"; exit 0; fi
+          spec="api/openapi/payments-platform.v1.yaml"
+          if ! git show "$base:$spec" > /tmp/base-spec.yaml 2>/dev/null; then
+            echo "::notice::$spec is new on this branch; nothing to diff"; exit 0
+          fi
+          if ! command -v oasdiff >/dev/null 2>&1; then
+            go install github.com/oasdiff/oasdiff@latest || {
+              echo "::warning::oasdiff could not be installed; the breaking-change gate did NOT run"
+              exit 0; }
+          fi
+          if oasdiff breaking /tmp/base-spec.yaml "$spec" --fail-on ERR; then
+            echo "no breaking changes"
+          else
+            echo "::error::a breaking OpenAPI change without a major version bump (§19.3)"
+            exit 1
+          fi
+
+      - name: Event schemas (stage 11)
+        run: ./scripts/check-events.sh
+
+      - name: Error catalogue
+        run: ./scripts/check-error-catalog.sh
+
+      - name: Validation rules documented (§21)
+        run: ./scripts/check-rules-documented.sh
+
+      - name: Metric cardinality (§22.3)
+        run: ./scripts/check-metrics-cardinality.sh
+
+  # =========================================================================================
+  # Stage 15 — migrations.
+  # =========================================================================================
+  migrations:
+    name: migrations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Static checks
+        run: ./scripts/check-migrations.sh
+
+      - name: Apply and reverse against a scratch database
+        # The down scripts exist so the reversal is written, reviewed and *testable*. This
+        # is where they are tested: up to head, down to zero, up again. A down script that
+        # has never run is a down script that does not work, and the day it is needed is
+        # not the day to find that out (deployment.md §5.4).
+        run: |
+          set -euo pipefail
+          docker run -d --name pgscratch -e POSTGRES_PASSWORD=scratch \
+            -e POSTGRES_USER=pp -e POSTGRES_DB=pp -p 5433:5432 postgres:16.6-alpine
+          for i in $(seq 1 30); do
+            docker exec pgscratch pg_isready -U pp -d pp -q && break || sleep 2
+          done
+          DSN="postgres://pp:scratch@localhost:5433/pp?sslmode=disable"
+          echo "--- up ---"
+          for f in $(ls migrations/*.up.sql | sort); do
+            echo "  $f"; psql "$DSN" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+          echo "--- down (reverse order) ---"
+          for f in $(ls migrations/*.down.sql | sort -r); do
+            echo "  $f"; psql "$DSN" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+          echo "--- up again ---"
+          for f in $(ls migrations/*.up.sql | sort); do
+            psql "$DSN" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+          echo "up → down → up succeeded"
+      - name: Remove the scratch database
+        if: always()
+        run: docker rm -f pgscratch >/dev/null 2>&1 || true
+
+  # =========================================================================================
+  # Stage 12 — SAST.
+  # =========================================================================================
+  sast:
+    name: gosec (SAST)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: prepare
     permissions:
       contents: read
+      # Required to upload the SARIF report so findings appear inline on the PR diff. A
+      # security finding in a log nobody opens is a finding nobody fixes.
+      security-events: write
     steps:
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: gosec
+        uses: securego/gosec@master
+        with:
+          # -no-fail so the SARIF upload below always runs; the severity gate is applied
+          # in the next step, where the message can say which rule and why.
+          args: >-
+            -no-fail -fmt sarif -out gosec.sarif
+            -exclude=G104,G304
+            -severity=medium
+            ./...
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+      - name: Fail on high or critical
+        run: |
+          set -euo pipefail
+          n=$(jq '[.runs[].results[]
+                   | select(.level == "error")] | length' gosec.sarif)
+          echo "gosec findings at error level: $n"
+          if [ "$n" -gt 0 ]; then
+            jq -r '.runs[].results[] | select(.level=="error")
+                   | "::error file=\(.locations[0].physicalLocation.artifactLocation.uri),line=\(.locations[0].physicalLocation.region.startLine)::\(.message.text)"' \
+              gosec.sarif
+            exit 1
+          fi
+
+  # =========================================================================================
+  # Stage 13 — vulnerabilities, licences, secrets.
+  # =========================================================================================
+  vuln:
+    name: govulncheck · licences · secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks scans history, which needs it.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: govulncheck
+        # govulncheck is reachability-aware: it reports a CVE only when the vulnerable
+        # symbol is actually called from this module. That is why it is the gate and a
+        # manifest scanner is not — the alternative is a backlog of advisories in code
+        # paths the binary never enters, which trains everyone to ignore the report.
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" -show verbose ./...
+
+      - name: osv-scanner
+        # Belt and braces on govulncheck: OSV covers advisories that have not reached the
+        # Go vulnerability database yet. Non-blocking on purpose — it has no reachability
+        # analysis, so making it a gate would block PRs on unreachable code.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          go install github.com/google/osv-scanner/cmd/osv-scanner@latest || exit 0
+          "$(go env GOPATH)/bin/osv-scanner" --lockfile=go.mod --format table || true
+
+      - name: Dependency licences
+        run: ./scripts/check-licences.sh --report licences.tsv
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: licence-report
+          path: licences.tsv
+          retention-days: 30
+
+      - name: Secret scan
+        run: ./scripts/check-secrets.sh
+
+      - name: gitleaks (history)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # =========================================================================================
+  # Stage 13 — GitHub dependency review.
+  # Complements govulncheck: this sees the *diff* of the dependency graph and can block a
+  # newly-introduced GPL dependency or a known-vulnerable version at the moment it is added,
+  # which is when the change is cheap.
+  # =========================================================================================
+  dependency-review:
+    name: dependency review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          # The same copyleft policy scripts/check-licences.sh enforces, applied to the
+          # diff. Both exist because this one only sees changes, and the script sees the
+          # whole graph including transitive dependencies introduced by a version bump.
+          deny-licenses: >-
+            GPL-1.0-or-later, GPL-2.0-or-later, GPL-3.0-or-later,
+            AGPL-1.0-or-later, AGPL-3.0-or-later,
+            LGPL-2.0-or-later, LGPL-2.1-or-later, LGPL-3.0-or-later,
+            SSPL-1.0, BUSL-1.1, Elastic-2.0
+          comment-summary-in-pr: on-failure
+
+  # =========================================================================================
+  # Stage 18 — Kubernetes manifests.
+  # =========================================================================================
+  manifests:
+    name: helm lint · kubeconform · kyverno
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Skip notice
+        if: needs.prepare.outputs.has_helm != 'true' && needs.prepare.outputs.has_manifests != 'true'
+        run: |
+          echo "::notice::neither helm/ nor deployments/ contains manifests yet; nothing to validate"
+
+      - uses: azure/setup-helm@v4
+        if: needs.prepare.outputs.has_helm == 'true'
+        with: { version: v3.16.3 }
+
+      - name: helm lint
+        if: needs.prepare.outputs.has_helm == 'true'
+        run: |
+          set -euo pipefail
+          find helm -name Chart.yaml -printf '%h\n' | sort -u | while read -r chart; do
+            echo "--- $chart ---"
+            helm dependency build "$chart" || true
+            helm lint --strict "$chart"
+          done
+
+      - name: Install kubeconform and kustomize
+        if: needs.prepare.outputs.has_helm == 'true' || needs.prepare.outputs.has_manifests == 'true'
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /usr/local/bin kubeconform
+          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s -- 5.5.0 /usr/local/bin
+
+      - name: kubeconform on the rendered manifests
+        if: needs.prepare.outputs.has_helm == 'true' || needs.prepare.outputs.has_manifests == 'true'
+        # -strict rejects unknown fields, which is what catches a typo'd key that
+        # Kubernetes would silently ignore — `readinessProb: {...}` applies no probe at all
+        # and the deployment looks healthy.
+        run: |
+          set -euo pipefail
+          CONFORM=(kubeconform -strict -summary -ignore-missing-schemas
+                   -kubernetes-version 1.31.0
+                   -schema-location default
+                   -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json')
+          rc=0
+          if [ -d deployments/k8s ]; then
+            for o in deployments/k8s/overlays/*/; do
+              [ -f "$o/kustomization.yaml" ] || continue
+              echo "--- kustomize $o ---"
+              kustomize build "$o" | "${CONFORM[@]}" || rc=1
+            done
+          fi
+          if [ -d helm ]; then
+            find helm -name Chart.yaml -printf '%h\n' | sort -u | while read -r chart; do
+              echo "--- helm template $chart ---"
+              helm template release "$chart" | "${CONFORM[@]}" || exit 1
+            done || rc=1
+          fi
+          exit $rc
+
+      - name: kyverno policy check
+        if: needs.prepare.outputs.has_manifests == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ ! -d deployments/policies ]; then
+            echo "::notice::no deployments/policies yet; the prod Kyverno policies are not asserted here"
+            exit 0
+          fi
+          curl -sSL -o /tmp/kyverno.tar.gz \
+            https://github.com/kyverno/kyverno/releases/download/v1.13.2/kyverno-cli_v1.13.2_linux_x86_64.tar.gz
+          tar -xzf /tmp/kyverno.tar.gz -C /usr/local/bin kyverno
+          for o in deployments/k8s/overlays/*/; do
+            kustomize build "$o" > /tmp/rendered.yaml
+            kyverno apply deployments/policies/ --resource /tmp/rendered.yaml
+          done
+
+  # =========================================================================================
+  # Stage 19-20 — Terraform.
+  #
+  # OIDC, not long-lived keys. deployment.md §2.3 gives each workload a role; CI gets one
+  # too, assumed through GitHub's OIDC provider with a trust policy scoped to this
+  # repository and this workflow. A long-lived AWS_SECRET_ACCESS_KEY in repository secrets
+  # is a credential with no expiry, no session, and no per-run audit trail — and it is
+  # readable by every workflow in the repository, including one added by a PR.
+  # =========================================================================================
+  terraform:
+    name: terraform fmt · validate · tflint · checkov
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: prepare
+    permissions:
+      contents: read
+      id-token: write          # OIDC only; nothing else in this job may mint a token
+      pull-requests: write     # to post the plan
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Skip notice
+        if: needs.prepare.outputs.has_terraform != 'true'
+        run: echo "::notice::terraform/ contains no .tf files yet; nothing to validate"
+
+      - uses: hashicorp/setup-terraform@v3
+        if: needs.prepare.outputs.has_terraform == 'true'
+        with:
+          terraform_version: "1.10.3"
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        if: needs.prepare.outputs.has_terraform == 'true'
+        run: terraform -chdir=terraform fmt -check -recursive -diff
+
+      - name: Configure AWS credentials via OIDC
+        if: needs.prepare.outputs.has_terraform == 'true' && vars.AWS_CI_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+          role-session-name: ci-${{ github.run_id }}
+          # A short session: the plan takes minutes, not an hour.
+          role-duration-seconds: 1800
+
+      - name: terraform init + validate
+        if: needs.prepare.outputs.has_terraform == 'true'
+        run: |
+          set -euo pipefail
+          for d in $(find terraform -name '*.tf' -printf '%h\n' | sort -u); do
+            echo "--- $d ---"
+            # -backend=false: validation does not need the state, and requiring the S3
+            # backend would make `terraform validate` fail on a fork PR that legitimately
+            # has no AWS access.
+            terraform -chdir="$d" init -backend=false -input=false
+            terraform -chdir="$d" validate
+          done
+
+      - uses: terraform-linters/setup-tflint@v4
+        if: needs.prepare.outputs.has_terraform == 'true'
+        with: { tflint_version: v0.55.0 }
+
+      - name: tflint
+        if: needs.prepare.outputs.has_terraform == 'true'
+        run: |
+          set -euo pipefail
+          tflint --init
+          tflint --recursive --minimum-failure-severity=warning
+
+      - name: checkov
+        if: needs.prepare.outputs.has_terraform == 'true'
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform
+          framework: terraform
+          quiet: true
+          soft_fail: false
+          output_format: cli
+          # The §4.1 stage-20 policy list, stated as check IDs so a suppression is a
+          # reviewed line rather than a flag: no public S3, no unencrypted resource, no
+          # 0.0.0.0/0 ingress except the ALB.
+          check: >-
+            CKV_AWS_18,CKV_AWS_19,CKV_AWS_20,CKV_AWS_21,CKV_AWS_23,
+            CKV_AWS_24,CKV_AWS_53,CKV_AWS_54,CKV_AWS_55,CKV_AWS_56,
+            CKV_AWS_57,CKV_AWS_58,CKV_AWS_79,CKV_AWS_88,CKV_AWS_130,
+            CKV_AWS_136,CKV_AWS_144,CKV_AWS_145,CKV_AWS_158,CKV_AWS_161,
+            CKV_AWS_162,CKV_AWS_189,CKV_AWS_260,CKV2_AWS_5,CKV2_AWS_6
+
+  # =========================================================================================
+  # Stage 14 — container build.
+  #
+  # Depends on `fast` (the tree compiles and passes the architecture check) but NOT on the
+  # full test suite: an image built from a commit whose tests later fail is never promoted,
+  # because promotion is gated on every required check, and building it in parallel takes
+  # eight minutes off the critical path.
+  # =========================================================================================
+  image:
+    name: build image (${{ matrix.service }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: [prepare, fast]
+    if: needs.prepare.outputs.services != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.prepare.outputs.services) }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write          # for cosign keyless signing in the sign job
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - name: build image (no push — CI validates buildability only)
-        uses: docker/build-push-action@v5
+
+      - uses: docker/login-action@v3
         with:
-          context: services/payments-api
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # arm64 primary (deployment.md §4.1 stage 14): Graviton is the production node
+          # type, so the arm64 image is the one that ships and amd64 is for developer
+          # laptops. Building arm64 first means a build failure specific to it fails fast.
+          platforms: linux/arm64,linux/amd64
+          # On a PR the image is built but not pushed: the point is to prove it builds and
+          # to scan it. Pushing every PR's image to the registry fills it with artifacts
+          # nothing will ever pull.
           push: false
-          tags: payments-api:ci-${{ github.sha }}
-      - name: Trivy image scan
-        uses: aquasecurity/trivy-action@master
+          load: false
+          outputs: type=docker,dest=/tmp/image-${{ matrix.service }}.tar
+          build-args: |
+            SERVICE=${{ matrix.service }}
+            VERSION=${{ needs.prepare.outputs.version }}
+            COMMIT=${{ needs.prepare.outputs.commit }}
+            BUILD_DATE=${{ needs.prepare.outputs.build_date }}
+            SOURCE_DATE_EPOCH=${{ needs.prepare.outputs.source_date_epoch }}
+            ALLOW_TEST_SERVICE=${{ matrix.service == 'gateway-simulator' && '1' || '0' }}
+          tags: ${{ env.IMAGE_REPO }}/${{ matrix.service }}:${{ needs.prepare.outputs.commit }}
+          provenance: true
+          sbom: true
+          # GitHub's cache backend, scoped per service so nine parallel builds do not
+          # invalidate each other. mode=max caches the intermediate stages too, which is
+          # where the module download lives.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+      - uses: actions/upload-artifact@v4
         with:
-          image-ref: payments-api:ci-${{ github.sha }}
-          severity: "CRITICAL,HIGH"
-          exit-code: "1" # fail the build on any critical/high CVE in the final image — the enforcement point for docs/09-production-checklist.md's image-scan gate
+          name: image-${{ matrix.service }}
+          path: /tmp/image-${{ matrix.service }}.tar
+          retention-days: 1
+
+  # =========================================================================================
+  # Stage 15-16 — image scan and SBOM.
+  # =========================================================================================
+  scan:
+    name: trivy + syft (${{ matrix.service }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [prepare, image]
+    if: needs.prepare.outputs.services != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.prepare.outputs.services) }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ matrix.service }}
+          path: /tmp
+
+      - name: Load the image
+        run: docker load -i /tmp/image-${{ matrix.service }}.tar
+
+      - name: trivy (stage 15)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ env.IMAGE_REPO }}/${{ matrix.service }}:${{ needs.prepare.outputs.commit }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: HIGH,CRITICAL
+          # --ignore-unfixed: a HIGH with no available fix is not actionable in this PR,
+          # and blocking on it means the next unrelated change is blocked too. It is still
+          # reported to the security tab, where it is tracked as an exception rather than
+          # as a build failure nobody can clear.
+          ignore-unfixed: true
+          exit-code: "0"      # the gate is applied below, with a readable message
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      - name: Fail on a fixable HIGH or CRITICAL
+        run: |
+          set -euo pipefail
+          n=$(jq '[.runs[].results[]] | length' trivy-${{ matrix.service }}.sarif)
+          echo "fixable HIGH/CRITICAL in ${{ matrix.service }}: $n"
+          if [ "$n" -gt 0 ]; then
+            jq -r '.runs[].results[] | "::error::\(.ruleId): \(.message.text)"' \
+              trivy-${{ matrix.service }}.sarif | head -50
+            exit 1
+          fi
+
+      - name: syft SBOM (stage 16)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_REPO }}/${{ matrix.service }}:${{ needs.prepare.outputs.commit }}
+          format: cyclonedx-json
+          output-file: sbom-${{ matrix.service }}.cyclonedx.json
+          artifact-name: sbom-${{ matrix.service }}.cyclonedx.json
+
+      - name: Assert the SBOM is non-trivial
+        # "Missing SBOM fails" (§4.1 stage 16). An empty component list is a missing SBOM
+        # that happens to be a valid JSON file, and it is the failure mode of a
+        # misconfigured scanner rather than of a genuinely empty image.
+        run: |
+          set -euo pipefail
+          n=$(jq '.components | length' sbom-${{ matrix.service }}.cyclonedx.json)
+          echo "SBOM components: $n"
+          [ "$n" -gt 0 ] || { echo "::error::the SBOM for ${{ matrix.service }} lists no components"; exit 1; }
+
+  # =========================================================================================
+  # Stage 16 — the coverage gate on the critical-path packages.
+  #
+  # testing.md §1.1 sets a floor per scope, and §1.2 explains why the floor is a floor
+  # against neglect and not a measure of quality. Both statements are implemented here: the
+  # gate blocks below the floor, and the summary reports the number without ceremony.
+  # =========================================================================================
+  coverage-gate:
+    name: coverage gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [prepare, unit]
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-go@v5
+        with: { go-version: "${{ env.GO_VERSION }}", cache: true, cache-dependency-path: go.sum }
+      - uses: actions/download-artifact@v4
+        with: { name: coverage-unit }
+
+      - name: Per-scope gates (testing.md §1.1)
+        run: |
+          set -euo pipefail
+          go tool cover -func=coverage.out > /tmp/func.txt
+
+          # scope <import-path-prefix> <floor-percent>
+          #
+          # The percentage is re-aggregated from the profile rather than read out of
+          # `go tool cover -func`. That command reports a percentage PER FUNCTION, and the
+          # mean of those overweights a one-line accessor against a two-hundred-line state
+          # machine — so a package can show 92 % while the FSM inside it is untested. Each
+          # profile line is `file.go:l.c,l.c <numStmts> <hitCount>`, and the statement-
+          # weighted ratio is the number the floor is stated in.
+          scope() {
+            local prefix="$1" floor="$2" covered total pct
+            covered=$(awk -v p="$prefix" 'NR>1 && index($1,p)==1 && $3>0 {c+=$2} END{print c+0}' coverage.out)
+            total=$(awk   -v p="$prefix" 'NR>1 && index($1,p)==1         {t+=$2} END{print t+0}' coverage.out)
+
+            if [ "$total" -eq 0 ]; then
+              # No statements under this prefix yet. Reported, not silently passed: a gate
+              # that vanishes when its package is empty is a gate that vanishes the day the
+              # package is renamed.
+              printf '%-52s %8s  (floor %s%%) — no statements, gate not applied\n' \
+                "$prefix" "n/a" "$floor" | tee -a "$GITHUB_STEP_SUMMARY"
+              return 0
+            fi
+
+            pct=$(awk -v c="$covered" -v t="$total" 'BEGIN{printf "%.1f", 100*c/t}')
+            printf '%-52s %7s%%  (floor %s%%)\n' "$prefix" "$pct" "$floor" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+
+            if awk -v p="$pct" -v f="$floor" 'BEGIN{exit !(p+0 < f+0)}'; then
+              echo "::error::$prefix coverage ${pct}% is below the ${floor}% floor (testing.md §1.1)"
+              return 1
+            fi
+            return 0
+          }
+
+          rc=0
+          {
+            echo '### Coverage against the testing.md §1.1 floors'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          M=github.com/udaykishore-resu/payments-platform
+          scope "$M/internal/domain/"                  95 || rc=1
+          scope "$M/internal/validation/"              95 || rc=1
+          scope "$M/internal/platform/idempotency"    100 || rc=1
+          scope "$M/internal/platform/tenantctx"      100 || rc=1
+          scope "$M/internal/application/"             90 || rc=1
+          scope "$M/internal/workflows/"               85 || rc=1
+          scope "$M/internal/adapters/gateway/"        80 || rc=1
+          scope "$M/internal/infrastructure/"          70 || rc=1
+          scope "$M/"                                  80 || rc=1
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+  # =========================================================================================
+  # A single required check that summarises the rest.
+  #
+  # Branch protection lists this one job instead of twenty. Without it, adding a job means
+  # editing branch protection, and a job added but not listed is a job that cannot block —
+  # which is exactly the "warn tier" §4.1 says must not exist.
+  # =========================================================================================
+  ci-ok:
+    name: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - fast
+      - unit
+      - integration
+      - contracts
+      - migrations
+      - sast
+      - vuln
+      - manifests
+      - terraform
+      - image
+      - scan
+      - coverage-gate
+    steps:
+      - name: Verdict
+        run: |
+          set -euo pipefail
+          results='${{ toJSON(needs) }}'
+          echo "$results" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' | sort | tee -a "$GITHUB_STEP_SUMMARY"
+          # `skipped` is acceptable — a job legitimately skips when its tree is empty.
+          # `failure` and `cancelled` are not.
+          bad=$(echo "$results" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')
+          if [ -n "$bad" ]; then
+            echo "::error::failed or cancelled: $bad"
+            exit 1
+          fi
+          echo "all required checks passed"

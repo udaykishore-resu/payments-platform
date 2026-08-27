@@ -1,0 +1,156 @@
+# dev — pp-dev account, 1 cluster, Spot-first, synthetic data only.
+#
+# What changes and why:
+#   * 1 replica per service: dev proves the manifest renders and the binary
+#     boots, not that the fleet survives an AZ loss.
+#   * No canary. There is no traffic in dev to measure a canary against, so
+#     the analysis would be a 40-minute wait for a statistically empty
+#     result. Rollouts fall back to plain Deployments.
+#   * Autoscaling off: 1 replica, and the KEDA triggers have no backlog to
+#     read. Off is honest; a ScaledObject that never fires is confusing.
+#   * PDBs disabled: a PDB over 1 replica blocks every node drain, and the
+#     dev cluster is Spot-first, so it drains constantly.
+#   * Relaxed CPU limits everywhere: dev nodes are small and shared, and
+#     nothing in dev has a latency SLO.
+
+global:
+  environment: dev
+  region: eu-west-1
+  regionActive: "true"
+  imageRegistry: 444455556666.dkr.ecr.eu-west-1.amazonaws.com/payments-platform
+  accountId: "444455556666"
+  networkCidrs:
+    pods:      ["10.40.16.0/20", "10.40.80.0/20", "10.40.96.0/20"]
+    database:  ["10.40.32.0/22", "10.40.36.0/22", "10.40.40.0/22"]
+    streaming: ["10.40.48.0/22", "10.40.52.0/22", "10.40.56.0/22"]
+    egress:    ["10.40.64.0/22", "10.40.68.0/22", "10.40.72.0/22"]
+
+control-plane-api:
+  enabled: true
+  replicaCount: 1
+  rollout:
+    enabled: false
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"     # dev nodes are shared and nothing here has a latency SLO
+      memory: "1Gi"
+
+payment-api:
+  enabled: true
+  replicaCount: 1
+  rollout:
+    enabled: false
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"     # dev nodes are shared and nothing here has a latency SLO
+      memory: "1Gi"
+
+payment-orchestrator:
+  enabled: true
+  replicaCount: 1
+  rollout:
+    enabled: false
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "1Gi"
+    limits:
+      cpu: "1000m"     # dev nodes are shared and nothing here has a latency SLO
+      memory: "2Gi"
+
+workflow-worker:
+  enabled: true
+  replicaCount: 1
+  rollout:
+    enabled: false
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "1Gi"
+    limits:
+      cpu: "1000m"     # dev nodes are shared and nothing here has a latency SLO
+      memory: "2Gi"
+
+webhook-ingress:
+  enabled: true
+  replicaCount: 1
+  rollout:
+    enabled: false
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"     # dev nodes are shared and nothing here has a latency SLO
+      memory: "512Mi"
+
+outbox-relay:
+  enabled: true
+  replicaCount: 1
+  rollout:
+    enabled: false
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"     # dev nodes are shared and nothing here has a latency SLO
+      memory: "512Mi"
+
+event-consumer:
+  enabled: true
+  replicaCount: 1
+  rollout:
+    enabled: false
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "768Mi"
+    limits:
+      cpu: "1000m"     # dev nodes are shared and nothing here has a latency SLO
+      memory: "1536Mi"
+
+platformctl:
+  enabled: true
+  replicaCount: 1
+  rollout:
+    enabled: false
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
+

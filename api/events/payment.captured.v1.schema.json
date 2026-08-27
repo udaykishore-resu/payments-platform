@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.captured.v1.json",
+  "title": "payment.captured.v1",
+  "description": "An authorization hold was converted into a debit. Published by Payment Orchestration (BC-6) on pp.payments.payment.v1, keyed by payment_id. Both the per-capture amount and the cumulative total are carried: the ledger posts on the DELTA but reconciles on the TOTAL, and a consumer that had to derive one from the other would be wrong the first time a capture event was redelivered.",
+  "type": "object",
+  "required": [
+    "attemptId",
+    "gatewayCode",
+    "gatewayReference",
+    "capturedAmount",
+    "capturedTotal",
+    "authorizedAmount",
+    "captureNumber",
+    "isFinalCapture",
+    "capturedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "attemptId": { "type": "string", "pattern": "^att_[0-9A-Z]{26}$" },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "gatewayReference": { "type": "string", "maxLength": 128 },
+    "capturedAmount": { "$ref": "#/$defs/money", "description": "This capture only. The ledger posts on this." },
+    "capturedTotal": { "$ref": "#/$defs/money", "description": "Cumulative across all captures. The ledger reconciles on this." },
+    "authorizedAmount": {
+      "$ref": "#/$defs/money",
+      "description": "Invariant I2 evidence: capturedTotal <= authorizedAmount. Carried so a consumer can assert the invariant instead of trusting it."
+    },
+    "captureNumber": {
+      "description": "Dense from 1, bounded by the merchant's limits.maxPartialCaptures.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "isFinalCapture": {
+      "description": "True when any uncaptured authorization balance was released. False leaves the authorization open for a further partial capture.",
+      "type": "boolean"
+    },
+    "capturedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer", "minimum": 0 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-6 Payment Orchestration",
+  "x-consumers": ["Ledger", "Notification", "Analytics"],
+  "x-revision": 1,
+  "examples": [
+    {
+      "attemptId": "att_01JB8Z44444444444444444444",
+      "gatewayCode": "stripe",
+      "gatewayReference": "pi_3OqZ4L2eZvKYlo2C",
+      "capturedAmount": { "amount": 600, "currency": "USD" },
+      "capturedTotal": { "amount": 600, "currency": "USD" },
+      "authorizedAmount": { "amount": 1050, "currency": "USD" },
+      "captureNumber": 1,
+      "isFinalCapture": false,
+      "capturedAt": "2026-08-26T15:20:44.771Z"
+    }
+  ]
+}

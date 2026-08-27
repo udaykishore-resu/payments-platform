@@ -1,0 +1,20 @@
+# scripts/licence-exceptions.txt — modules exempted from scripts/check-licences.sh.
+#
+# Format:  <module path>   # why this exemption is acceptable
+#
+# An exemption is a decision to accept a licence obligation, so each line needs a reason a
+# lawyer would accept and a reviewer can check. There should be very few of these; a
+# recurring exemption is a signal that the ALLOWED set in check-licences.sh is wrong and
+# should be amended instead.
+#
+# ---------------------------------------------------------------------------------------
+# Modules whose published zip omits the licence file.
+#
+# These three are Apache-2.0. Each is a Go submodule whose repository carries a single
+# top-level LICENSE that the module zip does not include, and whose parent module path is
+# not itself a dependency, so the parent-inheritance fallback in check-licences.sh has
+# nothing to read. The licence was confirmed from the upstream repository, not assumed
+# from the neighbours — which is the entire point of L1 refusing to guess.
+google.golang.org/genproto/googleapis/api   # Apache-2.0 per the LICENSE at the root of googleapis/go-genproto; the per-submodule zips omit it
+google.golang.org/genproto/googleapis/rpc   # Apache-2.0 per the LICENSE at the root of googleapis/go-genproto; the per-submodule zips omit it
+go.opentelemetry.io/proto/otlp              # Apache-2.0 per the LICENSE at the root of open-telemetry/opentelemetry-proto-go; the submodule zip omits it

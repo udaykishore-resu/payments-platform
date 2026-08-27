@@ -1,0 +1,4 @@
+# A library chart has no values of its own. Every helper reads the *consuming*
+# chart's `.Values` (helpers are invoked with the caller's context). This file
+# exists only so `helm lint` sees a well-formed chart.
+{}

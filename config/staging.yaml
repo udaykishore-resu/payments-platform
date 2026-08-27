@@ -1,0 +1,113 @@
+# config/staging.yaml — production-shaped, sandbox gateways.
+#
+# Staging exists to be *the same shape* as production, not a smaller version of it. Every value
+# here that differs from prod.yaml differs for a stated reason; everything else is identical,
+# because a staging environment tuned differently from production is a staging environment whose
+# load tests and DR drills prove nothing.
+#
+# The differences, and why:
+#
+#   * Gateways are the vendors' sandbox endpoints, so certification and the payment lifecycle run
+#     end to end without moving money.
+#   * Trace sampling is 50 % rather than 10 %: staging volume is a fraction of production's, so the
+#     same absolute trace budget buys a much higher ratio, and an investigation on staging is
+#     usually about one specific request.
+#   * Server reflection is on for the gRPC surface, so an operator can drive it with grpcurl. It is
+#     off in production because reflection publishes the full schema to anything that can connect.
+#   * The gateway simulator is *off*. Staging is where the real adapters are exercised; a
+#     simulator here would mean the first real gateway call happens in production.
+#
+# NO SECRETS. Every credential is a `secret://` reference resolved at the moment of use.
+
+environment: sandbox
+region: eu-central-1
+
+service:
+  log_level: info
+  trace_sample_ratio: 0.5
+  otlp_endpoint: http://$(NODE_IP):4317
+  otlp_insecure: true
+
+http:
+  addr: ":8080"
+  admin_addr: ":8081"
+  public_base_url: https://sandbox.api.example.com
+  # Empty: the staging console is served from the same origin, and every other cross-origin
+  # browser call is denied.
+  cors_allowed_origins: ""
+  # HSTS is on because staging terminates TLS at its own ingress and is reached by a browser.
+  hsts_max_age_seconds: 31536000
+  read_header_timeout: 5s
+  read_timeout: 30s
+  write_timeout: 35s
+  idle_timeout: 120s
+
+database:
+  url_ref: secret://staging/platform/database-url
+  # Same per-pod sizing as production. pool_size x replicas must stay under the instance's
+  # max_connections with headroom for migrations and for a human with psql.
+  max_conns: 20
+  min_conns: 2
+  statement_timeout: 5s
+  lock_timeout: 2s
+
+redis:
+  addr: payments-redis.staging.svc.cluster.local:6379
+  password_ref: secret://staging/platform/redis-password
+  tls: true
+  db: 0
+  pool_size: 10
+
+kafka:
+  brokers: b-1.payments.staging.kafka.eu-central-1.amazonaws.com:9096
+  security_protocol: SASL_SSL
+  sasl_mechanism: SCRAM-SHA-512
+  sasl_username: payments-platform
+  sasl_password_ref: secret://staging/platform/kafka-password
+
+auth:
+  jwks_url: https://auth.staging.example.com/.well-known/jwks.json
+  issuer: https://auth.staging.example.com/
+  audience: payments-platform
+  max_token_age: 1h
+
+mesh:
+  grpc_addr: ":9090"
+  trust_domain: payments-platform.staging
+  # On, so grpcurl works. See the header for why production differs.
+  enable_reflection: true
+
+gateway:
+  # The full production budget, so a staging load test measures the same thing production will.
+  timeout: 8s
+  enable_simulator: false
+
+config_snapshot:
+  refresh_interval: 10s
+  max_staleness: 30s
+  cliff_staleness: 5m
+
+concurrency:
+  initial_limit: 64
+  min_limit: 8
+  max_limit: 512
+
+worker:
+  poll_interval: 1s
+  batch_size: 100
+  concurrency: 4
+
+consumer:
+  dedup_retention: 168h
+
+outbox:
+  # One shard: staging runs a single relay replica. Production shards so that per-aggregate
+  # ordering survives horizontal scaling.
+  total_shards: 1
+
+tenant_policy:
+  supported_countries: [DE, FR, GB, NL, ES, IT, IE, BE, AT, PT]
+  sanctioned_countries: [KP, IR, SY, CU, RU, BY]
+  monthly_volume_ceiling:
+    amount: 50000000
+    currency: EUR

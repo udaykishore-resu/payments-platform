@@ -1,0 +1,103 @@
+# config/dev.yaml — local development and ephemeral preview environments.
+#
+# The values here differ from production in three deliberate directions, and each has a reason:
+#
+#   * Everything is traced. Sampling exists to bound cost at production volume; at development
+#     volume there is no cost to bound, and a developer debugging a single request should never
+#     have to wonder whether their trace was sampled away.
+#   * Timeouts are short. A local gateway simulator answers in microseconds, so an 8-second
+#     gateway budget hides a hang for 8 seconds. Short timeouts surface it immediately.
+#   * The simulator is enabled. This is the only environment file where that is true, and
+#     `PP_ENVIRONMENT` is `sandbox` here so the composition roots' own guard permits it.
+#
+# NOTHING IN THIS FILE IS A SECRET. The database URL is a local socket with a well-known
+# development password that grants access to nothing; every other credential is a `secret://`
+# reference resolved at the moment of use.
+
+environment: sandbox
+region: local
+
+service:
+  log_level: debug
+  # Full sampling. See the header.
+  trace_sample_ratio: 1.0
+  # No collector by default: a developer without one gets a working binary and no export errors.
+  otlp_endpoint: ""
+  otlp_insecure: true
+
+http:
+  addr: ":8080"
+  admin_addr: ":8081"
+  public_base_url: http://localhost:8080
+  # A browser-based console runs on 3000 in development. In production this list is empty and
+  # every cross-origin browser call is denied.
+  cors_allowed_origins: http://localhost:3000
+  # No HSTS: the local listener is plaintext, and pinning a developer's browser to HTTPS for
+  # localhost breaks every other project on the same host.
+  hsts_max_age_seconds: 0
+  read_header_timeout: 5s
+  read_timeout: 30s
+  write_timeout: 35s
+  idle_timeout: 120s
+
+database:
+  # Local Postgres, and the credentials are exactly the ones deploy/docker-compose.dev.yml
+  # creates. They used to disagree with it, which meant this file described a database nobody
+  # had. The password is spelled so that it reads as a placeholder to a human and to
+  # scripts/check-secrets.sh's S2 rule alike: a local-stack DSN that trips the credential
+  # scanner is a finding people learn to scroll past, which is how a real one gets through.
+  url: postgres://pp_dev:pp_dev_not_a_real_password@localhost:5432/pp?sslmode=disable
+  max_conns: 5
+  min_conns: 1
+  statement_timeout: 5s
+  lock_timeout: 2s
+
+redis:
+  addr: localhost:6379
+  # Plaintext against a local container. Production is TLS with a client certificate.
+  tls: false
+  db: 0
+  pool_size: 5
+
+kafka:
+  brokers: localhost:9092
+  # A local single-broker cluster has no SASL and no TLS. Every other environment has both.
+  security_protocol: PLAINTEXT
+
+auth:
+  # A local OIDC stub. The URL is not a secret; the keys it serves are ephemeral and are
+  # regenerated on every start, which is what makes a leaked development token worthless.
+  jwks_url: http://localhost:8088/.well-known/jwks.json
+  issuer: http://localhost:8088/
+  audience: payments-platform-dev
+  max_token_age: 8h
+
+gateway:
+  # Short, so a hang shows up immediately. See the header.
+  timeout: 3s
+  enable_simulator: true
+  simulator_url: http://localhost:8090
+
+config_snapshot:
+  refresh_interval: 5s
+  max_staleness: 30s
+  # The staleness cliff is generous here: a developer who stops the control plane should still be
+  # able to drive payments against the last snapshot rather than watching everything fail closed.
+  cliff_staleness: 30m
+
+concurrency:
+  initial_limit: 16
+  min_limit: 4
+  max_limit: 64
+
+worker:
+  poll_interval: 500ms
+  batch_size: 20
+  concurrency: 2
+
+tenant_policy:
+  supported_countries: [DE, FR, GB, US, NL, ES, IT]
+  sanctioned_countries: [KP, IR, SY, CU]
+  monthly_volume_ceiling:
+    amount: 100000000
+    currency: EUR

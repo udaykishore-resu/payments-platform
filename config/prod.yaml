@@ -1,0 +1,118 @@
+# config/prod.yaml — production.
+#
+# Every value here is a decision with a cost attached. The ones worth reading before changing:
+#
+#   * `trace_sample_ratio: 0.1` — head sampling at a tenth. Errors, money-path spans and
+#     high-value payments are kept regardless by the sampler's own override, so the ratio governs
+#     the *uninteresting* traces only. Raising it raises the collector bill linearly.
+#   * `database.max_conns: 20` — per pod. Multiply by the replica count and keep it under the
+#     instance's max_connections with headroom for a migration job and for a human with psql. A
+#     pool sized without that arithmetic is a pool that exhausts the writer during a scale-out.
+#   * `gateway.timeout: 8s` — the hard ceiling from baseline §12 stage 14. Past it the attempt is
+#     recorded TIMEOUT_UNKNOWN and the payment stays PROCESSING. Raising it raises the p99 of
+#     every failing payment and the shutdown budget that has to cover it.
+#   * `config_snapshot.cliff_staleness: 5m` — the §15 fail-static cliff. Inside it the data plane
+#     serves from a stale snapshot; past it, merchants it has never seen are refused. Widening it
+#     means processing against a policy nobody can vouch for; narrowing it means a control-plane
+#     outage becomes a payment outage.
+#   * `gateway.enable_simulator: false` — and the composition roots refuse `true` here regardless.
+#
+# NO SECRETS. Every credential is a `secret://` reference resolved at the moment of use.
+
+environment: production
+region: eu-central-1
+
+service:
+  log_level: info
+  trace_sample_ratio: 0.1
+  otlp_endpoint: http://$(NODE_IP):4317
+  otlp_insecure: true
+
+http:
+  addr: ":8080"
+  admin_addr: ":8081"
+  public_base_url: https://api.example.com
+  # Empty. This API's clients are servers; a browser origin allowlist here would be a decision to
+  # accept credentialed cross-origin traffic, and nothing needs it.
+  cors_allowed_origins: ""
+  hsts_max_age_seconds: 31536000
+  read_header_timeout: 5s
+  read_timeout: 30s
+  write_timeout: 35s
+  idle_timeout: 120s
+
+database:
+  url_ref: secret://prod/platform/database-url
+  max_conns: 20
+  min_conns: 5
+  statement_timeout: 5s
+  lock_timeout: 2s
+
+redis:
+  addr: payments-redis.prod.svc.cluster.local:6379
+  password_ref: secret://prod/platform/redis-password
+  tls: true
+  db: 0
+  pool_size: 20
+
+kafka:
+  brokers: >-
+    b-1.payments.prod.kafka.eu-central-1.amazonaws.com:9096,
+    b-2.payments.prod.kafka.eu-central-1.amazonaws.com:9096,
+    b-3.payments.prod.kafka.eu-central-1.amazonaws.com:9096
+  security_protocol: SASL_SSL
+  sasl_mechanism: SCRAM-SHA-512
+  sasl_username: payments-platform
+  sasl_password_ref: secret://prod/platform/kafka-password
+
+auth:
+  jwks_url: https://auth.example.com/.well-known/jwks.json
+  issuer: https://auth.example.com/
+  audience: payments-platform
+  # One hour. It bounds the damage of a leaked token independently of the token's own expiry,
+  # which an issuer misconfiguration could set to a year.
+  max_token_age: 1h
+
+mesh:
+  grpc_addr: ":9090"
+  trust_domain: payments-platform.prod
+  # Off. Reflection publishes the full service and message schema to anything that can open a
+  # connection, which is what an operator wants in staging and what an attacker wants here.
+  enable_reflection: false
+
+gateway:
+  timeout: 8s
+  enable_simulator: false
+
+config_snapshot:
+  refresh_interval: 10s
+  max_staleness: 30s
+  cliff_staleness: 5m
+
+concurrency:
+  initial_limit: 128
+  min_limit: 16
+  max_limit: 1024
+
+worker:
+  poll_interval: 1s
+  batch_size: 200
+  concurrency: 8
+
+consumer:
+  # Seven days, which must exceed the broker's own retention: a dedup record purged while the
+  # event it guards can still be redelivered is a record that has stopped guarding anything.
+  dedup_retention: 168h
+
+outbox:
+  # Four shards across four relay replicas. The shard is what preserves per-aggregate ordering
+  # when the relay scales out: one aggregate's messages always fall in the same shard and are
+  # therefore always claimed by the same replica.
+  total_shards: 4
+
+tenant_policy:
+  supported_countries: [DE, FR, GB, NL, ES, IT, IE, BE, AT, PT, SE, DK, FI, PL]
+  sanctioned_countries: [KP, IR, SY, CU, RU, BY, VE, MM]
+  monthly_volume_ceiling:
+    amount: 500000000
+    currency: EUR

@@ -1,0 +1,94 @@
+# prod — pp-prod account, eu-west-1 active + eu-central-1 passive.
+#
+# The values here are the §0 table. The passive region gets the SAME digest
+# 30 minutes after the active region stabilises, with global.regionActive
+# set to "false" — a DR region running a different build is a DR plan that
+# has not been tested.
+#
+# regionActive is read by the app's DR write fence and by the platformctl
+# CronJobs: the passive region must not reconcile money state.
+
+global:
+  environment: prod
+  region: eu-west-1        # eu-central-1 overrides this per cluster
+  regionActive: "true"     # "false" in the passive region
+  imageRegistry: 111122223333.dkr.ecr.eu-west-1.amazonaws.com/payments-platform
+  accountId: "111122223333"
+
+control-plane-api:
+  enabled: true
+  replicaCount: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+  rollout:
+    enabled: true
+    analysis:
+      enabled: true
+
+payment-api:
+  enabled: true
+  replicaCount: 12
+  autoscaling:
+    enabled: true
+    minReplicas: 12
+    maxReplicas: 120
+  rollout:
+    enabled: true
+    analysis:
+      enabled: true
+
+payment-orchestrator:
+  enabled: true
+  replicaCount: 12
+  autoscaling:
+    enabled: true
+    minReplicas: 12
+    maxReplicas: 150
+  rollout:
+    enabled: true
+    analysis:
+      enabled: true
+
+workflow-worker:
+  enabled: true
+  replicaCount: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 24
+
+webhook-ingress:
+  enabled: true
+  replicaCount: 6
+  autoscaling:
+    enabled: true
+    minReplicas: 6
+    maxReplicas: 90
+  rollout:
+    enabled: true
+    analysis:
+      enabled: true
+
+outbox-relay:
+  enabled: true
+  replicaCount: 4
+  autoscaling:
+    enabled: true
+    minReplicas: 4
+    maxReplicas: 24
+
+event-consumer:
+  enabled: true
+  replicaCount: 6
+  autoscaling:
+    enabled: true
+    minReplicas: 6
+    maxReplicas: 48
+
+platformctl:
+  enabled: true
+  migration:
+    enabled: true
+

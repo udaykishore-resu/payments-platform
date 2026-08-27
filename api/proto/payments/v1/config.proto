@@ -1,0 +1,417 @@
+// Configuration and Policy (BC-5) internal interface.
+//
+// The control plane is the PUBLISHED-LANGUAGE SUPPLIER here and the data plane is its
+// customer. The supplier may not break the customer's contract without a new major
+// event version.
+//
+// The data plane never takes a synchronous dependency on this service for a payment. It
+// warms a local snapshot from `configuration.published.v1`, tolerates 30 s of
+// staleness, and FAILS STATIC: if the control plane is entirely down it keeps
+// processing with its last-known-good snapshot rather than either stopping (which kills
+// revenue) or ignoring limits (which kills compliance). Past max_config_staleness
+// (15 min) it fails closed for NEW merchants while continuing to serve existing ones.
+// Graceful degradation with a defined cliff.
+syntax = "proto3";
+
+package payments.v1;
+
+import "google/protobuf/timestamp.proto";
+import "payments/v1/common.proto";
+
+option go_package = "github.com/udaykishore-resu/payments-platform/api/proto/payments/v1;paymentsv1";
+option java_multiple_files = true;
+option java_package = "com.example.payments.v1";
+option java_outer_classname = "ConfigProto";
+option csharp_namespace = "Example.Payments.V1";
+
+// Lifecycle of a configuration version. History is append-only: a superseded version is
+// never deleted or rewritten.
+enum ConfigurationStatus {
+  CONFIGURATION_STATUS_UNSPECIFIED = 0;
+  CONFIGURATION_STATUS_DRAFT = 1;
+  CONFIGURATION_STATUS_ACTIVE = 2;
+  CONFIGURATION_STATUS_SUPERSEDED = 3;
+  CONFIGURATION_STATUS_ROLLED_BACK = 4;
+}
+
+// How the router picks among eligible gateways.
+enum RoutingStrategy {
+  ROUTING_STRATEGY_UNSPECIFIED = 0;
+  ROUTING_STRATEGY_PRIORITY_WITH_FALLBACK = 1;
+  ROUTING_STRATEGY_WEIGHTED = 2;
+  ROUTING_STRATEGY_LEAST_COST = 3;
+  ROUTING_STRATEGY_LOWEST_LATENCY = 4;
+}
+
+// Backoff shape for outbound webhook delivery.
+enum WebhookBackoff {
+  WEBHOOK_BACKOFF_UNSPECIFIED = 0;
+  // The default, and the only one that avoids a retry storm when a merchant endpoint
+  // recovers and every parked delivery fires at once.
+  WEBHOOK_BACKOFF_EXPONENTIAL_JITTER = 1;
+  WEBHOOK_BACKOFF_EXPONENTIAL = 2;
+  WEBHOOK_BACKOFF_LINEAR = 3;
+}
+
+// Expected gateway payout cadence.
+enum SettlementSchedule {
+  SETTLEMENT_SCHEDULE_UNSPECIFIED = 0;
+  SETTLEMENT_SCHEDULE_DAILY = 1;
+  SETTLEMENT_SCHEDULE_WEEKLY = 2;
+  SETTLEMENT_SCHEDULE_BIWEEKLY = 3;
+  SETTLEMENT_SCHEDULE_MONTHLY = 4;
+  SETTLEMENT_SCHEDULE_MANUAL = 5;
+}
+
+// The `when` clause of a routing rule. All set fields must match; an unset field
+// matches anything.
+message RoutingRuleCondition {
+  string currency = 1;
+  string payment_method = 2;
+  string country = 3;
+  // Applies when the payment amount is strictly greater than this.
+  Money amount_above = 4;
+}
+
+// The `then` clause: which gateway leads and which follow.
+message RoutingRuleOutcome {
+  string primary = 1;
+  repeated string fallback = 2;
+}
+
+// A corridor-specific routing override. Rules are evaluated in declaration order and
+// the first match wins - there is no scoring across rules, because a rule set whose
+// outcome depends on both evaluation order and scores is not auditable.
+message RoutingRule {
+  RoutingRuleCondition when = 1;
+  RoutingRuleOutcome then = 2;
+}
+
+// Relative influence of each signal when the strategy is WEIGHTED.
+//
+// The four weights must sum to 1.0. A set that does not is rejected by L4 rather than
+// normalised: silent normalisation hides a typo that changes traffic distribution.
+message RoutingWeights {
+  double health = 1;
+  double success_rate = 2;
+  double cost = 3;
+  double latency = 4;
+}
+
+// Which gateway a payment goes to, and in what order the alternatives are tried.
+message RoutingConfig {
+  RoutingStrategy strategy = 1;
+  // Gateway code. Must have a CERTIFIED connection for this merchant in this
+  // environment; L4 checks it at publish time and again at rollback time.
+  string primary = 2;
+  // Ordered failover candidates, tried left to right when the primary is unusable.
+  repeated string fallback = 3;
+  repeated RoutingRule rules = 4;
+  RoutingWeights weights = 5;
+
+  reserved 6 to 11;
+}
+
+// Per-merchant and per-instrument velocity ceilings.
+message VelocityLimits {
+  int32 max_payments_per_minute = 1;
+  // Per payment-method-reference ceiling. The most effective card-testing control
+  // available without holding card data.
+  int32 max_per_card_per_hour = 2;
+}
+
+// Policy limits evaluated at L5 and by the risk engine before dispatch.
+message RiskConfig {
+  // Hard ceiling per payment.
+  Money max_transaction_amount = 1;
+  // Above this amount the risk decision is forced to REQUIRE_3DS. Strong customer
+  // authentication is a policy outcome, not a gateway default.
+  Money require_3ds_above = 2;
+  // Rolling 24-hour cumulative ceiling across all of this merchant's payments.
+  Money daily_volume_limit = 3;
+  VelocityLimits velocity = 4;
+  // Payer countries refused outright. Sanctions jurisdictions belong here and are
+  // additionally enforced platform-wide, so removing one here does not unblock it.
+  repeated string blocked_countries = 5;
+  // What the risk engine applies when the external scorer is unavailable. This is what
+  // "fail open to the policy default" means concretely - it is never "allow".
+  string fallback_decision = 6;
+
+  reserved 7 to 11;
+}
+
+// Operational limits enforced at L5.
+message LimitsConfig {
+  // How long after capture a refund may be requested. Must not exceed the gateway's own
+  // refund window, which L4 verifies against the capability descriptor.
+  int32 max_refund_window_days = 1;
+  // Maximum partial captures against one authorization.
+  int32 max_partial_captures = 2;
+}
+
+// One outbound webhook destination.
+message WebhookEndpoint {
+  // HTTPS only. Plaintext HTTP is rejected by L4: a webhook carrying payment outcomes
+  // over cleartext is an information disclosure, and a redirect to HTTPS does not
+  // retroactively protect the first request.
+  string url = 1;
+  // Event type patterns, e.g. "payment.*".
+  repeated string events = 2;
+  // Secrets-manager path of the HMAC signing secret. The secret itself never appears in
+  // a configuration document, an event, a log line or an API response.
+  string secret_ref = 3;
+  string description = 4;
+  // False stops delivery without losing the endpoint's configuration and secret
+  // binding.
+  bool active = 5;
+}
+
+// How failed webhook deliveries are retried.
+message WebhookRetryPolicy {
+  // Total attempts before the delivery is dead-lettered and an operator alert is raised.
+  int32 max_attempts = 1;
+  WebhookBackoff backoff = 2;
+  int32 initial_delay_seconds = 3;
+  int32 max_delay_seconds = 4;
+}
+
+// Outbound webhook delivery for this merchant.
+message WebhookConfig {
+  repeated WebhookEndpoint endpoints = 1;
+  WebhookRetryPolicy retry_policy = 2;
+}
+
+// How the gateway is expected to settle to the merchant.
+//
+// The platform OBSERVES settlement from gateway reports and reconciles against it. It
+// does not compute or perform settlement and takes no custody of funds.
+message SettlementConfig {
+  SettlementSchedule schedule = 1;
+  string currency = 2;
+  // Expected rolling reserve period in days, as agreed with the gateway.
+  int32 hold_days = 3;
+  // Payout day when the schedule is WEEKLY or BIWEEKLY.
+  string weekly_anchor_day = 4;
+}
+
+// Per-merchant capability switches. A flag may only enable a capability the merchant's
+// certified connections actually support; L4 checks each against the descriptors.
+message FeatureFlags {
+  bool network_tokens = 1;
+  bool partial_capture = 2;
+  bool multi_capture = 3;
+  // Allow TRA, low-value and MIT exemptions to be claimed. Every claimed exemption is
+  // modelled explicitly and audited.
+  bool three_ds_exemptions = 4;
+}
+
+// The canonical desired-state document.
+//
+// Published in full - never as a diff - because the configuration topic is compacted
+// and a consumer restoring from it must get a usable state from one record.
+message MerchantConfiguration {
+  string merchant_id = 1;
+  // Dense and monotonic per merchant. Assigned by the platform; ignored on write.
+  int32 version = 2;
+  ConfigurationStatus status = 3;
+  // "sandbox" or "production", matching the canonical document.
+  string environment = 4;
+  // A payment in a currency absent here is rejected before any gateway is contacted.
+  repeated string supported_currencies = 5;
+  repeated string payment_methods = 6;
+  // Payer countries this merchant may accept from.
+  repeated string countries = 7;
+  RoutingConfig routing = 8;
+  RiskConfig risk = 9;
+  LimitsConfig limits = 10;
+  WebhookConfig webhooks = 11;
+  SettlementConfig settlement = 12;
+  FeatureFlags feature_flags = 13;
+
+  reserved 14 to 25;
+}
+
+// A configuration document plus its version metadata.
+message ConfigurationVersion {
+  // `cfg_` + ULID. Stable across versions.
+  string configuration_id = 1;
+  // `cfv_` + ULID. Unique per version.
+  string configuration_version_id = 2;
+  string merchant_id = 3;
+  int32 version = 4;
+  // Zero on version 1.
+  int32 previous_version = 5;
+  // Non-zero when this version was produced by a rollback, naming the version whose
+  // document was restored. Its digest equals that version's digest, which is the
+  // machine-checkable proof that the rollback is faithful.
+  int32 rollback_of = 6;
+  MerchantConfiguration document = 7;
+  // sha256 of the JCS-canonical document, lowercase hex. Two publishes of an identical
+  // document produce different versions but the same digest, which is how the
+  // propagation probe detects a genuine no-op.
+  string digest = 8;
+  string published_by = 9;
+  google.protobuf.Timestamp published_at = 10;
+
+  reserved 11 to 15;
+}
+
+// Read the active configuration for one merchant.
+message GetActiveConfigurationRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  // Maximum staleness the caller accepts, in milliseconds. Zero means the server
+  // default. A caller needing a fresher answer than the server can produce gets an
+  // error, not a silently stale one.
+  int64 max_staleness_ms = 3;
+}
+
+// The active version.
+message GetActiveConfigurationResponse {
+  ConfigurationVersion configuration = 1;
+  // How stale the served snapshot is.
+  int64 snapshot_age_ms = 2;
+}
+
+// Bulk read for warming a cold data-plane cache after a deploy or a restart.
+message ListActiveConfigurationsRequest {
+  TenantContext context = 1;
+  PageRequest page = 2;
+  // Restrict to one environment.
+  string environment = 3;
+  // Only configurations published at or after this instant. Lets a cache that has been
+  // down for a bounded period fetch a delta instead of the whole tenant.
+  google.protobuf.Timestamp published_since = 4;
+}
+
+// A page of active configurations.
+message ListActiveConfigurationsResponse {
+  repeated ConfigurationVersion configurations = 1;
+  PageResponse page = 2;
+}
+
+// Cursor-paginated version history, newest first. Every version is present, including
+// those created by a rollback.
+message ListConfigurationVersionsRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  PageRequest page = 3;
+}
+
+// A page of versions.
+message ListConfigurationVersionsResponse {
+  repeated ConfigurationVersion versions = 1;
+  PageResponse page = 2;
+}
+
+// Publish a new configuration version.
+//
+// Validated (L4), assigned the next dense version, persisted with the full prior
+// document retained, audited with actor and diff, and published as
+// configuration.published.v1.
+message PublishConfigurationRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  MerchantConfiguration document = 3;
+  // The version the caller believes is current. A concurrent publish loses and must
+  // re-read, re-merge and retry - the platform does not merge documents on a caller's
+  // behalf.
+  Precondition precondition = 4;
+  // Recorded in the audit trail alongside the diff.
+  string change_reason = 5;
+  IdempotencyOptions idempotency = 6;
+}
+
+// The published version.
+message PublishConfigurationResponse {
+  ConfigurationVersion configuration = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Roll back to a previous version by re-publishing its document as a NEW version.
+//
+// The target document is RE-VALIDATED at rollback time, not trusted because it was
+// valid when first published: a gateway may since have been de-registered, a
+// certification expired or a residency policy tightened. Restoring a document the data
+// plane cannot honour would convert an attempted recovery into an outage.
+message RollbackConfigurationRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  // The version whose document should be restored.
+  int32 to_version = 3;
+  // Required. An unexplained production rollback is an incident nobody can reconstruct
+  // later.
+  string reason = 4;
+  IdempotencyOptions idempotency = 5;
+}
+
+// The new version carrying the restored document.
+message RollbackConfigurationResponse {
+  ConfigurationVersion configuration = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Validate a document without publishing it. Used by the console for pre-flight
+// feedback and by CI to check configuration changes before they are proposed.
+message ValidateConfigurationRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  MerchantConfiguration document = 3;
+}
+
+// The validation outcome. Warnings do not block a publish; errors do.
+message ValidateConfigurationResponse {
+  bool valid = 1;
+  repeated ErrorDetail errors = 2;
+  repeated ErrorDetail warnings = 3;
+  // Digest the document would have if published, so a caller can detect a no-op.
+  string digest = 4;
+}
+
+// Subscribe to configuration publications.
+//
+// Server-streaming as a propagation accelerator inside a region. Kafka remains the
+// durable path and the one that survives a control-plane outage; a dropped stream
+// widens the propagation window and never breaks correctness.
+message WatchConfigurationsRequest {
+  TenantContext context = 1;
+  // Restrict to specific merchants. Empty means every merchant in the tenant.
+  repeated string merchant_ids = 2;
+  // Resume from this version onwards for each merchant, so a reconnecting consumer does
+  // not miss a publication that landed while it was disconnected.
+  google.protobuf.Timestamp since = 3;
+}
+
+// One published configuration.
+message WatchConfigurationsResponse {
+  ConfigurationVersion configuration = 1;
+  // True when this message is part of the catch-up replay rather than a live
+  // publication.
+  bool is_replay = 2;
+}
+
+// Configuration and policy (BC-5).
+service ConfigurationService {
+  // Read the active configuration for one merchant.
+  rpc GetActiveConfiguration(GetActiveConfigurationRequest) returns (GetActiveConfigurationResponse);
+
+  // Bulk read for warming a cold data-plane cache.
+  rpc ListActiveConfigurations(ListActiveConfigurationsRequest) returns (ListActiveConfigurationsResponse);
+
+  // Cursor-paginated version history.
+  rpc ListConfigurationVersions(ListConfigurationVersionsRequest) returns (ListConfigurationVersionsResponse);
+
+  // Publish a new version. Validated, versioned, audited and published as an event.
+  rpc PublishConfiguration(PublishConfigurationRequest) returns (PublishConfigurationResponse);
+
+  // Roll back by re-publishing an earlier document as a new version, after re-validating
+  // it against today's world.
+  rpc RollbackConfiguration(RollbackConfigurationRequest) returns (RollbackConfigurationResponse);
+
+  // Validate without publishing. Pre-flight feedback for the console and for CI.
+  rpc ValidateConfiguration(ValidateConfigurationRequest) returns (ValidateConfigurationResponse);
+
+  // Stream publications to a data-plane cache. An accelerator over the durable Kafka
+  // path, never a replacement for it.
+  rpc WatchConfigurations(WatchConfigurationsRequest) returns (stream WatchConfigurationsResponse);
+}

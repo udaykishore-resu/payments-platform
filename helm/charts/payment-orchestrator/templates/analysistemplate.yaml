@@ -1,0 +1,87 @@
+{{- if and .Values.rollout.enabled .Values.rollout.analysis.enabled }}
+{{- $a := .Values.rollout.analysis }}
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ include "pp-common.fullname" . }}-sli
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  args:
+    - name: service
+    - name: canary-hash
+  metrics:
+    # 1. Error rate. The canary's own 5xx ratio, not the fleet's: the fleet is
+    #    still mostly stable pods, so a fleet-wide query dilutes a broken canary
+    #    below the threshold exactly when it matters.
+    - name: error-rate
+      interval: {{ $a.errorRate.interval }}
+      count: {{ $a.errorRate.count }}
+      successCondition: result[0] <= {{ $a.errorRate.threshold }}
+      failureLimit: {{ $a.errorRate.failureLimit }}
+      provider:
+        prometheus:
+          address: {{ $a.prometheusAddress }}
+          query: |
+            sum(rate(pp_http_requests_total{service="{{ "{{args.service}}" }}",status="5xx",
+                     pod=~".*{{ "{{args.canary-hash}}" }}.*"}[2m]))
+            /
+            clamp_min(sum(rate(pp_http_requests_total{service="{{ "{{args.service}}" }}",
+                     pod=~".*{{ "{{args.canary-hash}}" }}.*"}[2m])), 1e-9)
+    # 2. Latency. p99 must stay inside the SLO itself, not inside a relaxed
+    #    canary-only threshold.
+    - name: latency-p99
+      interval: {{ $a.latencyP99.interval }}
+      count: {{ $a.latencyP99.count }}
+      successCondition: result[0] <= {{ $a.latencyP99.threshold }}
+      failureLimit: {{ $a.latencyP99.failureLimit }}
+      provider:
+        prometheus:
+          address: {{ $a.prometheusAddress }}
+          query: |
+            histogram_quantile(0.99, sum by (le) (
+              rate(pp_http_request_duration_seconds_bucket{service="{{ "{{args.service}}" }}",
+                   pod=~".*{{ "{{args.canary-hash}}" }}.*"}[2m])))
+{{- if $a.authorizationRate.enabled }}
+    # 3. Business SLI: authorization rate vs the stable revision. This is the one
+    #    that catches a correct-looking deploy that quietly breaks money -- it
+    #    returns 200s at normal latency while authorising fewer payments.
+    - name: authorization-rate-vs-stable
+      interval: {{ $a.authorizationRate.interval }}
+      count: {{ $a.authorizationRate.count }}
+      successCondition: result[0] >= {{ $a.authorizationRate.threshold }}
+      failureLimit: {{ $a.authorizationRate.failureLimit }}
+      provider:
+        prometheus:
+          address: {{ $a.prometheusAddress }}
+          query: |
+            (
+              sum(rate(pp_payments_total{outcome="authorized",pod=~".*{{ "{{args.canary-hash}}" }}.*"}[5m]))
+              / clamp_min(sum(rate(pp_payments_total{outcome=~"authorized|declined|failed",
+                          pod=~".*{{ "{{args.canary-hash}}" }}.*"}[5m])), 1e-9)
+            )
+            -
+            scalar(
+              sum(rate(pp_payments_total{outcome="authorized",pod!~".*{{ "{{args.canary-hash}}" }}.*"}[5m]))
+              / clamp_min(sum(rate(pp_payments_total{outcome=~"authorized|declined|failed",
+                          pod!~".*{{ "{{args.canary-hash}}" }}.*"}[5m])), 1e-9)
+            )
+{{- end }}
+{{- if $a.errorBudget.enabled }}
+    # 4. Global guard: the org-wide error budget. The freeze policy applies to
+    #    in-flight rollouts, not only to merges -- promoting a canary while the
+    #    budget is nearly gone spends reliability we do not have.
+    - name: error-budget-guard
+      interval: {{ $a.errorBudget.interval }}
+      count: {{ $a.errorBudget.count }}
+      successCondition: result[0] >= {{ $a.errorBudget.threshold }}
+      failureLimit: {{ $a.errorBudget.failureLimit }}
+      provider:
+        prometheus:
+          address: {{ $a.prometheusAddress }}
+          query: pp:error_budget_remaining:payment_api
+{{- end }}
+{{- end }}

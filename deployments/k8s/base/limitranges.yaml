@@ -1,0 +1,121 @@
+# LimitRanges. Note what is absent: a default CPU limit.
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: pp-control-plane-defaults
+  namespace: pp-control-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  limits:
+    - type: Container
+      # A default *request* only. There is deliberately no `default` (i.e. no
+      # default limit) for cpu: a defaulted CPU limit would silently reintroduce
+      # CFS throttling on every workload that omits one on purpose.
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        memory: 512Mi
+      max:
+        memory: 4Gi
+      min:
+        cpu: 10m
+        memory: 32Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: pp-data-plane-defaults
+  namespace: pp-data-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  limits:
+    - type: Container
+      # A default *request* only. There is deliberately no `default` (i.e. no
+      # default limit) for cpu: a defaulted CPU limit would silently reintroduce
+      # CFS throttling on every workload that omits one on purpose.
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        memory: 512Mi
+      max:
+        memory: 8Gi
+      min:
+        cpu: 10m
+        memory: 32Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: pp-automation-defaults
+  namespace: pp-automation
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  limits:
+    - type: Container
+      # A default *request* only. There is deliberately no `default` (i.e. no
+      # default limit) for cpu: a defaulted CPU limit would silently reintroduce
+      # CFS throttling on every workload that omits one on purpose.
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        memory: 512Mi
+      max:
+        memory: 4Gi
+      min:
+        cpu: 10m
+        memory: 32Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: pp-platform-defaults
+  namespace: pp-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  limits:
+    - type: Container
+      # A default *request* only. There is deliberately no `default` (i.e. no
+      # default limit) for cpu: a defaulted CPU limit would silently reintroduce
+      # CFS throttling on every workload that omits one on purpose.
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        memory: 512Mi
+      max:
+        memory: 4Gi
+      min:
+        cpu: 10m
+        memory: 32Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: pp-observability-defaults
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  limits:
+    - type: Container
+      # A default *request* only. There is deliberately no `default` (i.e. no
+      # default limit) for cpu: a defaulted CPU limit would silently reintroduce
+      # CFS throttling on every workload that omits one on purpose.
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        memory: 512Mi
+      max:
+        memory: 8Gi
+      min:
+        cpu: 10m
+        memory: 32Mi

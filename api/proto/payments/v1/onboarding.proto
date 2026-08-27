@@ -1,0 +1,464 @@
+// Onboarding (BC-3) internal interface.
+//
+// Two audiences:
+//   * The control plane and console, which read cases and deliver signals.
+//   * The workflow worker, which reports activity results back to the engine. Those
+//     RPCs are the activity callbacks; they are the reason this service exists as gRPC
+//     rather than only as REST.
+//
+// Every step's result is checkpointed BEFORE the next step begins, resuming replays no
+// completed step, an aborted instance runs compensations in strict reverse order, and a
+// step that exhausts its retries moves the instance to FAILED with the full error chain
+// in the workflow DLQ.
+syntax = "proto3";
+
+package payments.v1;
+
+import "google/protobuf/timestamp.proto";
+import "payments/v1/common.proto";
+import "payments/v1/merchant.proto";
+
+option go_package = "github.com/udaykishore-resu/payments-platform/api/proto/payments/v1;paymentsv1";
+option java_multiple_files = true;
+option java_package = "com.example.payments.v1";
+option java_outer_classname = "OnboardingProto";
+option csharp_namespace = "Example.Payments.V1";
+
+// The twelve steps of workflow `merchant-onboarding@v1`, in definition order.
+enum OnboardingStepKey {
+  ONBOARDING_STEP_KEY_UNSPECIFIED = 0;
+  ONBOARDING_STEP_KEY_VALIDATE_MERCHANT = 1;
+  ONBOARDING_STEP_KEY_SUBMIT_KYC = 2;
+  ONBOARDING_STEP_KEY_AWAIT_KYC_DECISION = 3;
+  ONBOARDING_STEP_KEY_VALIDATE_BANK_ACCOUNT = 4;
+  ONBOARDING_STEP_KEY_PROVISION_GATEWAYS = 5;
+  ONBOARDING_STEP_KEY_STORE_CREDENTIALS = 6;
+  ONBOARDING_STEP_KEY_REGISTER_WEBHOOKS = 7;
+  ONBOARDING_STEP_KEY_APPLY_CONFIGURATION = 8;
+  ONBOARDING_STEP_KEY_SANDBOX_VALIDATION = 9;
+  ONBOARDING_STEP_KEY_CERTIFICATION = 10;
+  ONBOARDING_STEP_KEY_COMPLIANCE_REVIEW = 11;
+  ONBOARDING_STEP_KEY_ACTIVATE = 12;
+}
+
+// Lifecycle of one workflow step.
+enum OnboardingStepState {
+  ONBOARDING_STEP_STATE_UNSPECIFIED = 0;
+  ONBOARDING_STEP_STATE_PENDING = 1;
+  ONBOARDING_STEP_STATE_RUNNING = 2;
+  // A signal step. It holds NO worker lease: a 5-day compliance review or a 7-day KYC
+  // wait costs zero worker resource.
+  ONBOARDING_STEP_STATE_WAITING_SIGNAL = 3;
+  ONBOARDING_STEP_STATE_SUCCEEDED = 4;
+  ONBOARDING_STEP_STATE_FAILED = 5;
+  ONBOARDING_STEP_STATE_COMPENSATING = 6;
+  ONBOARDING_STEP_STATE_COMPENSATED = 7;
+  ONBOARDING_STEP_STATE_SKIPPED = 8;
+}
+
+// Lifecycle of an onboarding case: OPEN <-> BLOCKED -> COMPLETED | ABANDONED.
+// Exactly one non-terminal case may exist per merchant.
+enum OnboardingCaseStatus {
+  ONBOARDING_CASE_STATUS_UNSPECIFIED = 0;
+  ONBOARDING_CASE_STATUS_OPEN = 1;
+  ONBOARDING_CASE_STATUS_BLOCKED = 2;
+  ONBOARDING_CASE_STATUS_COMPLETED = 3;
+  ONBOARDING_CASE_STATUS_ABANDONED = 4;
+}
+
+// Lifecycle of the underlying durable workflow instance.
+enum WorkflowInstanceState {
+  WORKFLOW_INSTANCE_STATE_UNSPECIFIED = 0;
+  WORKFLOW_INSTANCE_STATE_PENDING = 1;
+  WORKFLOW_INSTANCE_STATE_RUNNING = 2;
+  WORKFLOW_INSTANCE_STATE_WAITING_SIGNAL = 3;
+  WORKFLOW_INSTANCE_STATE_COMPENSATING = 4;
+  WORKFLOW_INSTANCE_STATE_COMPLETED = 5;
+  WORKFLOW_INSTANCE_STATE_FAILED = 6;
+  WORKFLOW_INSTANCE_STATE_ABORTED = 7;
+}
+
+// Signals a workflow instance can be waiting on.
+enum OnboardingSignalName {
+  ONBOARDING_SIGNAL_NAME_UNSPECIFIED = 0;
+  // Resolves the KYC signal wait at step 3.
+  ONBOARDING_SIGNAL_NAME_KYC_DECISION = 1;
+  // The manual compliance gate at step 11. Dual control; the signal itself is audited.
+  ONBOARDING_SIGNAL_NAME_COMPLIANCE_APPROVAL = 2;
+  // Completes a gateway-hosted merchant consent flow during provisioning at step 5.
+  ONBOARDING_SIGNAL_NAME_GATEWAY_CONSENT = 3;
+}
+
+// Decision carried by a signal. The valid set depends on the signal name; an
+// inapplicable decision is INVALID_ARGUMENT rather than being silently coerced.
+enum SignalDecision {
+  SIGNAL_DECISION_UNSPECIFIED = 0;
+  SIGNAL_DECISION_APPROVE = 1;
+  SIGNAL_DECISION_REJECT = 2;
+  // KYC came back needing more evidence. Parks the instance and notifies the merchant;
+  // this is NOT a failure.
+  SIGNAL_DECISION_MORE_INFO = 3;
+  SIGNAL_DECISION_CONSENT_GRANTED = 4;
+  SIGNAL_DECISION_CONSENT_DECLINED = 5;
+}
+
+// Severity of a validation-plane outcome attached to a case.
+enum AnnotationSeverity {
+  ANNOTATION_SEVERITY_UNSPECIFIED = 0;
+  // Blocks the workflow.
+  ANNOTATION_SEVERITY_ERROR = 1;
+  // Recorded and surfaced, does not block.
+  ANNOTATION_SEVERITY_WARNING = 2;
+}
+
+// Terminal state of a certification run.
+enum CertificationState {
+  CERTIFICATION_STATE_UNSPECIFIED = 0;
+  CERTIFICATION_STATE_RUNNING = 1;
+  CERTIFICATION_STATE_PASSED = 2;
+  CERTIFICATION_STATE_FAILED = 3;
+}
+
+// One of the seven mandatory certification assertions.
+enum CertificationAssertionId {
+  CERTIFICATION_ASSERTION_ID_UNSPECIFIED = 0;
+  // Proves the happy path end to end.
+  CERTIFICATION_ASSERTION_ID_AUTH_CAPTURE_REFUND_ROUNDTRIP = 1;
+  // Proves reversal works before real money is at risk.
+  CERTIFICATION_ASSERTION_ID_AUTH_VOID = 2;
+  // Proves the anti-corruption layer maps errors correctly.
+  CERTIFICATION_ASSERTION_ID_DECLINE_MAPPED = 3;
+  // Proves the asynchronous loop is closed.
+  CERTIFICATION_ASSERTION_ID_WEBHOOK_VERIFIED_AND_APPLIED = 4;
+  // Proves SCA compliance.
+  CERTIFICATION_ASSERTION_ID_THREE_DS_CHALLENGE_COMPLETES = 5;
+  // Proves idempotency in the real integration, not just in ours.
+  CERTIFICATION_ASSERTION_ID_IDEMPOTENT_DUPLICATE_MATCHES = 6;
+  // Proves L6 response validation.
+  CERTIFICATION_ASSERTION_ID_AMOUNT_CURRENCY_ECHO_MATCHES = 7;
+}
+
+// A validation-plane outcome attached to a case.
+message Annotation {
+  // Stable rule identifier, e.g. "L2.WEBSITE_NOT_REACHABLE".
+  string rule_id = 1;
+  AnnotationSeverity severity = 2;
+  string message = 3;
+  google.protobuf.Timestamp annotated_at = 4;
+}
+
+// One step of the durable workflow.
+message OnboardingStep {
+  // `wfs_` + ULID.
+  string id = 1;
+  OnboardingStepKey key = 2;
+  // Position in the workflow definition, 1-12.
+  int32 sequence = 3;
+  OnboardingStepState state = 4;
+  // How many times the activity has been attempted.
+  int32 attempt_count = 5;
+  // Retry budget from the workflow definition.
+  int32 max_attempts = 6;
+  // Step timeout from the definition. 432000 for the 5-day compliance gate.
+  int32 timeout_seconds = 7;
+  // The signal this step is blocked on, when it is a signal step.
+  OnboardingSignalName awaiting_signal = 8;
+  google.protobuf.Timestamp started_at = 9;
+  google.protobuf.Timestamp ended_at = 10;
+  // Normalized error code from the catalogue, when the step failed.
+  string error_code = 11;
+  // Human-readable failure summary. Never contains secrets or personal data.
+  string error_message = 12;
+
+  reserved 13 to 19;
+}
+
+// The stateful record of one merchant's journey from CREATED to ACTIVE, backed by
+// exactly one workflow instance.
+//
+// The case REQUESTS merchant status transitions; the merchant aggregate DECIDES them.
+// Conflating the two would let the automation plane bypass the merchant FSM guards.
+message OnboardingCase {
+  // `onb_` + ULID.
+  string id = 1;
+  string merchant_id = 2;
+  // `wfr_` + ULID. Immutable for the life of the case.
+  string workflow_instance_id = 3;
+  // Definition name and version, e.g. "merchant-onboarding@v1".
+  string workflow_name = 4;
+  OnboardingCaseStatus status = 5;
+  WorkflowInstanceState instance_state = 6;
+  // The merchant's lifecycle state, denormalised for display.
+  MerchantStatus merchant_status = 7;
+  OnboardingStepKey current_step_key = 8;
+  // Why the case is BLOCKED, when it is.
+  string blocked_reason = 9;
+  // Gateway codes selected for provisioning.
+  repeated string selected_gateways = 10;
+  repeated OnboardingStep steps = 11;
+  repeated Annotation annotations = 12;
+  // The certification report identifier, once a run has produced one.
+  string certification_report_id = 13;
+  // When the current step breaches its SLA.
+  google.protobuf.Timestamp sla_due_at = 14;
+  google.protobuf.Timestamp opened_at = 15;
+  google.protobuf.Timestamp closed_at = 16;
+  int64 version = 17;
+
+  reserved 18 to 25;
+}
+
+// One (gateway, payment method, currency) cell of the certification matrix.
+message CertificationMatrixCell {
+  string gateway_code = 1;
+  // Domain payment method, e.g. "CARD".
+  string payment_method = 2;
+  // ISO 4217 code.
+  string currency = 3;
+  // True only when every assertion in this cell passed. There is no partial pass and
+  // no waiver flag, because a waiver flag is the mechanism by which "certified"
+  // degrades into an opinion.
+  bool passed = 4;
+  repeated CertificationAssertionResult assertions = 5;
+}
+
+// One assertion evaluated for one matrix cell.
+message CertificationAssertionResult {
+  CertificationAssertionId id = 1;
+  bool passed = 2;
+  // Object-storage URI of the transcript proving the result.
+  string evidence_ref = 3;
+  // The sandbox payment this assertion exercised, where one exists.
+  string payment_id = 4;
+  // Why it failed, when it did.
+  string failure_reason = 5;
+}
+
+// A signed, immutable certification report.
+//
+// PRODUCTION_READY is unreachable without a PASSED report for the production
+// environment; a sandbox report never certifies a production connection.
+message CertificationReport {
+  string id = 1;
+  string merchant_id = 2;
+  Environment environment = 3;
+  // Version of the certification suite that produced this report.
+  string suite_version = 4;
+  CertificationState state = 5;
+  repeated CertificationMatrixCell matrix = 6;
+  // PASSED requires assertions_passed == assertions_total.
+  int32 assertions_passed = 7;
+  int32 assertions_total = 8;
+  // Signed, immutable report in object storage under Object Lock.
+  string artifact_uri = 9;
+  // Lowercase hex SHA-256 of the stored object. A mismatch invalidates the report.
+  string artifact_sha256 = 10;
+  // Detached signature over artifact_sha256, verifiable without database access.
+  string signature = 11;
+  google.protobuf.Timestamp started_at = 12;
+  google.protobuf.Timestamp completed_at = 13;
+
+  reserved 14 to 19;
+}
+
+// Start the onboarding workflow for a merchant.
+message StartOnboardingRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  // Gateways to provision. Step 5 fans out one branch per gateway; a branch that fails
+  // does not abort the others.
+  repeated string selected_gateways = 3;
+  Environment environment = 4;
+  // Currencies to certify. Drives the certification matrix.
+  repeated string supported_currencies = 5;
+  // Payment methods to certify. Drives the certification matrix.
+  repeated string supported_payment_methods = 6;
+  IdempotencyOptions idempotency = 7;
+}
+
+// The case. Starting an already-running workflow is a no-op that returns the existing
+// case with `already_running` set - the business key is the merchant id, which
+// guarantees exactly one live instance per merchant.
+message StartOnboardingResponse {
+  OnboardingCase onboarding_case = 1;
+  bool already_running = 2;
+  IdempotencyResult idempotency = 3;
+}
+
+// Read one case by merchant.
+message GetOnboardingCaseRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  // Optional. When empty, the merchant's current or most recent case is returned.
+  string case_id = 3;
+}
+
+// The case.
+message GetOnboardingCaseResponse {
+  OnboardingCase onboarding_case = 1;
+}
+
+// Cursor-paginated case listing, for operator queues.
+message ListOnboardingCasesRequest {
+  TenantContext context = 1;
+  PageRequest page = 2;
+  repeated OnboardingCaseStatus statuses = 3;
+  // Only cases parked on this signal. Used to build the compliance review queue.
+  OnboardingSignalName awaiting_signal = 4;
+  // Only cases whose SLA has already been breached.
+  bool sla_breached_only = 5;
+}
+
+// A page of cases.
+message ListOnboardingCasesResponse {
+  repeated OnboardingCase onboarding_cases = 1;
+  PageResponse page = 2;
+}
+
+// Deliver a signal to a running workflow instance.
+//
+// Signals are durable and idempotent per (workflow_instance_id, signal): a duplicate
+// delivery is a no-op that replays the stored result, which is what makes a duplicated
+// vendor webhook harmless.
+message SignalWorkflowRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  OnboardingSignalName signal = 3;
+  SignalDecision decision = 4;
+  // The deciding principal. Recorded alongside the actor derived from the credential;
+  // a mismatch is a dual-control violation.
+  string reviewer_id = 5;
+  // Justification. Required on any rejection.
+  string reason = 6;
+  // Structured reason codes for a KYC decision, e.g. "SANCTIONS_HIT".
+  repeated string reason_codes = 7;
+  // Object-storage URI of the signed compliance attestation. Required for an approved
+  // compliance gate: the "-> ACTIVE" guard requires a completed attestation to exist.
+  string attestation_ref = 8;
+  // Object-storage URI of KYC evidence under Object Lock. Never the evidence itself.
+  string evidence_ref = 9;
+  // The gateway this consent relates to, for GATEWAY_CONSENT.
+  string gateway_code = 10;
+  IdempotencyOptions idempotency = 11;
+
+  reserved 12 to 19;
+}
+
+// Acceptance of a signal.
+message SignalWorkflowResponse {
+  string case_id = 1;
+  string workflow_instance_id = 2;
+  // True on first delivery and also on a duplicate - a redelivery is a no-op, not an
+  // error.
+  bool accepted = 3;
+  bool duplicate = 4;
+  // `aud_` + ULID of the audit record written for this signal.
+  string audit_record_id = 5;
+  google.protobuf.Timestamp accepted_at = 6;
+  IdempotencyResult idempotency = 7;
+}
+
+// Workflow activity callback: report a completed step.
+//
+// The engine checkpoints this result before the next step begins, which is what makes
+// resumption replay no completed work.
+message ReportStepResultRequest {
+  TenantContext context = 1;
+  string workflow_instance_id = 2;
+  string step_id = 3;
+  OnboardingStepKey step_key = 4;
+  // Whether the activity succeeded.
+  bool succeeded = 5;
+  // Opaque, JSON-encoded activity output, checkpointed verbatim. Redacted through the
+  // same allowlist as logs: no secrets, no personal data, no cardholder data.
+  string output_json = 6;
+  // Populated when `succeeded` is false.
+  Error error = 7;
+  // Whether the failure is classified as transient. A transient failure consumes a
+  // retry; a terminal one moves the instance to FAILED and the payload to the DLQ.
+  bool transient = 8;
+  // The lease the worker holds. A step may not transition without a valid, unexpired
+  // lease - this is how a crashed worker's instance is safely picked up by another.
+  string lease_owner = 9;
+  IdempotencyOptions idempotency = 10;
+
+  reserved 11 to 19;
+}
+
+// What the engine decided to do with the reported result.
+message ReportStepResultResponse {
+  OnboardingStep step = 1;
+  WorkflowInstanceState instance_state = 2;
+  // When the next attempt of this step becomes runnable, if it will be retried.
+  google.protobuf.Timestamp next_attempt_at = 3;
+  // True when the instance has entered compensation. Compensations run in strict
+  // reverse order of completion.
+  bool compensating = 4;
+  IdempotencyResult idempotency = 5;
+}
+
+// Workflow activity callback: record the outcome of a certification run.
+message RecordCertificationReportRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  CertificationReport report = 3;
+  IdempotencyOptions idempotency = 4;
+}
+
+// The sealed report. Sealed reports are immutable; a re-certification is a new report.
+message RecordCertificationReportResponse {
+  CertificationReport report = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Read a certification report.
+message GetCertificationReportRequest {
+  TenantContext context = 1;
+  string report_id = 2;
+}
+
+// The report.
+message GetCertificationReportResponse {
+  CertificationReport report = 1;
+}
+
+// Abort a running workflow, running compensations for completed steps.
+message AbortOnboardingRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  string reason = 3;
+  IdempotencyOptions idempotency = 4;
+}
+
+// The case after abort was initiated. Compensation is asynchronous; poll the case.
+message AbortOnboardingResponse {
+  OnboardingCase onboarding_case = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Onboarding orchestration (BC-3).
+service OnboardingService {
+  // Start the workflow. Idempotent on the merchant business key.
+  rpc StartOnboarding(StartOnboardingRequest) returns (StartOnboardingResponse);
+
+  // Read a case with its step history and annotations.
+  rpc GetOnboardingCase(GetOnboardingCaseRequest) returns (GetOnboardingCaseResponse);
+
+  // Cursor-paginated listing, used to build operator queues.
+  rpc ListOnboardingCases(ListOnboardingCasesRequest) returns (ListOnboardingCasesResponse);
+
+  // Deliver a durable signal to a parked workflow instance.
+  rpc SignalWorkflow(SignalWorkflowRequest) returns (SignalWorkflowResponse);
+
+  // Workflow activity callback. Reports a step result and checkpoints it.
+  rpc ReportStepResult(ReportStepResultRequest) returns (ReportStepResultResponse);
+
+  // Workflow activity callback. Seals a certification report.
+  rpc RecordCertificationReport(RecordCertificationReportRequest) returns (RecordCertificationReportResponse);
+
+  // Read a certification report by identifier.
+  rpc GetCertificationReport(GetCertificationReportRequest) returns (GetCertificationReportResponse);
+
+  // Abort a running workflow and run compensations in reverse order.
+  rpc AbortOnboarding(AbortOnboardingRequest) returns (AbortOnboardingResponse);
+}

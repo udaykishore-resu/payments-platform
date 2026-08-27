@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/gateway.health_changed.v1.json",
+  "title": "gateway.health_changed.v1",
+  "description": "The health state of a (gateway, operation) pair changed in one region. Published by Gateway Registry & Integration (BC-4) on pp.gateways.health.v1, keyed by gateway_id, on a COMPACTED topic so a restarting router learns the current state of every gateway in one read. This is the feedback loop from the Observability plane back into Control. It is PLATFORM-SCOPED: there is no merchantid on the envelope, and tenantid is the platform tenant. Health is measured per (gateway, operation) and never per merchant, because per-merchant samples are too sparse to be statistically meaningful.",
+  "type": "object",
+  "required": [
+    "gatewayId",
+    "gatewayCode",
+    "operation",
+    "previousState",
+    "state",
+    "circuitState",
+    "errorRate",
+    "p99LatencyMs",
+    "sampleCount",
+    "windowSeconds",
+    "region",
+    "changedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "gatewayId": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "operation": {
+      "type": "string",
+      "enum": ["AUTHORIZE", "CAPTURE", "REFUND", "VOID", "LOOKUP", "PROVISION"]
+    },
+    "previousState": { "$ref": "#/$defs/healthState" },
+    "state": { "$ref": "#/$defs/healthState" },
+    "circuitState": {
+      "type": "string",
+      "enum": ["CLOSED", "OPEN", "HALF_OPEN"]
+    },
+    "errorRate": {
+      "description": "Error rate over the evaluation window, as a fraction.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "p99LatencyMs": { "type": "integer", "minimum": 0 },
+    "sampleCount": {
+      "description": "Below 20 the transition to DEGRADED is not taken at all. Carried so consumers can judge confidence rather than reacting to a two-sample blip.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "windowSeconds": {
+      "description": "Length of the sliding evaluation window. 30 by default.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "cooldownSeconds": {
+      "description": "Present while UNHEALTHY. Doubles per failed probe, capped at 300.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 300
+    },
+    "region": {
+      "description": "Health is measured per region. A consumer in another region MUST NOT act on it - a gateway degraded in eu-central-1 may be perfectly healthy from us-east-1, and shifting traffic on the wrong signal turns one region's incident into two.",
+      "type": "string",
+      "maxLength": 32
+    },
+    "changedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "healthState": {
+      "description": "HEALTHY -> DEGRADED above 5% errors over 30 s with at least 20 samples. DEGRADED -> UNHEALTHY above 25% errors or p99 over 5 s, opening the circuit. UNHEALTHY -> PROBING after cool-down. PROBING -> HEALTHY after 3 consecutive successes, or back to UNHEALTHY on any failure. DEGRADED never transitions straight to PROBING.",
+      "type": "string",
+      "enum": ["HEALTHY", "DEGRADED", "UNHEALTHY", "PROBING"]
+    }
+  },
+  "x-topic": "pp.gateways.health.v1",
+  "x-partition-key": "gateway_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-4 Gateway Registry & Integration",
+  "x-consumers": ["Routing", "Control plane", "Alerting"],
+  "x-revision": 1,
+  "x-envelope-notes": "No merchantid - this event is platform-scoped. tenantid is set to the platform tenant.",
+  "x-unknown-behaviour": { "state": "route-to-dlq", "circuitState": "route-to-dlq", "operation": "ignore" },
+  "examples": [
+    {
+      "gatewayId": "stripe",
+      "gatewayCode": "stripe",
+      "operation": "AUTHORIZE",
+      "previousState": "HEALTHY",
+      "state": "DEGRADED",
+      "circuitState": "CLOSED",
+      "errorRate": 0.071,
+      "p99LatencyMs": 1840,
+      "sampleCount": 412,
+      "windowSeconds": 30,
+      "region": "eu-central-1",
+      "changedAt": "2026-08-26T14:05:00.000Z"
+    },
+    {
+      "gatewayId": "stripe",
+      "gatewayCode": "stripe",
+      "operation": "AUTHORIZE",
+      "previousState": "DEGRADED",
+      "state": "UNHEALTHY",
+      "circuitState": "OPEN",
+      "errorRate": 0.31,
+      "p99LatencyMs": 6120,
+      "sampleCount": 588,
+      "windowSeconds": 30,
+      "cooldownSeconds": 30,
+      "region": "eu-central-1",
+      "changedAt": "2026-08-26T14:06:12.400Z"
+    }
+  ]
+}

@@ -1,5 +1,10 @@
 # ADR-003: Amazon SQS + SNS for asynchronous event distribution
 
+> **Status update:** partially superseded by [ADR-020](ADR-020-kafka-event-backbone.md).
+> SQS remains the right choice for point-to-point work queues; the platform-wide event
+> backbone is Kafka. See ADR-020 for what changed and why.
+
+
 ## Status
 Accepted
 

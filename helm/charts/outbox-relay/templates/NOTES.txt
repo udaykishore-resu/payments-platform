@@ -1,0 +1,47 @@
+{{ include "pp-common.name" . }} — {{ .Chart.Description }}
+
+  release      : {{ .Release.Name }}
+  namespace    : {{ .Release.Namespace }}
+  environment  : {{ .Values.global.environment }} / {{ .Values.global.region }} (active: {{ .Values.global.regionActive }})
+  image        : {{ include "pp-common.image" . }}
+  workload     : {{ if .Values.rollout.enabled }}Rollout (canary){{ else }}Deployment (rolling){{ end }}
+  replicas     : {{ .Values.replicaCount }} (autoscaled {{ .Values.autoscaling.minReplicas }}–{{ .Values.autoscaling.maxReplicas }} via {{ .Values.autoscaling.type | upper }})
+  priority     : {{ .Values.priorityClassName }}
+  grace/preStop: {{ .Values.terminationGracePeriodSeconds }}s / {{ .Values.lifecycle.preStopSleepSeconds }}s
+
+Checks worth running before you call this deployed:
+
+  1. Probes answer independently:
+       kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "pp-common.fullname" . }} -- \
+         wget -qO- localhost:{{ .Values.ports.health }}{{ .Values.probes.liveness.path }}
+     /livez must answer even while /readyz is failing. If both fail together the
+     liveness probe has grown a downstream dependency and the next Aurora
+     failover will kill the fleet.
+
+  2. No secret material reached the pod:
+       kubectl -n {{ .Release.Namespace }} get pod -l app={{ include "pp-common.name" . }} \
+         -o jsonpath='{.items[0].spec.containers[0].env[*].name}'
+     Every name here should be a reference or a knob. Material lives only in
+     {{ .Values.externalSecrets.mountPath }}, projected by the External Secrets Operator.
+
+  3. Disruption budget actually binds:
+       kubectl -n {{ .Release.Namespace }} get pdb {{ include "pp-common.fullname" . }}
+     ALLOWED DISRUPTIONS must be < current replicas. A PDB whose selector matches
+     nothing reports 0 desired and silently permits everything.
+
+{{- if .Values.rollout.enabled }}
+
+  4. Watch or abort the canary:
+       kubectl argo rollouts get rollout {{ include "pp-common.fullname" . }} -n {{ .Release.Namespace }} --watch
+       kubectl argo rollouts abort  {{ include "pp-common.fullname" . }} -n {{ .Release.Namespace }}
+     Abort shifts 100% to stable within one reconcile (~10s). Database migrations
+     are NOT rolled back — the schema is expand/contract compatible with the
+     previous release by construction (deployment.md §5).
+{{- end }}
+{{- if eq .Values.autoscaling.type "keda" }}
+
+  4. Confirm KEDA owns the HPA and the trigger authenticates:
+       kubectl -n {{ .Release.Namespace }} get scaledobject {{ include "pp-common.fullname" . }} -o wide
+     A ScaledObject stuck at minReplicaCount with READY=False is usually a
+     TriggerAuthentication problem, not a scaling problem.
+{{- end }}

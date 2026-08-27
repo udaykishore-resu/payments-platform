@@ -1,0 +1,32 @@
+{{- if .Values.priorityClasses.create }}
+{{/*
+Off by default: PriorityClasses are cluster-scoped and owned by
+deployments/k8s/base. Two Helm releases in the same cluster both claiming
+ownership of a cluster-scoped object is a sync-loop waiting to happen. This
+template exists for standalone clusters (preview, kind) where the Kustomize base
+was never applied.
+
+The order is the degradation ladder read backwards: what must survive longest
+gets the highest value, and under node pressure eviction proceeds bottom-up.
+*/}}
+{{- range $pc := (list
+  (dict "name" "pp-money-path"        "value" 1000000 "desc" "payment-api, payment-orchestrator, webhook-ingress, outbox-relay")
+  (dict "name" "pp-platform-critical" "value" 900000  "desc" "CoreDNS, kube-proxy, CNI, otel-agent, Karpenter")
+  (dict "name" "pp-control-plane"     "value" 500000  "desc" "control-plane-api, workflow-worker, event-consumer")
+  (dict "name" "pp-observability"     "value" 400000  "desc" "Prometheus, otel-gateway, fluent-bit")
+  (dict "name" "pp-batch"             "value" 100000  "desc" "CronJobs, certification runs, reconciliation sweeps")
+  (dict "name" "pp-preview"           "value" 0       "desc" "Ephemeral preview environments (dev cluster only)")
+) }}
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $pc.name }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+value: {{ $pc.value }}
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: {{ $pc.desc | quote }}
+{{- end }}
+{{- end }}

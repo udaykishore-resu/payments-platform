@@ -1,0 +1,92 @@
+# The second, independent barrier against gateway-simulator reaching production.
+#
+# The first is a //go:build tag that excludes it from production images. This one
+# is a cluster policy that denies the Pod at admission. Two independent controls,
+# because "it will never be deployed to prod" is a statement about intent, not
+# about mechanism — and the two fail differently: a build-tag mistake is a
+# compile-time property of one repository, an admission policy is a runtime
+# property of the cluster.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deny-gateway-simulator
+  annotations:
+    policies.kyverno.io/severity: critical
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-gateway-simulator-image
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: >-
+          gateway-simulator must never run in production. It exists to fake
+          gateway responses; a production payment authorised by a simulator is a
+          payment that did not happen.
+        pattern:
+          spec:
+            containers:
+              - image: "!*gateway-simulator*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-digest-pinned-images
+  annotations:
+    policies.kyverno.io/severity: high
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: images-must-be-digest-pinned
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: >-
+          Images must be referenced by digest (@sha256:...), never by tag. A
+          mutable tag means you do not know what is running.
+        pattern:
+          spec:
+            containers:
+              - image: "*@sha256:*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-pdb-for-multi-replica
+  annotations:
+    policies.kyverno.io/severity: medium
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: deployment-needs-pdb
+      match:
+        any:
+          - resources:
+              kinds: [Deployment, Rollout]
+              namespaces: [pp-data-plane, pp-control-plane, pp-automation]
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.replicas || 1 }}"
+            operator: GreaterThan
+            value: 1
+      validate:
+        message: >-
+          Every Deployment/Rollout with more than one replica needs a
+          PodDisruptionBudget. Without one, a node drain can take the whole
+          workload at once and Kubernetes will consider that a success.
+        deny:
+          conditions:
+            all:
+              - key: "{{ length(query_kubernetes_resources('policy/v1', 'PodDisruptionBudget', request.object.metadata.namespace)) }}"
+                operator: Equals
+                value: 0

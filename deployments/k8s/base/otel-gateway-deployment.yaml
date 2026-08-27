@@ -1,0 +1,387 @@
+# otel-gateway — the tail sampler.
+#
+# Tail sampling requires trace-complete buffering, which is stateful and
+# therefore cannot run per node. The agents route to it by trace-ID hash so every
+# span of one trace lands on one replica.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-gateway
+  namespace: pp-observability
+  labels:
+    app.kubernetes.io/name: otel-gateway
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 20
+      tail_sampling:
+        # Longer than the end-to-end p99.9 (1.5s SLO) plus the 8s gateway timeout
+        # plus margin: deciding before the trace is complete is deciding wrong.
+        decision_wait: 12s
+        num_traces: 200000
+        expected_new_traces_per_sec: 4000
+        policies:
+          - name: errors-always
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+          - name: http-5xx-always
+            type: numeric_attribute
+            numeric_attribute:
+              key: http.response.status_code
+              min_value: 500
+              max_value: 599
+          - name: slow-always
+            type: latency
+            latency:
+              threshold_ms: 1500
+          - name: high-value-payments
+            type: numeric_attribute
+            numeric_attribute:
+              key: pp.payment.amount_minor
+              min_value: 50000
+          - name: unknown-outcome-always
+            type: string_attribute
+            string_attribute:
+              key: pp.attempt.outcome
+              values: [TIMEOUT_UNKNOWN, ERROR]
+          - name: reconciliation-required
+            type: string_attribute
+            string_attribute:
+              key: pp.event.type
+              values: ["payment.reconciliation_required.v1"]
+          - name: onboarding-always
+            type: string_attribute
+            string_attribute:
+              key: pp.workflow.name
+              values: ["merchant-onboarding@v1"]
+          - name: circuit-open
+            type: string_attribute
+            string_attribute:
+              key: pp.circuit.state
+              values: [OPEN, HALF_OPEN]
+          - name: baseline
+            type: probabilistic
+            probabilistic:
+              sampling_percentage: 10
+      batch:
+        timeout: 5s
+        send_batch_size: 2048
+    exporters:
+      otlp/tempo:
+        endpoint: tempo.pp-observability.svc.cluster.local:4317
+      prometheusremotewrite/amp:
+        endpoint: https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-REPLACE_ME/api/v1/remote_write
+        auth:
+          authenticator: sigv4auth
+    connectors:
+      spanmetrics:
+        histogram:
+          explicit:
+            buckets: [5ms, 10ms, 25ms, 50ms, 60ms, 100ms, 250ms, 500ms, 1s, 2500ms, 5s, 10s]
+    extensions:
+      sigv4auth:
+        region: eu-west-1
+      health_check:
+        endpoint: 0.0.0.0:13133
+    service:
+      extensions: [sigv4auth, health_check]
+      telemetry:
+        metrics:
+          address: 0.0.0.0:9090
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, tail_sampling, batch]
+          exporters: [otlp/tempo, spanmetrics]
+        metrics/spanmetrics:
+          receivers: [spanmetrics]
+          processors: [memory_limiter, batch]
+          exporters: [prometheusremotewrite/amp]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-gateway
+  namespace: pp-observability
+  labels:
+    app: otel-gateway
+    app.kubernetes.io/name: otel-gateway
+    app.kubernetes.io/part-of: payments-platform
+    pp.plane: observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      # Rolling a gateway replica moves its share of the trace-ID hash ring;
+      # taking two at once drops in-flight tail-sampling buffers for a third of
+      # traffic.
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: otel-gateway
+        app.kubernetes.io/name: otel-gateway
+        pp.plane: observability
+    spec:
+      priorityClassName: pp-observability
+      serviceAccountName: otel-collector
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 45   # decision_wait is 12s; drain the buffer
+      nodeSelector:
+        pp.plane: general
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-gateway
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: otel-gateway
+      containers:
+        - name: otel-gateway
+          image: otel/opentelemetry-collector-contrib@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+            - name: health
+              containerPort: 13133
+              protocol: TCP
+          env:
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: otel-gateway
+                  resource: limits.memory
+                  divisor: "1"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2000m"
+              # Tail sampling buffers whole traces, so memory is the real
+              # constraint; memory_limiter is set to 75% of this number.
+              memory: 4Gi
+          startupProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 2
+            failureThreshold: 30      # 60s: building the tail-sampling buffers
+          readinessProbe:
+            # health_check reflects pipeline state, so a failing exporter takes
+            # this replica out of the agents' hash ring — which is what we want:
+            # the agents redistribute rather than pile spans onto a sick replica.
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            # A TCP accept on the OTLP port, NOT the health endpoint. Liveness
+            # must answer only "is this process still able to serve", never
+            # "is the pipeline healthy" — an AMP outage failing every gateway's
+            # liveness at once would restart the whole tier and lose every
+            # in-flight trace buffer, which is the tracing equivalent of the
+            # database-failover fleet-kill this rule exists to prevent.
+            tcpSocket:
+              port: otlp-grpc
+            periodSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: otel-gateway
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-gateway
+  namespace: pp-observability
+  labels:
+    app.kubernetes.io/name: otel-gateway
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # Headless: the agents' loadbalancing exporter resolves the pod IPs itself and
+  # hashes on trace ID. A ClusterIP would round-robin and split traces across
+  # replicas, which silently breaks tail sampling.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: otel-gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: otel-gateway
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: otel-gateway
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: otel-gateway
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: otelcol_exporter_queue_size
+        target:
+          type: AverageValue
+          averageValue: "2000"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleDown:
+      # Long: scaling down the hash ring redistributes in-flight traces, so churn
+      # costs sampling accuracy rather than money. Still worth avoiding.
+      stabilizationWindowSeconds: 900
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-gateway
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-gateway
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-agent
+      ports:
+        - protocol: TCP
+          port: 4317
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tempo
+      ports:
+        - protocol: TCP
+          port: 4317
+    # AMP remote_write over the VPC endpoint ENIs in the pod subnets.
+    - to:
+        - ipBlock:
+            cidr: 10.20.16.0/20
+        - ipBlock:
+            cidr: 10.20.80.0/20
+        - ipBlock:
+            cidr: 10.20.96.0/20
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

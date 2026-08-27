@@ -1,0 +1,631 @@
+# .golangci.yml — the lint configuration for this repository.
+#
+# This is a contract, not a preference file. deployment.md §4.1 stage 2 makes any finding a
+# build failure, and §4.3 lists "any go vet/staticcheck finding" under Correctness. There
+# is no warn tier: a check that cannot block is a check nobody fixes.
+#
+# The selection principle: every enabled linter must correspond to a failure mode this
+# platform actually has. Style linters that produce opinions are off, because a lint
+# configuration that produces opinions gets a blanket `//nolint` and then the real findings
+# go with it.
+#
+# Schema version 2 (golangci-lint v2.x).
+
+version: "2"
+
+run:
+  timeout: 6m
+  # Test files are linted. They are where the fixtures live, where `bodyclose` catches a
+  # leaked response in a helper that runs ten thousand times, and where a real credential
+  # is most likely to be pasted.
+  tests: true
+  # Build-tagged code must be linted too, or the integration and contract suites — the
+  # code that touches real databases and real gateways — are exempt from every check here.
+  build-tags:
+    - integration
+    - contract
+    - e2e
+    - chaos
+    - tools
+
+linters:
+  default: none
+
+  enable:
+    # --- correctness ------------------------------------------------------------------
+    - errcheck        # an unchecked error is a decision nobody made
+    - govet           # the compiler's second opinion
+    - staticcheck     # includes gosimple and stylecheck in v2
+    - ineffassign     # an assignment that is never read is usually a typo'd variable
+    - unused          # dead code in a payments codebase is code nobody is maintaining
+    - errorlint       # %v on an error breaks errors.Is/As; == on an error breaks wrapping
+    - nilerr          # `if err != nil { return nil }` — returning success on failure
+    - nilnil          # (nil, nil) forces every caller to guess which nil means what
+    - exhaustive      # a switch over a state enum missing a state is a missed transition
+    - makezero        # make([]T, n) then append: n zero values nobody wanted
+    - durationcheck   # time.Duration * time.Duration is nanoseconds squared
+    - bidichk         # bidirectional unicode: the trojan-source class
+
+    # --- resource leaks ----------------------------------------------------------------
+    # Every one of these is the soak test's job made cheap. tests/load/soak.js finds these
+    # after four hours; these find them in two seconds.
+    - bodyclose       # an unclosed HTTP response leaks a connection AND a file descriptor
+    - sqlclosecheck   # an unclosed sql.Rows holds a pooled connection forever
+    - rowserrcheck    # rows.Err() unchecked: a partial result read as a complete one
+    - noctx           # an HTTP request without a context cannot be cancelled or timed out
+    - contextcheck    # a function that drops the caller's context breaks the §12.3 budget
+
+    # --- security -----------------------------------------------------------------------
+    - gosec           # SAST; deployment.md §4.1 stage 12
+    - forbidigo       # the platform-specific prohibitions; see settings below
+
+    # --- API and maintenance -------------------------------------------------------------
+    - revive          # the configurable replacement for golint; rules chosen below
+    - copyloopvar     # Go 1.22+ loop semantics; catches leftover `x := x` shadowing
+    - predeclared     # shadowing `new`, `len`, `cap`, `max` is a debugging afternoon
+    - unconvert       # a redundant conversion usually means a type changed underneath
+    - wastedassign
+    - usestdlibvars   # http.MethodPost, not "POST"
+    - testifylint     # assert.Equal argument order, and require vs assert in a goroutine
+    - depguard        # the import-boundary backstop; see settings
+    - nolintlint      # the suppressions must themselves be reviewable; see settings
+
+  settings:
+
+    errcheck:
+      # An unchecked type assertion is a panic on a request path (conventions §Rules 9 forbids
+      # exactly that), and unlike a dropped error it has no visible spelling — `x := y.(T)` looks
+      # identical to code that cannot fail. This stays on, and the two places it fired were both
+      # real: httpx cloning http.DefaultTransport, which any dependency may replace, and the
+      # resilience registry reading container/list's `any` payload.
+      check-type-assertions: true
+
+      # check-blank is deliberately OFF. This is the only setting in this file that relaxes a
+      # default rather than tightening one, so the reasoning is written out.
+      #
+      # `_ = f()` is Go's designated spelling for "I have read this error and I am discarding
+      # it". It cannot be written by accident; it is the *record* of a decision. Every one of the
+      # ~90 sites check-blank reported here is that spelling, and nearly all of them carry the
+      # reason on the line above: the deferred Rollback on an already-committed transaction, the
+      # best-effort Redis write in front of the Postgres source of truth, the compensating Save
+      # on a path that is already returning the original failure, the reconciler tolerating a
+      # state-machine refusal because a webhook won the race. Reporting those is reporting
+      # decisions that *were* made — the inverse of this linter's stated job — and the only route
+      # to zero with it on is ~90 //nolint comments, which is precisely how a real finding gets
+      # scrolled past.
+      #
+      # The class that actually escapes review — an error return dropped entirely, with no `_`
+      # and no assignment — is errcheck's default behaviour and still fails the build.
+      check-blank: false
+
+      exclude-functions:
+        # Deferred Close on a read-only handle: the error carries no information a caller
+        # could act on, and wrapping every one in a closure that logs is noise that hides
+        # the Close errors that DO matter (on a writer, where it is the flush).
+        - (io.Closer).Close
+        - (*os.File).Close
+        # fmt.Fprintf to a bytes.Buffer or an http.ResponseWriter cannot fail in a way the
+        # caller can do anything about; the connection is already gone.
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprintf(*bytes.Buffer)
+        - fmt.Fprintln(*bytes.Buffer)
+
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment optimises struct layout for memory. It produces dozens of findings
+        # that reorder fields into an order that makes no semantic sense, on structs where
+        # the saving is bytes. The domain aggregates are grouped by meaning on purpose.
+        - fieldalignment
+        # shadow is off for the same reason `go vet` itself does not run it: in Go, `err`
+        # shadowed inside an `if` or a subtest closure is the idiom, not a bug, and on this
+        # codebase every finding it produced was exactly that. The shadowing that DOES
+        # cause defects — a `:=` where a `=` was meant, so an outer variable silently keeps
+        # its old value — is caught by ineffassign and wastedassign, which report the dead
+        # write rather than the redeclaration.
+        - shadow
+
+    staticcheck:
+      checks:
+        - all
+        # ST1000: package comment on every package. Enforced by revive's package-comments
+        # instead, which produces one finding per package rather than one per file.
+        - -ST1000
+        # ST1003: naming conventions for initialisms. It fights with the domain vocabulary
+        # (KYC, MCC, PAN, DSN, SPI, TPS) that baseline §2 makes ubiquitous language.
+        - -ST1003
+        # QF1001: "could apply De Morgan's law". A pure rewrite with no correctness content, and
+        # on the shape it actually fires on here — a range-membership test written
+        # `!((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7'))` — the rewrite it asks for turns
+        # one readable "outside this alphabet" into four negated comparisons. This is the
+        # opinion-producing class the header of this file says stays off; every other QF check,
+        # which report a redundancy rather than a preference, remain on.
+        - -QF1001
+
+    exhaustive:
+      # The state machines are the reason this linter is on. A switch over PaymentStatus
+      # that has forgotten TIMEOUT_UNKNOWN is a payment the code cannot describe.
+      #
+      # Switches only, not maps. A map keyed by an enum is very often a deliberate
+      # *override* table — pkg/apierror's codeHTTPOverride holds the handful of codes whose
+      # status differs from their category default — and being partial is the whole point
+      # of one. Reporting those is a false positive with no fix other than listing every
+      # key with its own default, which is the table the override map exists to avoid.
+      check:
+        - switch
+      # default-signifies-exhaustive is ON, and the code was changed to earn it rather than the
+      # setting being flipped to hide findings.
+      #
+      # The argument for `false` is that a `default:` which silently does nothing is not a
+      # handling of the enum. That is true, and it is the reason the 21 switches this repository
+      # had with *no* default at all were the valuable findings — a new PaymentStatus or
+      # HealthState fell straight through them and the code could not describe it. All 21 now
+      # carry an explicit `default:` that states, at the switch, what the unlisted members mean:
+      # "the result is already complete for these", "these are not payment transitions",
+      # "these fall through to the category check below".
+      #
+      # The argument against `false` is what the other 63 findings were: switches that already
+      # had a default which returns an error, panics, or is the documented catch-all — where the
+      # only way to satisfy the linter is to list every member and give it the body the default
+      # already had. pkg/apierror has ~120 codes; enumerating them at two call sites that care
+      # about six of them does not make a missed transition more likely to be caught, it makes
+      # the six invisible. Same trade as the map exclusion above.
+      #
+      # So: a switch over a domain enum must account for every member, and a `default:` is one of
+      # the ways to account for them — but *saying nothing at all* is not, and that is now a
+      # build failure. Coverage of the state machines themselves is not left to this linter
+      # either: conventions §Rules 14 requires the exhaustive (from, to) property test on every
+      # shared.NewStateMachine table, which asserts the transitions rather than the switch.
+      default-signifies-exhaustive: true
+      ignore-enum-members: "^_"
+      # Standard-library enums are not state machines and enumerating them is not the
+      # point. reflect.Kind has twenty-six members; a switch over it in the redaction
+      # walker handles the kinds that can carry a value and falls through for the rest,
+      # which is correct and which listing all twenty-six would obscure.
+      ignore-enum-types: "^(reflect\\.Kind|time\\.(Month|Weekday)|syscall\\.|os\\.FileMode)"
+
+    gosec:
+      excludes:
+        # G104 duplicates errcheck, with worse messages.
+        - G104
+        # G304 (file inclusion via variable) fires on every config and migration loader.
+        # The paths are process arguments, not request input; the real control is that no
+        # request-derived string ever reaches a filesystem call, which is asserted by the
+        # security test suite rather than by a linter that cannot see taint.
+        - G304
+        # G101 (hardcoded credentials) matches on the *identifier*, not on the value. Every one
+        # of the eleven findings it produced is a name containing "credential", "token", "key",
+        # "password" or "secret" bound to something that is not one: the env var *name*
+        # "KAFKA_SASL_PASSWORD", the header name "X-Sim-Api-Key", the route template
+        # "/v1/gateways/{gatewayId}/credentials:rotate", the audit action "credential.rotated",
+        # the apierror code CREDENTIAL_ROTATION_IN_PROGRESS, the PayPal OAuth *path*. There is no
+        # edit that satisfies it short of renaming the platform's vocabulary away from the domain
+        # language baseline §2 makes binding.
+        #
+        # The class it exists for is covered, and covered better, by scripts/check-secrets.sh,
+        # which greps values rather than names and which (per the test-file note further down)
+        # does not exempt test fixtures.
+        - G101
+        # G115 (integer overflow on conversion) reports every narrowing or sign-changing
+        # conversion without looking at the guard in front of it. All fourteen findings are
+        # values bounded by their producer and, in several cases, by an explicit check on the
+        # line above: an HTTP status code into int16, a loop index below a compile-time bucket
+        # count into int16, `uint32(f.RolloutBasisPoints)` two lines under `RolloutBasisPoints >
+        # 0` and a validator that rejects anything outside 0..10000, a monotonic audit sequence,
+        # a gRPC code from the apierror catalogue, and the ULID millisecond timestamp in pkg/ids.
+        #
+        # The failure this rule exists for is an attacker-controlled length going negative and
+        # wrapping. On this platform no request-derived integer reaches a conversion: body size
+        # is capped before parsing, page limits go through pageLimit(), and amounts are
+        # money.Money, which is validated on construction and never converted. Leaving G115 on
+        # would cost fourteen //nolint comments on lines that are already guarded, and the first
+        # unguarded conversion would arrive to a reviewer who has learned the rule means nothing.
+        - G115
+      config:
+        # G302/G306: file permissions. Nothing this platform writes should be group- or
+        # world-readable.
+        G302: "0600"
+        G306: "0600"
+
+    forbidigo:
+      # analyze-types lets a rule match `time.Now` through an aliased import, which the
+      # pattern-only mode cannot.
+      analyze-types: true
+      forbid:
+        # --- fmt.Print* -------------------------------------------------------------------
+        # Anything printed to stdout bypasses the structured logger, which means it bypasses
+        # the redaction allowlist (§22.1, conventions rule 15), the sampler, the trace
+        # correlation and the log-field metric. In a container it lands in the same stream
+        # as the JSON logs and breaks every downstream parser.
+        - pattern: '^fmt\.Print(f|ln)?$'
+          msg: >-
+            fmt.Print* bypasses the structured logger and therefore the redaction
+            allowlist. Use the slog handler from internal/infrastructure/telemetry. In
+            cmd/** startup paths before the logger exists, write to os.Stderr explicitly.
+
+        # --- time.Now ---------------------------------------------------------------------
+        # Conventions rule 5: time comes from shared.Clock. A domain method that reads the
+        # wall clock cannot be tested deterministically, and every FSM property test that
+        # depends on an elapsed interval becomes a flake. Excluded paths below are the ones
+        # that legitimately own a clock.
+        - pattern: '^time\.Now$'
+          msg: >-
+            time.Now() is forbidden in internal/domain, internal/application,
+            internal/validation and internal/workflows: those four layers take a shared.Clock so
+            that time is an input rather than an ambient effect (conventions §Rules 5), which is
+            what makes the FSM property tests deterministic and what lets a reconciliation sweep
+            be replayed at a fixed instant. Nothing else is in scope — an infrastructure adapter
+            that measures elapsed time, a transport handler stamping a response, a cmd/**
+            composition root and pkg/ids (a ULID carries its own timestamp) all legitimately
+            read the wall clock, and the exclusion below states that boundary as a path rule
+            rather than leaving it to a growing list of directories. Inside the four layers the
+            only exemptions are shared.SystemClock (the implementation of the port itself), the
+            apptest harness and _test.go files.
+
+        # --- %+v / %#v --------------------------------------------------------------------
+        # The reflective verbs print every field of a struct including unexported ones. On a
+        # request type that means the payment method reference, the metadata map and any
+        # credential the struct happens to carry — straight past the Secret[T] wrapper,
+        # whose String() method %+v does not call for nested fields. deployment.md §4.3
+        # lists "a %+v on a request type" as a build-failing security condition.
+        - pattern: '%\+v'
+          msg: >-
+            %+v prints every field including ones a redacting wrapper would have hidden.
+            Format the fields you mean, or use the type's own String()/LogValue().
+        - pattern: '%#v'
+          msg: >-
+            %#v prints the full Go-syntax representation, including unexported fields and
+            any credential material in them. Format the fields you mean.
+
+        # There is deliberately NO rule against `panic`. Conventions §Rules 9 permits it
+        # for programming errors detectable at init or on the first test run — the
+        # registry duplicate-ID check, the unregistered-prefix check in pkg/ids, the
+        # MustCompile in a package initialiser — and forbids it in a request path. A
+        # linter matching on the identifier cannot tell those apart, so a rule here would
+        # be ~40 false positives against a convention that explicitly allows the pattern.
+        # The property that matters ("no panic reachable from a handler") is asserted by
+        # the security test suite, which exercises the handlers, rather than guessed at
+        # from the token.
+
+        # --- math/rand --------------------------------------------------------------------
+        - pattern: '^rand\.(Int|Intn|Int31|Int63|Float64|Read)$'
+          pkg: '^math/rand$'
+          msg: >-
+            math/rand is not suitable for idempotency keys, nonces, or anything an attacker
+            could predict. Use crypto/rand, or pkg/ids for identifiers. For deliberate
+            deterministic jitter, take a *rand.Rand injected by the caller so the test can
+            seed it.
+
+    revive:
+      # Only the rules that catch a defect. Style rules are off: they generate volume, and
+      # volume is how a real finding gets scrolled past.
+      rules:
+        - name: exported
+          # Conventions rule 7: every exported symbol has a doc comment that says *why*.
+          arguments: ["checkPrivateReceivers", "disableStutteringCheck"]
+        - name: package-comments
+        - name: context-as-argument
+          # Conventions rule 12: ctx is the first parameter.
+          #
+          # allowTypesBefore names the one type that legitimately precedes it. `func h(t
+          # *testing.T, ctx context.Context, ...)` is the standard shape for a test helper: t is
+          # what makes it a helper, it is what t.Helper() and every t.Fatalf below it need, and
+          # putting ctx first to satisfy the rule would make the test tree read differently from
+          # every other Go codebase. The property the rule protects — that a caller cannot pass
+          # a context into the wrong parameter — is unaffected, because *testing.T is not a
+          # context and cannot be confused with one.
+          arguments:
+            - allowTypesBefore: "*testing.T"
+        - name: context-keys-type
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: errorf
+        - name: indent-error-flow
+        - name: range-val-in-closure
+        - name: unexported-return
+        - name: time-naming
+          # `timeout` vs `timeoutSeconds` vs `timeoutMs`: a duration field whose unit is not
+          # in its name is a 1000× bug waiting for a refactor.
+        - name: waitgroup-by-value
+        - name: unconditional-recursion
+        - name: defer
+          arguments: [["loop", "return", "recover"]]
+        - name: datarace
+        - name: early-return
+        - name: superfluous-else
+
+    depguard:
+      # A backstop for scripts/check-architecture.sh, not a replacement. The architecture
+      # check reads the resolved package graph and understands the §4 table including the
+      # SPI exception; depguard sees import strings. Both exist because depguard runs in
+      # the same second as the rest of the lint and gives the author the message at the
+      # point of the import, while the architecture check is authoritative.
+      rules:
+        domain-is-pure:
+          list-mode: lax
+          files:
+            - "**/internal/domain/**"
+          deny:
+            - pkg: "database/sql"
+              desc: "the domain layer is stdlib-only and persistence-free (baseline §4)"
+            - pkg: "net/http"
+              desc: "the domain layer does no I/O (baseline §4)"
+            - pkg: "github.com/jackc/pgx/**"
+              desc: "a driver in the domain layer (baseline §4)"
+            - pkg: "github.com/redis/**"
+              desc: "a client in the domain layer (baseline §4)"
+            - pkg: "github.com/twmb/franz-go/**"
+              desc: "a broker client in the domain layer (baseline §4)"
+            - pkg: "go.opentelemetry.io/**"
+              desc: "the domain layer is not instrumented; its callers are (baseline §4)"
+            - pkg: "github.com/prometheus/**"
+              desc: "the domain layer declares no metrics (baseline §4, §22.2)"
+
+        pkg-is-stdlib-only:
+          list-mode: lax
+          files:
+            - "**/pkg/**"
+          deny:
+            - pkg: "github.com/udaykishore-resu/payments-platform/internal/**"
+              desc: >-
+                pkg/ could be extracted and published; a dependency on internal/ makes that
+                impossible (baseline §4)
+
+        application-owns-its-ports:
+          list-mode: lax
+          files:
+            - "**/internal/application/**"
+          deny:
+            - pkg: "github.com/udaykishore-resu/payments-platform/internal/infrastructure/**"
+              desc: >-
+                the application layer depends on ports it declares, never on an
+                implementation (baseline §4)
+
+    nolintlint:
+      # A //nolint is a lint finding somebody decided not to fix. That decision is reviewable
+      # only if it says which linter it silences and why, so both are mandatory here.
+      require-explanation: true
+      require-specific: true
+      # A directive that no longer suppresses anything is a claim about the code that has since
+      # stopped being true, and it is the thing that survives a refactor and quietly widens.
+      allow-unused: false
+
+    testifylint:
+      enable-all: true
+      disable:
+        # require-error would demand require.NoError everywhere; assert.NoError followed by
+        # an early return is a legitimate pattern in table tests.
+        - require-error
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+
+    rules:
+      # --- test files ---------------------------------------------------------------------
+      # gosec on test code reports the deliberately weak crypto, the hardcoded fixture
+      # credentials and the http.Get without a context that every table test contains.
+      # Those are asserted separately: scripts/check-secrets.sh scans test files too (and
+      # does not exempt S1, S2 or S4 there), so the credential class is still covered.
+      #
+      # errcheck here means check-type-assertions only, now that check-blank is off. In a test,
+      # `r.Outbox.(ports.OutboxReader)` panicking IS the failure report: the panic names the file
+      # and line and fails the test, which is what a comma-ok plus t.Fatalf would have done with
+      # three more lines. In production code the same assertion is a 500, which is why the check
+      # stays on everywhere else.
+      #
+      # (`dupl` was listed here and is not an enabled linter; an exclusion for a check that does
+      # not run is a claim about this file that stops being true silently.)
+      - path: '_test\.go$'
+        linters:
+          - gosec
+          - noctx
+          - contextcheck
+          - errcheck
+
+      # revive's `exported` rule on test helpers: a test helper's name is its
+      # documentation, and requiring a doc comment on every table-test fixture type
+      # produces hundreds of comments that restate the identifier.
+      - path: '_test\.go$'
+        linters: [revive]
+        text: "exported"
+
+      # --- cmd/** -------------------------------------------------------------------------
+      # A composition root legitimately prints to stderr before the logger exists. It is exempt
+      # from that one forbidigo rule — the %+v and panic rules still apply, because a startup
+      # panic that prints a config struct is exactly how a database password reaches a log
+      # aggregator. (time.Now in cmd/** is covered by the layer rule below, not here.)
+      - path: '^cmd/'
+        linters: [forbidigo]
+        text: 'fmt\.Print'
+
+      # --- time.Now: the rule owns four trees, and only those --------------------------------
+      #
+      # The prohibition is a *layer* rule, not a package list. Domain, application, validation
+      # and workflow code takes a shared.Clock so that time is an input; everything below them
+      # either implements that port, measures elapsed time, or is a process entry point that has
+      # no caller to take a clock from. The previous shape of this file enumerated the exempt
+      # directories one at a time — clock, telemetry, resilience, pkg/ids, cmd — and the list was
+      # already behind the code: redis/velocity, kafka/retry, postgres/*_repo, the HTTP and gRPC
+      # latency middleware and the httpx client had all grown a `start := time.Now()` that the
+      # list did not cover, so the rule was producing forty findings nobody could act on.
+      #
+      # Stating the boundary once, as the four trees the rule applies to, means a new
+      # infrastructure package is exempt automatically and — the part that matters — a new
+      # *domain* package is covered automatically, which an enumerated exempt list can never do.
+      - linters: [forbidigo]
+        text: 'time\.Now'
+        path-except: '^internal/(domain|application|validation|workflows)/'
+
+      # --- the Clock port's own implementation --------------------------------------------
+      # shared.SystemClock is the production implementation of the Clock interface every
+      # other domain type takes. `func (SystemClock) Now() time.Time { return time.Now() }`
+      # is the one line in the domain layer that must read the wall clock — it is the
+      # boundary the rule exists to create, not a violation of it.
+      #
+      # (The previous form of this rule spelled the path `...(primitives|clock|time)\\.go$`,
+      # whose doubled backslash matches a literal backslash and therefore matched nothing; the
+      # one line it was written for was being reported.)
+      - path: '^internal/domain/shared/(primitives|clock|time)\.go$'
+        linters: [forbidigo]
+        text: 'time\.Now'
+
+      # --- the application-layer test harness -------------------------------------------------
+      # internal/application/apptest builds the fixtures the application tests run against. It
+      # sits inside the covered tree but is test scaffolding: the deterministic clock it hands to
+      # the code under test is precisely what it exists to provide, and the two wall-clock reads
+      # here stamp the fixture's own construction, which nothing asserts on.
+      - path: '^internal/application/apptest/'
+        linters: [forbidigo]
+        text: 'time\.Now'
+
+      # --- tests inside the covered layers ------------------------------------------------------
+      # A _test.go file is the caller, not the code under test. Rule 5 constrains what the domain
+      # reads; a test that says `expiresAt: time.Now().Add(30*time.Second)` when building an input
+      # is choosing an input, which is the whole point of the rule. Determinism where it is load
+      # bearing — the FSM property tests, anything asserting an elapsed interval — comes from the
+      # fake clock the test injects, and is asserted by the tests themselves failing.
+      - path: '_test\.go$'
+        linters: [forbidigo]
+        text: 'time\.Now'
+
+      # --- the check tooling ------------------------------------------------------------------
+      # scripts/** is the verification tooling, not a deployable. It prints to stdout by
+      # design — that is its entire interface — and reads the filesystem from
+      # command-line-supplied paths.
+      #
+      # noctx and nilerr are here for the same reason and are equally narrow in effect: these are
+      # one-shot CLIs whose cancellation boundary is the process, so `exec.Command` has no
+      # inbound context to attach; and every nilerr site is a filepath.WalkDir callback returning
+      # nil to *continue the walk* past an unreadable or unparseable file, which is the
+      # documented way to say "skip this entry" and not a swallowed failure.
+      - path: '^scripts/'
+        linters:
+          - forbidigo
+          - gosec
+          - revive
+          - noctx
+          - nilerr
+
+      # --- the cross-suite test tree ------------------------------------------------------------
+      # tests/** is the integration, contract, e2e and chaos harness, and it is scaffolding, not
+      # a deployable — which is the whole reason this exclusion is scoped to this one prefix.
+      #
+      # `unused`: each suite compiles under its own build tag and the analysis sees one tag set
+      # at a time, so a fixture a sibling suite uses reads as dead from inside any single run.
+      # The residue it reports here is deliberately-kept scaffolding — repos_test.go's
+      # repoWritesJSONB is the reference case tests/README.md cites for a known repository
+      # defect, and deleting it would delete the documentation of that defect. Dead code in
+      # shipped packages is still a build failure; this says nothing about them.
+      #
+      # `nilnil`: a fixture lookup whose (nil, nil) means "this suite did not stage that record",
+      # which is the assertion the caller then makes.
+      #
+      # Deliberately NOT excluded here: bodyclose, sqlclosecheck, rowserrcheck, gosec's real
+      # rules, testifylint. The suites that touch real databases and real gateways are where a
+      # leaked connection is found, which is the reason run.tests and the build tags are on.
+      - path: '^tests/'
+        linters:
+          - unused
+          - nilnil
+
+      # --- shutdown and settle paths run on a context the request no longer owns ---------------
+      #
+      # contextcheck's rule is "propagate the caller's context". These are the paths where
+      # propagating it is the bug.
+      #
+      # cmd/**: `defer func() { _ = pool.Close(context.Background()) }()` in every platformctl
+      # subcommand — the request context is cancelled by the time the defer runs, so passing it
+      # would abandon the connection teardown it exists to perform. And the lifecycle callbacks,
+      # `lc.Add("public-http", func(context.Context) error { return srv.Start() }, srv.Shutdown)`,
+      # deliberately ignore the context they are handed: an http.Server is stopped through the
+      # Shutdown function registered beside it, not by cancelling ListenAndServe.
+      - path: '^cmd/'
+        linters: [contextcheck]
+
+      # The idempotency middleware settles its claim on a context detached from the request's
+      # cancellation, and that detachment is the entire correctness argument of the file: a
+      # client that hangs up after the handler committed must not leave the record IN_FLIGHT, or
+      # the next duplicate re-executes an operation that already happened. settleContext(r) is
+      # where that decision is made and documented.
+      - path: '^internal/transport/httpapi/middleware/idempotency\.go$'
+        linters: [contextcheck]
+
+      # tests/testenv's Tenanted helpers roll back on context.Background() for the same reason:
+      # the rollback must run even when the test's context is the thing that just expired.
+      - path: '^tests/testenv/'
+        linters: [contextcheck]
+
+      # --- deliberate, seeded, non-cryptographic jitter -------------------------------------------
+      # G404 (weak RNG) on internal/infrastructure/resilience/backoff.go. Retry jitter is the one
+      # place a predictable random number is not only acceptable but required to be reproducible:
+      # the backoff takes a *rand.Rand built from a caller-supplied seed, which is exactly the
+      # shape the forbidigo math/rand rule above directs authors to, and it is what lets a test
+      # assert a computed ready-at instead of sleeping. Nothing derived from it is a token, a
+      # nonce or an idempotency key — those come from crypto/rand through pkg/ids, and G404 stays
+      # on everywhere else to keep it that way.
+      - path: '^internal/infrastructure/resilience/backoff\.go$'
+        linters: [gosec]
+        text: 'G404'
+
+      # --- generated code -----------------------------------------------------------------------
+      - path: '(_gen|\.pb|\.pb\.gw)\.go$'
+        linters:
+          - revive
+          - staticcheck
+          - errcheck
+          - unused
+          - gosec
+
+      # --- migrations embed ---------------------------------------------------------------------
+      - path: '^migrations/'
+        linters: [revive]
+        text: "package-comments|exported"
+
+    paths:
+      - third_party
+      - vendor
+      - node_modules
+
+# Formatting is a formatter's job, not a linter's. gofmt is checked separately by
+# scripts/verify.sh and by CI stage 1, where the message ("run gofmt") is more useful than
+# a lint finding per file.
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/udaykishore-resu/payments-platform
+  exclusions:
+    generated: lax
+    paths:
+      - third_party
+      - vendor
+
+issues:
+  # Report everything. The defaults (3 per linter per file, 50 overall) exist to keep a
+  # first run readable; on a codebase that is already clean they silently hide findings,
+  # and "the lint passed" then means "the lint stopped counting".
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # A finding on a line the PR did not touch is still a finding. new-from-rev would let
+  # the existing debt stay invisible, and the debt in a payments codebase is the part
+  # nobody has looked at in two years.
+  uniq-by-line: false
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      colors: true
+  # Sorted output means two runs of the same code produce the same bytes, which is what
+  # makes a CI diff of lint results meaningful.
+  sort-order:
+    - file
+    - linter

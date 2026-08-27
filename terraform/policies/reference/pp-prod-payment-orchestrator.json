@@ -1,0 +1,63 @@
+{
+  "Version": "2012-10-17",
+  "Comment": "GENERATED. Source of truth is terraform/modules/eks/irsa.tf. Regenerate with `make policies`. Reproduced here for checkov/conftest and the QSA evidence pack.",
+  "Statement": [
+    {
+      "Sid": "ReadGatewayCredentials",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:eu-west-1:111122223333:secret:/prod/*/*/*/api_key-*",
+        "arn:aws:secretsmanager:eu-west-1:111122223333:secret:/prod/*/*/*/api_secret-*",
+        "arn:aws:secretsmanager:eu-west-1:111122223333:secret:/prod/*/*/*/webhook_signing_key-*"
+      ]
+    },
+    {
+      "Sid": "DecryptSecretsManagerCiphertextOnly",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:eu-west-1:111122223333:key/PP_PROD_SECRETS_KEY_ID",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.eu-west-1.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "ConnectToKafkaCluster",
+      "Effect": "Allow",
+      "Action": [
+        "kafka-cluster:Connect",
+        "kafka-cluster:DescribeCluster"
+      ],
+      "Resource": "arn:aws:kafka:eu-west-1:111122223333:cluster/pp-prod/*"
+    },
+    {
+      "Sid": "ProducePaymentEvents",
+      "Effect": "Allow",
+      "Action": [
+        "kafka-cluster:WriteData",
+        "kafka-cluster:DescribeTopic"
+      ],
+      "Resource": "arn:aws:kafka:eu-west-1:111122223333:topic/pp-prod/*/pp.payments.*"
+    },
+    {
+      "Sid": "ConnectAsApplicationDatabaseUser",
+      "Effect": "Allow",
+      "Action": "rds-db:connect",
+      "Resource": "arn:aws:rds-db:eu-west-1:111122223333:dbuser:cluster-PPPRODCLUSTERRESOURCEID/pp_app"
+    },
+    {
+      "Sid": "ReadDrFencingToken",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": "arn:aws:dynamodb:eu-west-1:111122223333:table/pp-dr-control"
+    }
+  ]
+}

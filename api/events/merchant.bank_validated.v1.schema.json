@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.bank_validated.v1.json",
+  "title": "merchant.bank_validated.v1",
+  "description": "A merchant settlement account passed bank validation and the merchant moved KYC_APPROVED -> BANK_VALIDATED. Published by Onboarding (BC-3) on pp.merchants.merchant.v1, keyed by merchant_id. The account number is never carried: only the masked last four survive validation, and the submitted number is discarded.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "caseId",
+    "bankAccountId",
+    "maskedAccount",
+    "country",
+    "currency",
+    "scheme",
+    "nameMatch",
+    "validatedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "caseId": { "type": "string", "pattern": "^onb_[0-9A-Z]{26}$" },
+    "bankAccountId": {
+      "description": "The validated account within the merchant aggregate.",
+      "type": "string",
+      "pattern": "^ba_[0-9A-Z]{26}$"
+    },
+    "maskedAccount": {
+      "description": "Last four digits only. Never the full account number - four digits cannot be extended into an account number, and the full value never left the validation call.",
+      "type": "string",
+      "pattern": "^\\*{4}[0-9]{4}$"
+    },
+    "country": {
+      "description": "ISO 3166-1 alpha-2 country of the account.",
+      "type": "string",
+      "pattern": "^[A-Z]{2}$"
+    },
+    "currency": {
+      "description": "ISO 4217 settlement currency. Exactly one primary account may exist per currency.",
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "scheme": {
+      "description": "The payment scheme this account settles over.",
+      "type": "string",
+      "enum": ["SEPA", "ACH", "FPS", "SWIFT"]
+    },
+    "nameMatch": {
+      "description": "Confirmation-of-payee outcome. NONE does not automatically fail onboarding but requires a recorded operator decision, which is why the raw result is published rather than a boolean.",
+      "type": "string",
+      "enum": ["EXACT", "CLOSE", "NONE"]
+    },
+    "validatedAt": { "type": "string", "format": "date-time" }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "workflow-worker",
+  "x-context": "BC-3 Onboarding",
+  "x-consumers": ["Onboarding", "Audit"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "scheme": "route-to-dlq", "nameMatch": "route-to-dlq" },
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "caseId": "onb_01JB8Z66666666666666666666",
+      "bankAccountId": "ba_01JB8Z77777777777777777777",
+      "maskedAccount": "****4471",
+      "country": "DE",
+      "currency": "EUR",
+      "scheme": "SEPA",
+      "nameMatch": "EXACT",
+      "validatedAt": "2026-08-27T13:02:55.117Z"
+    }
+  ]
+}

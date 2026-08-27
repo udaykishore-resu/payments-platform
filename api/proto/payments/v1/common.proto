@@ -1,0 +1,251 @@
+// Shared kernel types for every payments-platform gRPC service.
+//
+// This file is the protobuf mirror of `internal/domain/shared`: identifiers, Money,
+// tenancy context, pagination and the error model. It is deliberately tiny. Anything
+// added here becomes a dependency of every context, so a change requires review from
+// every context owner.
+//
+// Source of truth: docs/spec/00-design-baseline.md sections 6, 7, 14, 19, 20.
+syntax = "proto3";
+
+package payments.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/udaykishore-resu/payments-platform/api/proto/payments/v1;paymentsv1";
+option java_multiple_files = true;
+option java_package = "com.example.payments.v1";
+option java_outer_classname = "CommonProto";
+option csharp_namespace = "Example.Payments.V1";
+
+// Money is an amount in the currency's MINOR units plus its ISO 4217 code.
+//
+// There is no floating point anywhere in the money path: `double` cannot represent
+// 0.10, and a decimal string invites the parsing bug it was meant to avoid.
+// Arithmetic across differing currencies is an error, never a silent conversion.
+// Splitting uses largest-remainder allocation so the parts always sum to the whole.
+message Money {
+  // Amount in minor units of `currency` (cents, pence, fils). Integer, always.
+  // The minor-unit exponent comes from an embedded ISO 4217 table (USD=2, JPY=0,
+  // BHD=3, CLF=4) and is never inferred from the value.
+  int64 amount = 1;
+
+  // ISO 4217 alphabetic code, uppercase, e.g. "USD".
+  string currency = 2;
+
+  // Reserved for a future scale/exponent override should a non-ISO currency ever be
+  // supported. Not used today; the ISO table is authoritative.
+  reserved 3;
+  reserved "exponent";
+}
+
+// Who is calling, on whose behalf, and under which trace.
+//
+// The tenant is derived EXCLUSIVELY from the authenticated principal. A tenant
+// identifier that disagrees with the caller's credential is a security event, not a
+// parameter: the isolation guard rejects it with PERMISSION_DENIED / TENANT_MISMATCH.
+// An mTLS mesh identity is not tenant-scoped and can never satisfy a tenant-scoped
+// read on its own - it must propagate this context explicitly.
+message TenantContext {
+  // `ten_` + ULID. Required on every tenant-scoped RPC.
+  string tenant_id = 1;
+
+  // `mrc_` + ULID. Required on merchant-scoped RPCs, empty on platform-scoped ones.
+  string merchant_id = 2;
+
+  // The acting principal: `cli_`/`usr_`/`system:<component>`/SPIFFE ID.
+  string principal_id = 3;
+
+  // What kind of actor `principal_id` names. Drives audit classification.
+  ActorType actor_type = 4;
+
+  // `req_` + ULID. Constant across the entire causal fan-out of one API call, so one
+  // request's full consequences - payments, attempts, events, audit records - are one
+  // query.
+  string correlation_id = 5;
+
+  // W3C trace context: `00-<32 hex trace-id>-<16 hex span-id>-<2 hex flags>`.
+  string traceparent = 6;
+
+  // The originating HTTP request identifier, echoed to the client as X-Request-Id.
+  string request_id = 7;
+
+  // Scopes granted to the caller, for defence-in-depth checks inside a service that
+  // was reached through another service. Never used to GRANT - only to deny.
+  repeated string scopes = 8;
+
+  reserved 9 to 15;
+}
+
+// Classification of the acting principal, mirrored into the audit trail.
+enum ActorType {
+  ACTOR_TYPE_UNSPECIFIED = 0;
+  // A human operator authenticated through the console.
+  ACTOR_TYPE_USER = 1;
+  // A tenant's machine client authenticated by OAuth2 client credentials.
+  ACTOR_TYPE_API_CLIENT = 2;
+  // One of our own workloads authenticated by mTLS/SPIFFE.
+  ACTOR_TYPE_SYSTEM = 3;
+  // The workflow engine acting on a checkpointed step.
+  ACTOR_TYPE_WORKFLOW = 4;
+}
+
+// Deployment environment. A sandbox artifact never certifies a production resource.
+enum Environment {
+  ENVIRONMENT_UNSPECIFIED = 0;
+  ENVIRONMENT_SANDBOX = 1;
+  ENVIRONMENT_PRODUCTION = 2;
+}
+
+// Opaque-cursor pagination request.
+//
+// There is no offset pagination anywhere in this platform: offsets are unstable under
+// concurrent writes and silently skip or duplicate rows on a busy list.
+message PageRequest {
+  // Maximum items to return. Zero means the server default (50). Capped at 200.
+  int32 page_size = 1;
+
+  // Opaque continuation token from a previous PageResponse. Signed, tied to the tenant
+  // and to the exact filter set of the originating request, and valid for 24 hours.
+  // Callers must not construct, parse or reuse one across different filters.
+  string page_token = 2;
+
+  reserved 3 to 7;
+}
+
+// Opaque-cursor pagination response.
+message PageResponse {
+  // Token for the next page. Empty when this is the last page.
+  string next_page_token = 1;
+
+  // Best-effort total, populated only where it can be produced without a second scan.
+  // Zero means "not computed", never "no rows" - use an empty result set for that.
+  int64 approximate_total = 2;
+
+  reserved 3 to 7;
+}
+
+// Coarse classification of a failure, driving gRPC code, retryability and alerting.
+//
+// This mirrors the HTTP error model exactly: one catalogue, two transports.
+enum ErrorCategory {
+  ERROR_CATEGORY_UNSPECIFIED = 0;
+  // Malformed or schema-invalid input. gRPC INVALID_ARGUMENT. Not retryable.
+  ERROR_CATEGORY_VALIDATION = 1;
+  // Missing or invalid credentials. gRPC UNAUTHENTICATED. Not retryable.
+  ERROR_CATEGORY_AUTHENTICATION = 2;
+  // Authenticated but not permitted. gRPC PERMISSION_DENIED. Not retryable.
+  ERROR_CATEGORY_AUTHORIZATION = 3;
+  // No such resource within the caller's tenant. gRPC NOT_FOUND. Not retryable.
+  ERROR_CATEGORY_NOT_FOUND = 4;
+  // State conflict. gRPC ABORTED or FAILED_PRECONDITION. Retryable only for an
+  // in-flight idempotent duplicate.
+  ERROR_CATEGORY_CONFLICT = 5;
+  // A business rule refused the operation. gRPC FAILED_PRECONDITION. Not retryable.
+  ERROR_CATEGORY_BUSINESS_RULE = 6;
+  // Rate limit or bulkhead. gRPC RESOURCE_EXHAUSTED. Retryable after the stated delay.
+  ERROR_CATEGORY_RATE_LIMIT = 7;
+  // A gateway failed or violated its contract. gRPC UNAVAILABLE. Retryable unless the
+  // decline was hard.
+  ERROR_CATEGORY_GATEWAY = 8;
+  // A call timed out with an AMBIGUOUS outcome. gRPC DEADLINE_EXCEEDED. Retryability
+  // is not a boolean here - see the timeout rule in payment.proto.
+  ERROR_CATEGORY_TIMEOUT = 9;
+  // Infrastructure is unavailable and we fail closed. gRPC UNAVAILABLE. Retryable.
+  ERROR_CATEGORY_INFRASTRUCTURE = 10;
+  // An unexpected internal fault. gRPC INTERNAL. Not retryable; it pages.
+  ERROR_CATEGORY_INTERNAL = 11;
+}
+
+// The platform error model, carried in `google.rpc.Status.details` and mirrored 1:1
+// by the RFC 9457 problem document on the REST surface.
+//
+// `retryable` is a machine-readable contract that client SDKs, the workflow engine and
+// the outbox relay branch on. It is not advisory prose.
+message Error {
+  // Stable code from api/errors/catalog.yaml, e.g. "REFUND_EXCEEDS_CAPTURED". This,
+  // not the message, is what callers branch on.
+  string code = 1;
+
+  // Coarse category. Determines the gRPC status code.
+  ErrorCategory category = 2;
+
+  // Human-readable, instance-specific explanation. Contains identifiers and amounts;
+  // never cardholder data, credentials or personal data.
+  string message = 3;
+
+  // Whether retrying the identical request with the same idempotency key can succeed.
+  bool retryable = 4;
+
+  // Echo of TenantContext.request_id, so a failure can be traced from a client log.
+  string request_id = 5;
+
+  // W3C trace id (32 hex characters) of the failing request.
+  string trace_id = 6;
+
+  // Field-level breakdown. Present whenever the failure is attributable to specific
+  // inputs; absent for infrastructure failures.
+  repeated ErrorDetail details = 7;
+
+  // Documentation anchor for `code`, including remediation.
+  string docs_url = 8;
+
+  // How long to wait before retrying, when `retryable` is true and a delay applies.
+  int32 retry_after_seconds = 9;
+
+  reserved 10 to 19;
+}
+
+// One attributable cause within an Error.
+message ErrorDetail {
+  // Dotted path to the offending field, where one applies.
+  string field = 1;
+
+  // Stable sub-code, e.g. "EXCEEDS_REFUNDABLE".
+  string code = 2;
+
+  // Human-readable explanation. Never contains cardholder data or secrets.
+  string message = 3;
+
+  // Validation-plane rule identifier, e.g. "L5.AMOUNT_WITHIN_MERCHANT_LIMIT". Every
+  // rule id is documented with its meaning and remediation, and CI fails the build if
+  // one is not.
+  string rule_id = 4;
+}
+
+// Idempotency parameters for an unsafe RPC.
+//
+// The scope is (tenant_id, merchant_id, method, path_template, key). A SHA-256
+// fingerprint of the canonicalized request is stored with the key: the same key with a
+// different request is IDEMPOTENCY_KEY_REUSED, which is the check that catches a
+// client reusing one key for two different operations. A concurrent duplicate while
+// the first is still executing is IDEMPOTENT_REQUEST_IN_PROGRESS with a retry delay -
+// we never block a caller on another process's lease, and we never process twice.
+message IdempotencyOptions {
+  // Client-supplied opaque key, 1-255 characters. Generate it BEFORE the first attempt
+  // and reuse it across every retry of that logical operation.
+  string key = 1;
+
+  reserved 2 to 5;
+}
+
+// Result metadata returned alongside an idempotent operation's response.
+message IdempotencyResult {
+  // True when this response was replayed from a stored record rather than produced by
+  // executing the operation again.
+  bool replayed = 1;
+
+  // When the stored record was first completed. Useful for diagnosing a client that
+  // believes it has never received a response.
+  google.protobuf.Timestamp first_completed_at = 2;
+}
+
+// A resource's optimistic-concurrency token, mirrored by the HTTP ETag.
+//
+// Every aggregate write is version-checked. A stale version loses and must re-read,
+// re-apply and retry; it is never silently merged.
+message Precondition {
+  // The version the caller believes is current. Zero means "no precondition", which is
+  // only legal on operations whose contract says so.
+  int64 expected_version = 1;
+}

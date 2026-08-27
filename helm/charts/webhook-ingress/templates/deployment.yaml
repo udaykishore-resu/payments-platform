@@ -1,0 +1,37 @@
+{{- if not .Values.rollout.enabled }}
+{{/*
+The plain Deployment alternative. Selected when .Values.rollout.enabled is false:
+either because the deployable serves no user-facing traffic (there is no weight to
+shift, so a canary would measure nothing), or because the environment has no Argo
+Rollouts controller installed (dev).
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pp-common.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWave | default "3" | quote }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.rollout.revisionHistoryLimit }}
+  progressDeadlineSeconds: {{ .Values.rollout.progressDeadlineSeconds }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.rollout.maxSurge }}
+      maxUnavailable: {{ .Values.rollout.maxUnavailable }}
+  selector:
+    matchLabels:
+{{- include "pp-common.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+{{- include "pp-common.labels" . | nindent 8 }}
+      annotations:
+{{- include "pp-common.podAnnotations" . | nindent 8 }}
+    spec:
+{{- include "pp-common.podSpec" . | nindent 6 }}
+{{- end }}

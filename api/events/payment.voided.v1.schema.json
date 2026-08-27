@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.voided.v1.json",
+  "title": "payment.voided.v1",
+  "description": "An authorization hold was reversed before capture and the payment reached the terminal state VOIDED. Published by Payment Orchestration (BC-6) on pp.payments.payment.v1, keyed by payment_id. The voided amount always equals the authorized amount: a partial void is not an operation this platform offers, and modelling one would create a second, subtly different way of returning money that the ledger would have to reconcile against refunds.",
+  "type": "object",
+  "required": ["attemptId", "gatewayCode", "gatewayReference", "voidedAmount", "reason", "voidedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "attemptId": { "type": "string", "pattern": "^att_[0-9A-Z]{26}$" },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "gatewayReference": { "type": "string", "maxLength": 128 },
+    "voidedAmount": {
+      "$ref": "#/$defs/money",
+      "description": "Equals the authorized amount, always."
+    },
+    "reason": {
+      "type": "string",
+      "enum": ["MERCHANT_REQUEST", "AUTH_EXPIRY_PREVENTION", "RISK_REVERSAL", "ONBOARDING_TEST"]
+    },
+    "voidedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer", "minimum": 1 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-6 Payment Orchestration",
+  "x-consumers": ["Ledger", "Notification"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "reason": "route-to-dlq" },
+  "examples": [
+    {
+      "attemptId": "att_01JB8Z44444444444444444444",
+      "gatewayCode": "stripe",
+      "gatewayReference": "pi_3OqZ4L2eZvKYlo2C",
+      "voidedAmount": { "amount": 1050, "currency": "USD" },
+      "reason": "MERCHANT_REQUEST",
+      "voidedAt": "2026-08-26T16:02:00.412Z"
+    }
+  ]
+}

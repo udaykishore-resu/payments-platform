@@ -1,0 +1,152 @@
+# .github/dependabot.yml
+#
+# The policy, stated once: **production dependencies get security updates only; everything
+# else gets grouped version updates.**
+#
+# WHY PRODUCTION IS SECURITY-ONLY
+#   Every dependency bump on the money path is a change to code that authorises payments,
+#   and it arrives with no test written for whatever changed in it. A weekly PR bumping
+#   pgx from 5.7.2 to 5.7.3 costs a review, a CI run and a promotion through three
+#   environments — to gain a changelog nobody read. Multiply by forty modules and the
+#   result is a queue of low-information PRs that get rubber-stamped, which is worse than
+#   not having them: it trains the reviewers who would otherwise catch the one that matters.
+#
+#   A *security* update is different in exactly the way that matters: it has a reason
+#   attached, the reason is a CVE, and govulncheck in `ci.yml` will tell us whether the
+#   vulnerable symbol is reachable. Those get raised immediately and individually.
+#
+#   Deliberate version upgrades still happen — in a change with an owner, a reason and a
+#   soak, rather than by a robot on a Monday morning.
+#
+# WHY THE REST IS GROUPED
+#   Actions, Docker base images and the tooling in the dev group have no runtime blast
+#   radius on the payment path and a real cost when they go stale: an unmaintained action
+#   version is a supply-chain risk of its own. Grouping them means one PR a week instead of
+#   fifteen, and one CI run instead of fifteen.
+
+version: 2
+
+updates:
+
+  # =======================================================================================
+  # Go — production dependencies. SECURITY ONLY.
+  # =======================================================================================
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: daily
+      time: "06:00"
+      timezone: "Europe/London"
+    open-pull-requests-limit: 10
+    allow:
+      - dependency-type: all
+    # `security-updates-only` behaviour is achieved by ignoring every non-security version
+    # bump: Dependabot always raises security PRs regardless of `ignore` rules, so ignoring
+    # all version-update ranges leaves exactly the security updates.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+    labels:
+      - dependencies
+      - security
+      - go
+    commit-message:
+      prefix: "fix(deps)"
+      include: scope
+    reviewers:
+      - udaykishore-resu
+    # A security PR touches a dependency of the payment path, so it needs the same two
+    # approvals as any other change to it (deployment.md §4.2).
+    assignees:
+      - udaykishore-resu
+
+  # =======================================================================================
+  # GitHub Actions — grouped weekly.
+  #
+  # A pinned-but-stale action is a supply-chain risk: the version that stops receiving
+  # fixes is the version an attacker studies. Grouped because fifteen individual PRs to bump
+  # patch versions of setup-go is fifteen CI runs and zero information.
+  # =======================================================================================
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Europe/London"
+    open-pull-requests-limit: 3
+    groups:
+      # The actions that can read secrets or mint tokens are grouped separately and are NOT
+      # batched with the rest: a change to cosign-installer, configure-aws-credentials or
+      # attest-build-provenance deserves to be looked at on its own.
+      supply-chain-critical:
+        patterns:
+          - "sigstore/*"
+          - "aws-actions/*"
+          - "actions/attest*"
+          - "docker/login-action"
+          - "github/codeql-action*"
+        update-types: [minor, patch]
+      actions-minor-patch:
+        patterns: ["*"]
+        exclude-patterns:
+          - "sigstore/*"
+          - "aws-actions/*"
+          - "actions/attest*"
+          - "docker/login-action"
+          - "github/codeql-action*"
+        update-types: [minor, patch]
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci(deps)"
+      include: scope
+
+  # =======================================================================================
+  # Container base images.
+  #
+  # Grouped, weekly, and worth having: the distroless base is where an OS-level CVE would
+  # land, and the nightly image rescan (nightly.yml) is what notices — this is how the fix
+  # arrives.
+  # =======================================================================================
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:30"
+      timezone: "Europe/London"
+    open-pull-requests-limit: 2
+    groups:
+      base-images:
+        patterns: ["*"]
+    labels: [dependencies, docker, security]
+    commit-message:
+      prefix: "build(deps)"
+      include: scope
+
+  # =======================================================================================
+  # The local development stack.
+  #
+  # Separate from the production base images because these never ship: Postgres, Redis,
+  # Redpanda, Grafana and Jaeger in deploy/. A CVE here is a laptop, not a payment path,
+  # so they are batched monthly.
+  # =======================================================================================
+  # `docker`, not `docker-compose`: Dependabot's ecosystem for image references is
+  # `docker`, and it reads both Dockerfiles and compose files under the given directory.
+  - package-ecosystem: docker
+    directory: "/deploy"
+    schedule:
+      interval: monthly
+      time: "07:00"
+      timezone: "Europe/London"
+    open-pull-requests-limit: 1
+    groups:
+      dev-stack:
+        patterns: ["*"]
+    labels: [dependencies, dev-environment]
+    commit-message:
+      prefix: "chore(deps-dev)"
+      include: scope

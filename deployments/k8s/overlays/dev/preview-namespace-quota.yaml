@@ -1,0 +1,55 @@
+# Ephemeral preview environments live in the dev cluster, one namespace per PR
+# (pp-preview-pr-<number>), created by an ApplicationSet PR generator and reaped
+# at 72h or on PR close.
+#
+# This is the template quota the generator copies. It exists in the overlay
+# rather than the base because previews exist only in dev: a preview namespace in
+# a production cluster is the least-controlled compute in the estate sitting next
+# to the most controlled data.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: pp-preview-defaults
+  namespace: pp-dev-previews
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 25m
+        memory: 64Mi
+      default:
+        cpu: 500m
+        memory: 256Mi
+      max:
+        cpu: "2"
+        memory: 1Gi
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pp-dev-previews
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    kubernetes.io/metadata.name: pp-dev-previews
+    pp.plane: preview
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pp-dev-previews-quota
+  namespace: pp-dev-previews
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.memory: 24Gi
+    pods: "40"

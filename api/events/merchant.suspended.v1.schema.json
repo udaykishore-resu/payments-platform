@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.suspended.v1.json",
+  "title": "merchant.suspended.v1",
+  "description": "A merchant was suspended and may no longer create new payments. Published by the Merchant Registry (BC-2) on pp.merchants.merchant.v1, keyed by merchant_id. The data plane cache treats this as a PRIORITY INVALIDATION: a suspended merchant that keeps processing because a cache was 30 seconds stale is a compliance finding, so this event jumps the ordinary refresh cadence.",
+  "type": "object",
+  "required": ["merchantId", "reasonCode", "suspendedBy", "effectiveAt", "permitsRefunds"],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "reasonCode": {
+      "description": "Why the merchant was suspended. Drives operator routing and the merchant-facing message.",
+      "type": "string",
+      "enum": [
+        "RISK_BREACH",
+        "COMPLIANCE_EXPIRY",
+        "GATEWAY_DEPROVISIONED",
+        "OPERATOR_ACTION",
+        "TENANT_SUSPENDED"
+      ]
+    },
+    "reasonDetail": {
+      "description": "Free-text detail for operators. Never contains personal data or secrets.",
+      "type": "string",
+      "maxLength": 1024
+    },
+    "suspendedBy": {
+      "description": "Actor: a human identifier, or system:<component> when the automation plane suspended the merchant on a risk or compliance trigger.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "effectiveAt": {
+      "description": "When the suspension takes effect. May be in the future for a scheduled suspension, which is why it is distinct from the envelope `time`.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "permitsRefunds": {
+      "description": "Always true. Suspension rejects NEW payments but permits refunds, voids and webhook processing - you must always be able to give money back. Carried explicitly so no consumer has to remember the rule or infer it from a state name.",
+      "type": "boolean",
+      "const": true
+    }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "control-plane-api",
+  "x-context": "BC-2 Merchant Registry",
+  "x-consumers": ["Data plane cache (priority invalidation)", "Audit", "Notification"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "reasonCode": "route-to-dlq" },
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "reasonCode": "COMPLIANCE_EXPIRY",
+      "reasonDetail": "Attestation expired 2026-08-26",
+      "suspendedBy": "system:compliance-sweeper",
+      "effectiveAt": "2026-08-27T00:00:00.000Z",
+      "permitsRefunds": true
+    }
+  ]
+}

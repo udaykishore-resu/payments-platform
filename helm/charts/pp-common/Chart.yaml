@@ -1,0 +1,15 @@
+apiVersion: v2
+name: pp-common
+description: |
+  Library chart for the payments-platform deployables. Holds the shared label
+  scheme, selectors, pod/container security contexts, probe semantics, env
+  projection (references only, never secret material), topology spread,
+  anti-affinity and the resource presets. Contains no renderable resources of
+  its own: it is `type: library` so `helm install pp-common` is impossible by
+  construction.
+type: library
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0-0"
+maintainers:
+  - name: payments-platform SRE

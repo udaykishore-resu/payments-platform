@@ -1,0 +1,1533 @@
+# Platform error catalogue — the single source of truth for every error this platform
+# can return, on either transport.
+#
+# This file is CONSUMED BY GENERATORS. Do not reformat it by hand into something a
+# parser cannot read, and do not add a code here without also adding its documentation
+# anchor:
+#
+#   go generate ./pkg/apierror   -> pkg/apierror/codes_gen.go   (constants + lookup table)
+#   make docs-errors             -> docs/errors/*.md            (one page per code)
+#   make openapi-error-examples  -> validates every `code` used in api/openapi against this file
+#
+# CI checks, all failing the build:
+#   * every `code` is unique and matches ^[A-Z][A-Z0-9_]{2,63}$
+#   * every `category` exists in `categories`
+#   * `http_status`, `grpc_code` and `retryable` agree with the code's category unless an
+#     explicit `overrides_category: <reason>` is given — divergence needs a stated reason
+#   * every code referenced anywhere in api/openapi, api/proto or internal/ exists here
+#   * every code here has a docs anchor that resolves
+#   * no code is removed without a `deprecated_in` and a `sunset` date
+#
+# Compatibility: a code is a public contract. Adding one is additive. Changing a code's
+# `retryable`, `http_status` or `grpc_code` is BREAKING — client SDKs and the workflow
+# engine branch on those fields, so a change silently alters retry behaviour in code we
+# do not own. Change the meaning by introducing a new code and deprecating the old one.
+
+version: 1
+schema: https://schemas.example.com/errors/catalog.v1.json
+generated_artifacts:
+  go_package: github.com/udaykishore-resu/payments-platform/pkg/apierror
+  go_file: pkg/apierror/codes_gen.go
+  docs_dir: docs/errors
+  type_uri_prefix: https://errors.example.com/
+  docs_url_prefix: https://docs.example.com/errors/
+
+# Category defaults. A code inherits every field it does not set itself.
+categories:
+  - name: VALIDATION
+    http_status: 400
+    grpc_code: INVALID_ARGUMENT
+    retryable: false
+    alert: none
+    description: >-
+      Malformed, schema-invalid or semantically unacceptable input. The caller must change
+      the request; retrying the identical bytes cannot succeed.
+  - name: AUTHENTICATION
+    http_status: 401
+    grpc_code: UNAUTHENTICATED
+    retryable: false
+    alert: on_spike
+    description: >-
+      Missing, malformed, expired or unverifiable credentials. Alerts on a spike because a
+      spike is credential stuffing until proven otherwise.
+  - name: AUTHORIZATION
+    http_status: 403
+    grpc_code: PERMISSION_DENIED
+    retryable: false
+    alert: on_spike
+    description: >-
+      Authenticated but not permitted. Includes tenant isolation violations, which are
+      additionally raised as security events.
+  - name: NOT_FOUND
+    http_status: 404
+    grpc_code: NOT_FOUND
+    retryable: false
+    alert: none
+    description: >-
+      No such resource within the caller's tenant. A resource that exists under another
+      tenant is deliberately indistinguishable from one that does not exist.
+  - name: CONFLICT
+    http_status: 409
+    grpc_code: ABORTED
+    retryable: false
+    alert: none
+    description: >-
+      The request conflicts with the resource's current state or with a concurrent
+      request. Mostly not retryable; the in-flight idempotency case is the exception and
+      says so on its own entry.
+  - name: BUSINESS_RULE
+    http_status: 422
+    grpc_code: FAILED_PRECONDITION
+    retryable: false
+    alert: none
+    description: >-
+      Well-formed but refused by a business rule — limits, state guards, policy. The
+      caller must change the request or the underlying configuration.
+  - name: RATE_LIMIT
+    http_status: 429
+    grpc_code: RESOURCE_EXHAUSTED
+    retryable: true
+    alert: on_sustained
+    description: >-
+      A rate limit or concurrency bulkhead rejected the request. Retryable after
+      Retry-After, with jitter.
+  - name: GATEWAY
+    http_status: 502
+    grpc_code: UNAVAILABLE
+    retryable: true
+    alert: yes
+    description: >-
+      A third-party gateway failed or violated its contract. Retryable unless the outcome
+      was a hard decline.
+  - name: TIMEOUT
+    http_status: 504
+    grpc_code: DEADLINE_EXCEEDED
+    retryable: false
+    alert: yes
+    description: >-
+      A call exceeded its deadline with an AMBIGUOUS outcome. `retryable: false` here is
+      deliberate and is the most consequential flag in this file: a timed-out payment may
+      already have moved money, so the correct client action is to poll, not to re-issue.
+      Retrying with the SAME idempotency key is always safe; issuing a new key is not.
+  - name: INFRASTRUCTURE
+    http_status: 503
+    grpc_code: UNAVAILABLE
+    retryable: true
+    alert: yes
+    description: >-
+      The platform cannot serve the request and fails closed rather than degrading
+      correctness. Retryable.
+  - name: INTERNAL
+    http_status: 500
+    grpc_code: INTERNAL
+    retryable: false
+    alert: page
+    description: >-
+      An unexpected fault. Not retryable by the caller: the cause is ours, it pages, and a
+      retry storm on top of an internal fault makes the incident worse.
+
+subsystems:
+  payment-api: Public data-plane ingress.
+  payment-orchestrator: Payment FSM, routing and gateway dispatch.
+  control-plane-api: Merchant registry, onboarding, configuration, gateway catalogue.
+  workflow-worker: Durable onboarding saga engine.
+  webhook-ingress: Inbound gateway webhook ingestion.
+  outbox-relay: Postgres-to-Kafka publisher.
+  event-consumer: Projections, ledger, audit, notifications.
+  validation-plane: L1-L7 rule engine, shared by the above.
+  platform-authn: Authentication and tenant resolution middleware.
+  platform-idempotency: Idempotency claim and replay middleware.
+
+codes:
+  - code: VALIDATION_FAILED
+    category: VALIDATION
+    title: Request failed schema validation
+    detail_template: "{failureCount} field(s) failed validation."
+    remediation: >-
+      Correct the fields named in `details[]` and resend. Each entry carries the offending
+      path and a stable sub-code; `ruleId` names the validation rule where one applies.
+    docs_anchor: /errors/VALIDATION_FAILED
+    raised_by: [payment-api, control-plane-api, validation-plane]
+    validation_level: L1
+    go_const: CodeValidationFailed
+    since: 1.0.0
+
+  - code: MALFORMED_REQUEST
+    category: VALIDATION
+    http_status: 400
+    title: Request body could not be parsed
+    detail_template: "The request body is not well-formed JSON: {reason}."
+    remediation: >-
+      Fix the serializer. This is raised before any schema rule runs, so there are no
+      `details[]` to inspect - the bytes never became a document. VALIDATION and not
+      retryable: the same bytes will fail the same way every time.
+    docs_anchor: /errors/MALFORMED_REQUEST
+    raised_by: [payment-api, control-plane-api, webhook-ingress]
+    validation_level: L1
+    go_const: CodeMalformedRequest
+    since: 1.0.0
+
+  - code: MISSING_REQUIRED_HEADER
+    category: VALIDATION
+    http_status: 400
+    title: A required header is missing
+    detail_template: "{method} {path} requires the {header} header."
+    remediation: >-
+      Add the named header and resend. Distinct from IDEMPOTENCY_KEY_REQUIRED, which names
+      the one header whose absence has a money consequence and therefore has its own code.
+    docs_anchor: /errors/MISSING_REQUIRED_HEADER
+    raised_by: [payment-api, control-plane-api]
+    validation_level: L1
+    go_const: CodeMissingRequiredHeader
+    since: 1.0.0
+
+  - code: AMOUNT_INVALID
+    category: VALIDATION
+    http_status: 422
+    title: Amount is not a valid money value
+    detail_template: "Amount {amount} is not valid: {reason}."
+    remediation: >-
+      Send a non-negative integer in the currency's minor units together with its ISO-4217
+      code. VALIDATION rather than BUSINESS_RULE: a negative, fractional or overflowing
+      amount is not a value any configuration could make legal, which is what separates this
+      from AMOUNT_EXCEEDS_LIMIT.
+    docs_anchor: /errors/AMOUNT_INVALID
+    raised_by: [payment-api, payment-orchestrator, validation-plane]
+    validation_level: L1
+    overrides_category: 422 rather than 400 - the body parses and the value is semantically wrong.
+    go_const: CodeAmountInvalid
+    since: 1.0.0
+
+  - code: SENSITIVE_DATA_IN_REQUEST
+    category: VALIDATION
+    title: Request contained cardholder data
+    detail_template: >-
+      A field in this request matched the primary account number detector. The value has
+      been discarded and was not logged.
+    remediation: >-
+      Submit a gateway token or a vault reference instead of card data. This API never
+      accepts a PAN, a CVV or track data on any endpoint; if your integration needs to
+      collect card details, use the gateway's hosted fields or SDK so the data goes from
+      the payer's browser to the gateway without traversing this platform.
+    docs_anchor: /errors/SENSITIVE_DATA_IN_REQUEST
+    raised_by: [payment-api, control-plane-api, validation-plane]
+    validation_level: L1
+    security_event: true
+    log_value: false
+    go_const: CodeSensitiveDataInRequest
+    since: 1.0.0
+    notes: >-
+      The detector runs over every string field, not only the ones that plausibly carry a
+      token, because the failure mode being prevented is a PAN arriving in a metadata
+      value or a statement descriptor.
+
+  - code: IDEMPOTENCY_KEY_REQUIRED
+    category: VALIDATION
+    title: Idempotency-Key header is required
+    detail_template: "{method} {path} requires an Idempotency-Key header of 1-255 characters."
+    remediation: >-
+      Generate one key per logical operation before the first attempt and reuse it across
+      every retry of that operation. A UUIDv4 is a good default.
+    docs_anchor: /errors/IDEMPOTENCY_KEY_REQUIRED
+    raised_by: [payment-api, control-plane-api, platform-idempotency]
+    go_const: CodeIdempotencyKeyRequired
+    since: 1.0.0
+
+  - code: IDEMPOTENCY_KEY_REUSED
+    category: VALIDATION
+    http_status: 422
+    title: Idempotency key reused with a different request
+    detail_template: >-
+      Idempotency key {keyPrefix}... was first used at {firstUsedAt} with a different
+      request body.
+    remediation: >-
+      Use a new key for a new logical operation, or resend the original request body
+      byte-for-byte. The platform refuses rather than guessing which of the two requests
+      was intended.
+    docs_anchor: /errors/IDEMPOTENCY_KEY_REUSED
+    raised_by: [platform-idempotency]
+    overrides_category: >-
+      422 rather than the category's 400 - the request is syntactically valid and the
+      conflict is semantic, which is what distinguishes this from a malformed body.
+    go_const: CodeIdempotencyKeyReused
+    since: 1.0.0
+    notes: >-
+      The check is a SHA-256 fingerprint over the JCS-canonicalized body plus the scope
+      tuple. This is the check that catches a client bug where one key is reused for two
+      different payments, which is otherwise invisible until a customer is charged twice.
+
+  - code: IDEMPOTENT_REQUEST_IN_PROGRESS
+    category: CONFLICT
+    http_status: 409
+    grpc_code: ABORTED
+    retryable: true
+    retry_after_seconds: 1
+    title: A request with this idempotency key is already in progress
+    detail_template: >-
+      Idempotency key {keyPrefix}... is claimed by an in-flight request whose lease
+      expires at {leaseExpiresAt}.
+    remediation: >-
+      Retry after the stated delay to receive the stored response. Do not issue a new key:
+      the first request may still complete, and a second key would produce a second effect.
+    docs_anchor: /errors/IDEMPOTENT_REQUEST_IN_PROGRESS
+    raised_by: [platform-idempotency]
+    overrides_category: >-
+      The one retryable member of CONFLICT. Blocking the second caller on the first
+      caller's lease is how thread pools die under a retry storm, so the platform answers
+      immediately and tells the caller when to come back.
+    go_const: CodeIdempotentRequestInProgress
+    since: 1.0.0
+
+  - code: PRECONDITION_REQUIRED
+    category: CONFLICT
+    http_status: 428
+    grpc_code: FAILED_PRECONDITION
+    title: If-Match header is required
+    detail_template: "{method} {path} requires an If-Match header carrying a prior ETag."
+    remediation: >-
+      Read the resource, take its ETag, and resend with `If-Match`. The header is required
+      so that a concurrent modification cannot be silently overwritten.
+    docs_anchor: /errors/PRECONDITION_REQUIRED
+    raised_by: [control-plane-api]
+    overrides_category: >-
+      428 rather than the category's 409. 409 says "you conflicted"; 428 says "you did not
+      declare what you expected", which is a different fix for the caller.
+    go_const: CodePreconditionRequired
+    since: 1.0.0
+
+  - code: UNAUTHENTICATED
+    category: AUTHENTICATION
+    title: Authentication failed
+    detail_template: "{reason}"
+    remediation: >-
+      Obtain a fresh access token from the token endpoint. Tokens are valid for 15 minutes;
+      refresh before expiry rather than on a 401, so a token refresh is never on the
+      payment path.
+    docs_anchor: /errors/UNAUTHENTICATED
+    raised_by: [platform-authn]
+    go_const: CodeUnauthenticated
+    since: 1.0.0
+
+  - code: INVALID_TOKEN
+    category: AUTHENTICATION
+    title: Access token is invalid
+    detail_template: "The presented bearer token failed verification: {reason}."
+    remediation: >-
+      Obtain a fresh token from the token endpoint. Deliberately distinct from TOKEN_EXPIRED:
+      an expired token is a client that refreshed too late, an invalid one is a client
+      presenting something this platform never issued, and only the second is worth alerting
+      on as possible credential stuffing.
+    docs_anchor: /errors/INVALID_TOKEN
+    raised_by: [platform-authn]
+    security_event: true
+    go_const: CodeInvalidToken
+    since: 1.0.0
+
+  - code: TOKEN_EXPIRED
+    category: AUTHENTICATION
+    title: Access token has expired
+    detail_template: "The access token expired at {expiredAt}."
+    remediation: >-
+      Refresh proactively, before expiry, rather than reactively on a 401. A token refresh on
+      the payment path adds a round trip to every request that happens to straddle the
+      15-minute boundary. Not retryable with the same token; retryable with a new one, which
+      is a different request.
+    docs_anchor: /errors/TOKEN_EXPIRED
+    raised_by: [platform-authn]
+    go_const: CodeTokenExpired
+    since: 1.0.0
+
+  - code: FORBIDDEN
+    category: AUTHORIZATION
+    title: Insufficient scope
+    detail_template: "This operation requires scope {requiredScope}."
+    remediation: >-
+      Request a client credential granted the named scope. Scopes are minted per client,
+      not requested per call, so this is a provisioning change rather than a request change.
+    docs_anchor: /errors/FORBIDDEN
+    raised_by: [platform-authn]
+    go_const: CodeForbidden
+    since: 1.0.0
+
+  - code: INSUFFICIENT_SCOPE
+    category: AUTHORIZATION
+    title: Access token lacks a required scope
+    detail_template: "This operation requires scope {requiredScope}; the token carries {grantedScopes}."
+    remediation: >-
+      Mint a client credential granted the named scope. Scopes are provisioned per client,
+      not requested per call, so this is a provisioning change and never fixable by retrying.
+    docs_anchor: /errors/INSUFFICIENT_SCOPE
+    raised_by: [platform-authn]
+    go_const: CodeInsufficientScope
+    since: 1.0.0
+
+  - code: DUAL_CONTROL_REQUIRED
+    category: AUTHORIZATION
+    title: Operation requires dual control
+    detail_template: >-
+      {action} requires approval from a second authorized principal. Request {approvalId}
+      is pending.
+    remediation: >-
+      Have a second principal holding the same scope approve the pending request. The
+      approver may not be the requester, and both identities are written to the audit trail.
+    docs_anchor: /errors/DUAL_CONTROL_REQUIRED
+    raised_by: [control-plane-api]
+    go_const: CodeDualControlRequired
+    since: 1.0.0
+
+  - code: TENANT_MISMATCH
+    category: AUTHORIZATION
+    title: Resource belongs to a different tenant
+    detail_template: >-
+      The requested resource is not owned by the tenant in the access token.
+    remediation: >-
+      Use a credential belonging to the resource's tenant. Tenant identity is derived
+      exclusively from the token; a tenant identifier in a body or query string is ignored,
+      and one that disagrees with the token produces this error.
+    docs_anchor: /errors/TENANT_MISMATCH
+    raised_by: [platform-authn, payment-api, control-plane-api]
+    security_event: true
+    alert: yes
+    go_const: CodeTenantMismatch
+    since: 1.0.0
+    notes: >-
+      This is an alerting error even though it is a 4xx. A cross-tenant access attempt is
+      either a client bug worth telling the client about, or an attack worth telling
+      ourselves about; neither should be silent.
+
+  - code: MISSING_TENANT_CONTEXT
+    category: INTERNAL
+    title: Tenant context missing from the request path
+    detail_template: "A repository call was made without a tenant in context."
+    remediation: >-
+      Internal defect. Every repository method takes a context from which the tenant is
+      extracted; a call with no tenant returns this rather than querying, so that a missing
+      guard fails loudly instead of returning another tenant's rows.
+    docs_anchor: /errors/MISSING_TENANT_CONTEXT
+    raised_by: [payment-orchestrator, control-plane-api, event-consumer]
+    security_event: true
+    go_const: CodeMissingTenantContext
+    since: 1.0.0
+
+  - code: MERCHANT_NOT_FOUND
+    category: NOT_FOUND
+    title: Merchant not found
+    detail_template: "No merchant {merchantId} exists for this tenant."
+    remediation: Verify the identifier and that it belongs to the authenticated tenant.
+    docs_anchor: /errors/MERCHANT_NOT_FOUND
+    raised_by: [control-plane-api, payment-api, payment-orchestrator]
+    go_const: CodeMerchantNotFound
+    since: 1.0.0
+
+  - code: PAYMENT_NOT_FOUND
+    category: NOT_FOUND
+    title: Payment not found
+    detail_template: "No payment {paymentId} exists for this tenant."
+    remediation: >-
+      Verify the identifier. A payment created moments ago is readable immediately by its
+      creator; a reader on a different connection may need the consistent-read option.
+    docs_anchor: /errors/PAYMENT_NOT_FOUND
+    raised_by: [payment-api, payment-orchestrator]
+    go_const: CodePaymentNotFound
+    since: 1.0.0
+
+  - code: REFUND_NOT_FOUND
+    category: NOT_FOUND
+    title: Refund not found
+    detail_template: "No refund {refundId} exists on payment {paymentId}."
+    remediation: Verify the identifier and that it belongs to the named payment.
+    docs_anchor: /errors/REFUND_NOT_FOUND
+    raised_by: [payment-api]
+    go_const: CodeRefundNotFound
+    since: 1.0.0
+
+  - code: GATEWAY_NOT_FOUND
+    category: NOT_FOUND
+    title: Gateway not found
+    detail_template: "No gateway {gatewayRef} exists in the catalogue."
+    remediation: >-
+      List the catalogue to obtain valid gateway identifiers and codes. The catalogue is
+      platform-global and read-only to tenants.
+    docs_anchor: /errors/GATEWAY_NOT_FOUND
+    raised_by: [control-plane-api]
+    go_const: CodeGatewayNotFound
+    since: 1.0.0
+
+  - code: CONNECTION_NOT_FOUND
+    category: NOT_FOUND
+    title: Gateway connection not found
+    detail_template: "No connection exists for merchant {merchantId} and gateway {gatewayCode} in {environment}."
+    remediation: >-
+      Provision the connection through onboarding before configuring or rotating it. A
+      connection is created by workflow step 5, not by a configuration write.
+    docs_anchor: /errors/CONNECTION_NOT_FOUND
+    raised_by: [control-plane-api, workflow-worker]
+    go_const: CodeConnectionNotFound
+    since: 1.0.0
+
+  - code: CONFIGURATION_NOT_FOUND
+    category: NOT_FOUND
+    title: Configuration not found
+    detail_template: "Merchant {merchantId} has no configuration version {version}."
+    remediation: >-
+      List the version history to see what exists. Version numbers are dense per merchant
+      and start at 1.
+    docs_anchor: /errors/CONFIGURATION_NOT_FOUND
+    raised_by: [control-plane-api]
+    go_const: CodeConfigurationNotFound
+    since: 1.0.0
+
+  - code: ONBOARDING_CASE_NOT_FOUND
+    category: NOT_FOUND
+    title: Onboarding case not found
+    detail_template: "Merchant {merchantId} has no onboarding case."
+    remediation: >-
+      Start onboarding before reading or signalling a case. Starting is idempotent on the
+      merchant, so it is safe to call when unsure.
+    docs_anchor: /errors/ONBOARDING_CASE_NOT_FOUND
+    raised_by: [control-plane-api]
+    go_const: CodeOnboardingCaseNotFound
+    since: 1.0.0
+
+  - code: MERCHANT_ALREADY_EXISTS
+    category: CONFLICT
+    title: Merchant already exists
+    detail_template: >-
+      A merchant with external reference {externalReference} already exists in this tenant
+      as {merchantId}.
+    remediation: >-
+      Use a distinct external reference, or update the existing merchant. External
+      references are unique within a tenant precisely so an integration can use them as an
+      idempotent lookup key.
+    docs_anchor: /errors/MERCHANT_ALREADY_EXISTS
+    raised_by: [control-plane-api]
+    go_const: CodeMerchantAlreadyExists
+    since: 1.0.0
+
+  - code: MERCHANT_NOT_ACTIVE
+    category: BUSINESS_RULE
+    http_status: 409
+    title: Merchant is not active
+    detail_template: >-
+      Merchant {merchantId} is in state {state} and may not create new payments.
+    remediation: >-
+      Complete onboarding, or resume the merchant if it is suspended. Refunds, voids and
+      webhook processing remain available while a merchant is SUSPENDED - you must always
+      be able to give money back - so only payment creation and capture are blocked.
+    docs_anchor: /errors/MERCHANT_NOT_ACTIVE
+    raised_by: [payment-api, payment-orchestrator]
+    validation_level: L5
+    overrides_category: >-
+      409 rather than 422 because the request is fine and the resource's state is the
+      obstacle, which is what a caller's retry logic needs to distinguish.
+    go_const: CodeMerchantNotActive
+    since: 1.0.0
+
+  - code: MERCHANT_SUSPENDED
+    category: BUSINESS_RULE
+    title: Merchant is suspended
+    detail_template: "Merchant {merchantId} was suspended at {suspendedAt}: {reason}."
+    remediation: >-
+      Lift the suspension through the control plane; lifting requires the authority that
+      imposed it. Note that refunds, voids and webhook processing remain available while a
+      merchant is suspended - you must always be able to give money back - so this code names
+      only the blocked half of the surface. The 422 category default stands: the request is
+      well formed and a policy refuses it.
+    docs_anchor: /errors/MERCHANT_SUSPENDED
+    raised_by: [payment-api, payment-orchestrator, control-plane-api]
+    validation_level: L5
+    go_const: CodeMerchantSuspended
+    since: 1.0.0
+
+  - code: KYC_REQUIRED
+    category: BUSINESS_RULE
+    title: Know-your-business verification is required
+    detail_template: >-
+      Merchant {merchantId} cannot proceed past {step} without a completed KYB verification.
+    remediation: >-
+      Complete the verification step in onboarding. BUSINESS_RULE and not AUTHORIZATION: the
+      caller is permitted to make this request, the merchant record is what is not ready.
+    docs_anchor: /errors/KYC_REQUIRED
+    raised_by: [control-plane-api, workflow-worker]
+    validation_level: L2
+    go_const: CodeKYCRequired
+    since: 1.0.0
+
+  - code: TERMINATION_BLOCKED_OPEN_PAYMENTS
+    category: BUSINESS_RULE
+    title: Merchant has payments in a non-terminal state
+    detail_template: >-
+      Merchant {merchantId} has {openPaymentCount} payment(s) in a non-terminal state and
+      cannot be terminated.
+    remediation: >-
+      Resolve the open payments first - capture, void, refund or reconcile them. The guard
+      exists because terminating a merchant with money in flight leaves that money with no
+      owner in the ledger.
+    docs_anchor: /errors/TERMINATION_BLOCKED_OPEN_PAYMENTS
+    raised_by: [control-plane-api]
+    go_const: CodeTerminationBlockedOpenPayments
+    since: 1.0.0
+
+  - code: PAYMENT_ALREADY_PROCESSED
+    category: BUSINESS_RULE
+    http_status: 409
+    title: Payment has already been processed
+    detail_template: "Payment {paymentId} is in state {state} and cannot be {operation}ed again."
+    remediation: >-
+      Read the payment to see its current state. If you intended a second, distinct
+      operation, use a new idempotency key and the operation appropriate to the current
+      state - for example refund rather than a second capture.
+    docs_anchor: /errors/PAYMENT_ALREADY_PROCESSED
+    raised_by: [payment-orchestrator]
+    overrides_category: >-
+      409 rather than the category's 422. The request is well formed and the payment's
+      state is the obstacle, which is the distinction a client's retry logic branches on.
+    validation_level: L7
+    go_const: CodePaymentAlreadyProcessed
+    since: 1.0.0
+
+  - code: INVALID_STATE_TRANSITION
+    category: CONFLICT
+    http_status: 409
+    grpc_code: FAILED_PRECONDITION
+    title: Invalid state transition
+    detail_template: "{aggregate} {id} is in state {from}; {to} is not a legal transition."
+    remediation: >-
+      Read the resource and choose an operation legal from its current state. Transitions
+      absent from the transition table are rejected rather than coerced, which is what
+      makes the state machine an invariant rather than a suggestion.
+    docs_anchor: /errors/INVALID_STATE_TRANSITION
+    raised_by: [payment-orchestrator, control-plane-api, workflow-worker]
+    overrides_category: >-
+      gRPC FAILED_PRECONDITION rather than the category's ABORTED. ABORTED invites a
+      client retry; a transition that is not in the table will never become legal by
+      retrying, and FAILED_PRECONDITION says exactly that.
+    validation_level: L7
+    go_const: CodeInvalidStateTransition
+    since: 1.0.0
+
+  - code: AUTHORIZATION_EXPIRED
+    category: BUSINESS_RULE
+    title: Authorization has expired
+    detail_template: "The authorization on payment {paymentId} expired at {expiresAt}."
+    remediation: >-
+      Create a new payment. An expired authorization cannot be captured; the hold has
+      already been released by the issuer.
+    docs_anchor: /errors/AUTHORIZATION_EXPIRED
+    raised_by: [payment-orchestrator]
+    validation_level: L5
+    go_const: CodeAuthorizationExpired
+    since: 1.0.0
+
+  - code: AMOUNT_EXCEEDS_LIMIT
+    category: BUSINESS_RULE
+    title: Amount exceeds a configured limit
+    detail_template: >-
+      Amount {amount} {currency} exceeds {limitName} of {limit} {currency} in configuration
+      version {configVersion}.
+    remediation: >-
+      Reduce the amount or raise the merchant's configured limit through the control plane.
+      The limit is per-merchant policy, not a platform ceiling.
+    docs_anchor: /errors/AMOUNT_EXCEEDS_LIMIT
+    raised_by: [payment-api, payment-orchestrator, validation-plane]
+    validation_level: L5
+    validation_rules: [L5.AMOUNT_WITHIN_MERCHANT_LIMIT, L5.CAPTURE_WITHIN_AUTHORIZED]
+    go_const: CodeAmountExceedsLimit
+    since: 1.0.0
+
+  - code: DAILY_VOLUME_LIMIT_EXCEEDED
+    category: BUSINESS_RULE
+    title: Daily volume limit exceeded
+    detail_template: >-
+      Merchant {merchantId} has processed {processed} {currency} in the rolling 24-hour
+      window against a limit of {limit} {currency}.
+    remediation: >-
+      Wait for the rolling window to advance, or raise the limit through the control plane.
+      The window is rolling rather than calendar-day so a merchant cannot reset it by
+      waiting for midnight in a timezone of their choosing.
+    docs_anchor: /errors/DAILY_VOLUME_LIMIT_EXCEEDED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    validation_rules: [L5.DAILY_VOLUME_WITHIN_LIMIT]
+    go_const: CodeDailyVolumeLimitExceeded
+    since: 1.0.0
+
+  - code: VELOCITY_LIMIT_EXCEEDED
+    category: BUSINESS_RULE
+    title: Velocity limit exceeded
+    detail_template: "{limitName} exceeded: {observed} > {limit}."
+    remediation: >-
+      Slow the request rate for this merchant or payment instrument. Per-instrument
+      velocity is the most effective card-testing control available to a platform that
+      deliberately holds no card data, so these limits are set conservatively.
+    docs_anchor: /errors/VELOCITY_LIMIT_EXCEEDED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    validation_rules: [L5.VELOCITY_PER_MERCHANT_PER_MINUTE, L5.VELOCITY_PER_CARD_PER_HOUR]
+    go_const: CodeVelocityLimitExceeded
+    since: 1.0.0
+
+  - code: REFUND_EXCEEDS_CAPTURED
+    category: BUSINESS_RULE
+    title: Refund exceeds the captured amount
+    detail_template: >-
+      Requested refund of {requested} {currency} plus {alreadyRefunded} {currency} already
+      refunded exceeds the captured total of {captured} {currency} on payment {paymentId}.
+    remediation: >-
+      Refund at most the remaining refundable balance, which the detail states. This is
+      invariant I1 and is enforced in the aggregate, by a database CHECK constraint and by
+      a serialized update of the payment row - three layers, because a refund that exceeds
+      capture is money created from nothing.
+    docs_anchor: /errors/REFUND_EXCEEDS_CAPTURED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    validation_rules: [L5.REFUND_WITHIN_CAPTURED]
+    invariant: I1
+    go_const: CodeRefundExceedsCaptured
+    since: 1.0.0
+
+  - code: CAPTURE_EXCEEDS_AUTHORIZED
+    category: BUSINESS_RULE
+    title: Capture exceeds the authorized amount
+    detail_template: >-
+      Requested capture of {requested} {currency} plus {alreadyCaptured} {currency} already
+      captured exceeds the authorized total of {authorized} {currency} on payment {paymentId}.
+    remediation: >-
+      Capture at most the remaining capturable balance, which the detail states. This is
+      invariant I2 and, like I1, is enforced in the aggregate, by a database CHECK constraint
+      and by a serialized update of the payment row - capturing beyond an authorization is
+      money the issuer never agreed to.
+    docs_anchor: /errors/CAPTURE_EXCEEDS_AUTHORIZED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    validation_rules: [L5.CAPTURE_WITHIN_AUTHORIZED]
+    invariant: I2
+    go_const: CodeCaptureExceedsAuthorized
+    since: 1.0.0
+
+  - code: REFUND_WINDOW_EXPIRED
+    category: BUSINESS_RULE
+    title: Refund window has expired
+    detail_template: >-
+      Payment {paymentId} was captured on {capturedAt}; the merchant's refund window of
+      {maxRefundWindowDays} days closed on {windowClosedAt}.
+    remediation: >-
+      Refund outside the window through the gateway directly, or extend the configured
+      window if the gateway's own window still allows it. The platform's window may be
+      shorter than the gateway's but never longer.
+    docs_anchor: /errors/REFUND_WINDOW_EXPIRED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    validation_rules: [L5.REFUND_WITHIN_WINDOW]
+    go_const: CodeRefundWindowExpired
+    since: 1.0.0
+
+  - code: CAPTURE_LIMIT_EXCEEDED
+    category: BUSINESS_RULE
+    title: Too many partial captures
+    detail_template: >-
+      Payment {paymentId} already has {captureCount} captures against a configured maximum
+      of {maxPartialCaptures}.
+    remediation: >-
+      Capture the remaining balance in one final capture, or raise maxPartialCaptures in
+      the merchant's configuration if the gateway supports more.
+    docs_anchor: /errors/CAPTURE_LIMIT_EXCEEDED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    go_const: CodeCaptureLimitExceeded
+    since: 1.0.0
+
+  - code: PARTIAL_CAPTURE_NOT_SUPPORTED
+    category: BUSINESS_RULE
+    title: Partial capture is not supported for this payment
+    detail_template: >-
+      Gateway {gatewayCode} does not support partial capture for {paymentMethod}.
+    remediation: >-
+      Capture the full authorized amount, or route this corridor to a gateway whose
+      capability descriptor declares partial capture support.
+    docs_anchor: /errors/PARTIAL_CAPTURE_NOT_SUPPORTED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    go_const: CodePartialCaptureNotSupported
+    since: 1.0.0
+
+  - code: CURRENCY_NOT_SUPPORTED
+    category: BUSINESS_RULE
+    title: Currency is not supported for this merchant
+    detail_template: >-
+      Currency {currency} is not in merchant {merchantId}'s supported set in configuration
+      version {configVersion}.
+    remediation: >-
+      Add the currency to the merchant's configuration and ensure at least one certified
+      connection supports it. The check happens before any gateway is contacted, so this
+      costs nothing but a rejection.
+    docs_anchor: /errors/CURRENCY_NOT_SUPPORTED
+    raised_by: [payment-api, payment-orchestrator, validation-plane]
+    validation_level: L5
+    go_const: CodeCurrencyNotSupported
+    since: 1.0.0
+
+  - code: CURRENCY_MISMATCH
+    category: VALIDATION
+    http_status: 422
+    title: Currency does not match the payment
+    detail_template: >-
+      Operation currency {operationCurrency} does not match payment currency
+      {paymentCurrency}.
+    remediation: >-
+      Use the payment's own currency. Arithmetic across differing currencies is an error
+      rather than a silent conversion, because a silent conversion is a made-up exchange
+      rate applied to someone else's money.
+    docs_anchor: /errors/CURRENCY_MISMATCH
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    overrides_category: 422 - semantically invalid rather than malformed.
+    go_const: CodeCurrencyMismatch
+    since: 1.0.0
+
+  - code: PAYMENT_METHOD_NOT_SUPPORTED
+    category: BUSINESS_RULE
+    title: Payment method is not supported for this merchant
+    detail_template: >-
+      Payment method {paymentMethod} is not enabled for merchant {merchantId} in
+      configuration version {configVersion}.
+    remediation: >-
+      Enable the method in the merchant's configuration, then certify it: a method that is
+      configured but not certified is still not routable.
+    docs_anchor: /errors/PAYMENT_METHOD_NOT_SUPPORTED
+    raised_by: [payment-api, payment-orchestrator, validation-plane]
+    validation_level: L5
+    go_const: CodePaymentMethodNotSupported
+    since: 1.0.0
+
+  - code: COUNTRY_BLOCKED
+    category: BUSINESS_RULE
+    title: Payer country is blocked
+    detail_template: "Country {country} is blocked for merchant {merchantId}."
+    remediation: >-
+      This is a policy decision, not a configuration error. Sanctions jurisdictions are
+      additionally enforced platform-wide, so removing a country from the merchant's
+      blocked list does not unblock it.
+    docs_anchor: /errors/COUNTRY_BLOCKED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    go_const: CodeCountryBlocked
+    since: 1.0.0
+
+  - code: RESIDENCY_POLICY_VIOLATION
+    category: BUSINESS_RULE
+    title: Operation violates the tenant's data-residency policy
+    detail_template: >-
+      No permitted gateway can process this payment within residency region
+      {residencyRegion}.
+    remediation: >-
+      Provision a gateway available in the tenant's residency region. Routing will not
+      select a gateway whose region violates the policy, even when it is otherwise the best
+      candidate - residency is a hard exclusion, not a scoring input.
+    docs_anchor: /errors/RESIDENCY_POLICY_VIOLATION
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    go_const: CodeResidencyPolicyViolation
+    since: 1.0.0
+
+  - code: RISK_DECLINED
+    category: BUSINESS_RULE
+    title: Payment declined by risk policy
+    detail_template: "The payment was declined by the merchant's risk policy before dispatch."
+    remediation: >-
+      No gateway was contacted and no money moved. Review the merchant's risk configuration
+      if the decline was unexpected. The risk engine fails open to the merchant's declared
+      policy default, never to "allow", so an unreachable external scorer produces a
+      predictable decision rather than an unlimited merchant.
+    docs_anchor: /errors/RISK_DECLINED
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L5
+    go_const: CodeRiskDeclined
+    since: 1.0.0
+
+  - code: THREE_DS_REQUIRED
+    category: BUSINESS_RULE
+    title: Strong customer authentication is required
+    detail_template: >-
+      The risk policy requires 3-D Secure for this payment; the payment is in
+      REQUIRES_ACTION.
+    remediation: >-
+      Redirect the payer to the `nextAction.redirectUrl` and let them complete the
+      challenge. This is not a failure: the payment is alive and will proceed once
+      authentication completes or expire if it does not.
+    docs_anchor: /errors/THREE_DS_REQUIRED
+    raised_by: [payment-orchestrator]
+    validation_level: L5
+    go_const: CodeThreeDsRequired
+    since: 1.0.0
+
+  - code: NO_ELIGIBLE_GATEWAY
+    category: INFRASTRUCTURE
+    http_status: 503
+    retryable: true
+    retry_after_seconds: 5
+    title: No eligible gateway
+    detail_template: >-
+      No gateway can process {currency} {paymentMethod} for merchant {merchantId} right
+      now. Routing plan {routingPlanId} records why each candidate was excluded.
+    remediation: >-
+      Retry after the stated delay - the usual cause is a transient circuit opening. If it
+      persists, read the routing plan: it records an exclusion reason for every candidate,
+      which is the question asked in every routing incident. Failing closed is deliberate;
+      processing through a gateway the merchant is not certified for would be worse than
+      rejecting the payment.
+    docs_anchor: /errors/NO_ELIGIBLE_GATEWAY
+    raised_by: [payment-orchestrator]
+    alert: yes
+    go_const: CodeNoEligibleGateway
+    since: 1.0.0
+
+  - code: GATEWAY_NOT_CERTIFIED
+    category: BUSINESS_RULE
+    title: Gateway connection is not certified
+    detail_template: >-
+      Connection {connectionId} to {gatewayCode} is in state {state} and has no passing
+      {environment} certification report.
+    remediation: >-
+      Run certification for this connection. A production connection is never certified on
+      the strength of a sandbox report, and there is no waiver flag - a waiver is the
+      mechanism by which "certified" degrades into an opinion.
+    docs_anchor: /errors/GATEWAY_NOT_CERTIFIED
+    raised_by: [control-plane-api, payment-orchestrator, validation-plane]
+    validation_level: L4
+    go_const: CodeGatewayNotCertified
+    since: 1.0.0
+
+  - code: GATEWAY_NOT_CONFIGURED
+    category: BUSINESS_RULE
+    title: Gateway is not configured for this merchant
+    detail_template: >-
+      Merchant {merchantId} has no {environment} connection to gateway {gatewayCode}.
+    remediation: >-
+      Provision the connection through onboarding, then certify it. BUSINESS_RULE and not
+      NOT_FOUND: the gateway exists in the platform catalogue, it is this merchant's
+      configuration that does not reference it, and telling the caller "not found" would send
+      them looking for the wrong thing.
+    docs_anchor: /errors/GATEWAY_NOT_CONFIGURED
+    raised_by: [payment-orchestrator, control-plane-api, validation-plane]
+    validation_level: L4
+    go_const: CodeGatewayNotConfigured
+    since: 1.0.0
+
+  - code: GATEWAY_DECLINED
+    category: GATEWAY
+    http_status: 402
+    grpc_code: FAILED_PRECONDITION
+    retryable: false
+    alert: none
+    title: Gateway declined the payment
+    detail_template: >-
+      Gateway {gatewayCode} declined with normalized reason {declineReasonCode}.
+    remediation: >-
+      A hard decline is final: do not retry, and do not route to another gateway. Retrying
+      a hard decline elsewhere is card-testing behaviour and gets a platform
+      de-registered. A soft decline was already retried on an eligible fallback before this
+      error was returned, so seeing it means every eligible route declined.
+    docs_anchor: /errors/GATEWAY_DECLINED
+    raised_by: [payment-orchestrator]
+    overrides_category: >-
+      402 and not retryable. A decline is the gateway working correctly, so it is neither
+      a 502 nor an alerting condition - treating it as an infrastructure failure would
+      bury the real ones under normal business volume.
+    go_const: CodeGatewayDeclined
+    since: 1.0.0
+
+  - code: GATEWAY_TIMEOUT
+    category: TIMEOUT
+    http_status: 504
+    grpc_code: DEADLINE_EXCEEDED
+    retryable: false
+    title: Gateway timed out
+    detail_template: >-
+      Gateway {gatewayCode} did not respond within {timeoutMs} ms. Payment {paymentId}
+      remains PROCESSING and attempt {attemptId} is TIMEOUT_UNKNOWN.
+    remediation: >-
+      POLL the payment; do not resubmit with a new idempotency key. The outcome is unknown,
+      not failed - the authorization may have succeeded at the gateway. Retrying with the
+      SAME key is safe and returns the stored outcome once one exists. A reconciler resolves
+      the attempt from a gateway lookup, a webhook or a settlement report. No timer may fail
+      a payment.
+    docs_anchor: /errors/GATEWAY_TIMEOUT
+    raised_by: [payment-orchestrator]
+    alert: yes
+    go_const: CodeGatewayTimeout
+    since: 1.0.0
+    notes: >-
+      `retryable: false` is the most consequential flag in this catalogue. It does not mean
+      "give up"; it means "an automatic retry with a fresh key is forbidden". Auto-failing
+      and re-issuing a timed-out authorization is the single most common cause of double
+      charges in real platforms.
+
+  - code: GATEWAY_CONTRACT_VIOLATION
+    category: GATEWAY
+    http_status: 502
+    retryable: false
+    title: Gateway response violated its contract
+    detail_template: >-
+      Gateway {gatewayCode} returned a response that failed L6 validation: {violation}.
+    remediation: >-
+      Do NOT re-issue. The response was rejected and the payment left for reconciliation
+      rather than being applied, so the true outcome at the gateway is unknown - poll the
+      payment, exactly as for GATEWAY_TIMEOUT. This is an integration defect on one side or
+      the other; the raw response is retained on the attempt for diagnosis. Common causes are
+      a signature mismatch, a schema change the adapter has not caught up with, and an amount
+      or currency echo that differs from what we sent.
+    docs_anchor: /errors/GATEWAY_CONTRACT_VIOLATION
+    raised_by: [payment-orchestrator, validation-plane]
+    validation_level: L6
+    alert: yes
+    overrides_category: >-
+      `retryable: false`, against the GATEWAY category default of true. The category default
+      assumes the gateway failed to answer; here it answered and the answer was invalid. Asking
+      the same question again does not make the previous answer valid, and the gateway has just
+      demonstrated it may have moved money it did not correctly report. A `retryable: true`
+      here instructs every generated SDK, the workflow engine and the outbox relay to re-issue
+      against exactly that gateway: that is the double-charge path.
+    go_const: CodeGatewayContractViolation
+    since: 1.0.0
+
+  - code: GATEWAY_CIRCUIT_OPEN
+    category: INFRASTRUCTURE
+    http_status: 503
+    retryable: true
+    retry_after_seconds: 30
+    title: Gateway circuit is open
+    detail_template: >-
+      The circuit for ({gatewayCode}, {operation}) in {region} is OPEN since {openedAt}.
+    remediation: >-
+      Retry after the cool-down, by which time the breaker will have moved to PROBING. If
+      an eligible fallback existed, routing would already have used it, so this error means
+      the circuit is open on every candidate.
+    docs_anchor: /errors/GATEWAY_CIRCUIT_OPEN
+    raised_by: [payment-orchestrator]
+    alert: yes
+    go_const: CodeGatewayCircuitOpen
+    since: 1.0.0
+
+  - code: GATEWAY_UNAVAILABLE
+    category: GATEWAY
+    http_status: 502
+    retryable: true
+    retry_after_seconds: 2
+    title: Gateway is unavailable
+    detail_template: "Gateway {gatewayCode} returned {status} for {operation}."
+    remediation: >-
+      Retry with backoff. Transport-level failures that occur BEFORE the gateway could have
+      acted are safe to retry on the same attempt with the same gateway idempotency key;
+      the orchestrator does this up to twice with jitter before failing over as a new
+      attempt.
+    docs_anchor: /errors/GATEWAY_UNAVAILABLE
+    raised_by: [payment-orchestrator]
+    alert: yes
+    go_const: CodeGatewayUnavailable
+    since: 1.0.0
+
+  - code: GATEWAY_AUTHENTICATION_FAILED
+    category: GATEWAY
+    http_status: 502
+    retryable: false
+    title: Authentication with the gateway failed
+    detail_template: >-
+      Gateway {gatewayCode} rejected our credentials for connection {connectionId}
+      ({status}).
+    remediation: >-
+      Rotate or re-provision the connection's credentials. Nothing about the payment was
+      wrong; the platform could not identify itself to the third party.
+    docs_anchor: /errors/GATEWAY_AUTHENTICATION_FAILED
+    raised_by: [payment-orchestrator, workflow-worker]
+    alert: yes
+    overrides_category: >-
+      `retryable: false`, against the GATEWAY category default of true. A credential the
+      gateway has rejected will be rejected identically on every subsequent call, and most
+      acquirers lock an account after a run of failed authentications - so an automatic retry
+      converts a configuration error into an outage across every merchant on that connection.
+      Recovery is a credential rotation, which is a different request.
+    go_const: CodeGatewayAuthenticationFailed
+    since: 1.0.0
+
+  - code: CREDENTIAL_ROTATION_IN_PROGRESS
+    category: CONFLICT
+    title: A credential rotation is already running
+    detail_template: >-
+      Connection {connectionId} has a rotation in state {state} started at {startedAt}.
+    remediation: >-
+      Wait for the dual-run overlap to close. Starting a second rotation while the first is
+      mid-overlap would revoke a credential that in-flight authorizations are still using.
+    docs_anchor: /errors/CREDENTIAL_ROTATION_IN_PROGRESS
+    raised_by: [control-plane-api, workflow-worker]
+    go_const: CodeCredentialRotationInProgress
+    since: 1.0.0
+
+  - code: WEBHOOK_SIGNATURE_INVALID
+    category: AUTHENTICATION
+    title: Webhook signature verification failed
+    detail_template: >-
+      The {header} header did not verify over the received body for gateway {gatewayCode}.
+    remediation: >-
+      Verify that the gateway is signing with the secret registered for this connection and
+      that no proxy is re-encoding the body. Signature verification runs over the exact raw
+      bytes received, never over a re-serialized parse, because a re-serialization changes
+      the bytes and therefore the signature.
+    docs_anchor: /errors/WEBHOOK_SIGNATURE_INVALID
+    raised_by: [webhook-ingress]
+    security_event: true
+    alert: yes
+    go_const: CodeWebhookSignatureInvalid
+    since: 1.0.0
+
+  - code: WEBHOOK_REPLAY_DETECTED
+    category: AUTHENTICATION
+    title: Webhook replay detected
+    detail_template: >-
+      Signature timestamp {timestamp} is outside the permitted +/-{skewSeconds}s window, or
+      gateway event {gatewayRef} has already been seen.
+    remediation: >-
+      Check clock synchronisation on the sending system. A genuine duplicate delivery from
+      a gateway retry is answered 200 with `duplicate: true` and is not this error; this
+      error means the timestamp window failed or a nonce was reused, which is a replay
+      attempt rather than a retry.
+    docs_anchor: /errors/WEBHOOK_REPLAY_DETECTED
+    raised_by: [webhook-ingress]
+    security_event: true
+    alert: yes
+    go_const: CodeWebhookReplayDetected
+    since: 1.0.0
+
+  - code: WEBHOOK_UNKNOWN_GATEWAY
+    category: NOT_FOUND
+    title: Unknown gateway on the webhook path
+    detail_template: "No gateway with code {gatewayCode} is registered."
+    remediation: >-
+      Register the gateway before pointing its webhooks at this platform. Unknown-gateway
+      traffic is counted and alerted on, because a sustained stream of it is either a
+      misconfiguration or a probe.
+    docs_anchor: /errors/WEBHOOK_UNKNOWN_GATEWAY
+    raised_by: [webhook-ingress]
+    alert: on_spike
+    go_const: CodeWebhookUnknownGateway
+    since: 1.0.0
+
+  - code: WEBHOOK_UNKNOWN_EVENT_TYPE
+    category: VALIDATION
+    http_status: 422
+    title: Unrecognised webhook event type
+    detail_template: "Gateway {gatewayCode} sent event type {eventType}, which has no mapping."
+    remediation: >-
+      The delivery is acknowledged and parked rather than processed, so the gateway will not
+      retry it forever. Add a mapping in the gateway adapter if the event is one we should act
+      on. VALIDATION and not NOT_FOUND: the payload is what is unrecognised, not a resource
+      the caller asked for.
+    docs_anchor: /errors/WEBHOOK_UNKNOWN_EVENT_TYPE
+    raised_by: [webhook-ingress]
+    validation_level: L1
+    alert: on_spike
+    overrides_category: >-
+      422 rather than 400 - the body parsed and verified; one field carries a value the
+      adapter has no mapping for.
+    go_const: CodeWebhookUnknownEventType
+    since: 1.0.0
+
+  - code: REQUEST_TOO_LARGE
+    category: VALIDATION
+    http_status: 413
+    grpc_code: INVALID_ARGUMENT
+    title: Request body exceeds the ingest cap
+    detail_template: "Body of {bytes} bytes exceeds the {limit}-byte cap for {path}."
+    remediation: >-
+      Use the sender's own payload-reference mechanism, or split the request. The cap
+      exists because an oversized body on the webhook path can wedge the relay, and a
+      wedged relay stalls every merchant's events, not just the sender's.
+    docs_anchor: /errors/REQUEST_TOO_LARGE
+    raised_by: [payment-api, control-plane-api, webhook-ingress]
+    overrides_category: 413 rather than 400 - the body is well formed and merely too big.
+    go_const: CodeRequestTooLarge
+    since: 1.0.0
+    notes: >-
+      Published as REQUEST_TOO_LARGE. The catalogue previously spelled this PAYLOAD_TOO_LARGE
+      while every raiser in internal/ used REQUEST_TOO_LARGE, so the published spelling named
+      a code the platform could not raise and the raisable one was undocumented. The
+      in-code spelling wins because it is the one that has ever reached a caller.
+
+  - code: UNSUPPORTED_MEDIA_TYPE
+    category: VALIDATION
+    http_status: 415
+    grpc_code: INVALID_ARGUMENT
+    title: Unsupported content type
+    detail_template: "Content-Type {contentType} is not supported by {path}."
+    remediation: "Send `application/json`, or `application/merge-patch+json` on PATCH."
+    docs_anchor: /errors/UNSUPPORTED_MEDIA_TYPE
+    raised_by: [payment-api, control-plane-api]
+    overrides_category: 415 rather than 400 - the media type, not the content, is at fault.
+    go_const: CodeUnsupportedMediaType
+    since: 1.0.0
+
+  - code: INVALID_CURSOR
+    category: VALIDATION
+    title: Pagination cursor is invalid or expired
+    detail_template: "The supplied cursor is not valid for this tenant, filter set or time window."
+    remediation: >-
+      Restart the listing without a cursor. Cursors are signed, bound to the exact filter
+      set of the originating request and valid for 24 hours; reusing one across different
+      filters would silently return the wrong page rather than an error, which is why it is
+      rejected instead.
+    docs_anchor: /errors/INVALID_CURSOR
+    raised_by: [payment-api, control-plane-api]
+    go_const: CodeInvalidCursor
+    since: 1.0.0
+
+  - code: CONFIGURATION_INVALID
+    category: VALIDATION
+    http_status: 422
+    title: Configuration document is invalid
+    detail_template: "L4 validation rejected the document: {failureCount} rule(s) failed."
+    remediation: >-
+      Fix the rules named in `details[]`. Note that a rollback re-validates the target
+      document at rollback time rather than trusting that it was valid when first
+      published - a gateway may since have been de-registered or a certification expired,
+      and restoring a document the data plane cannot honour turns an attempted recovery
+      into an outage.
+    docs_anchor: /errors/CONFIGURATION_INVALID
+    raised_by: [control-plane-api, validation-plane]
+    validation_level: L4
+    overrides_category: 422 - the document parses; a rule refuses it.
+    go_const: CodeConfigurationInvalid
+    since: 1.0.0
+
+  - code: CONFIGURATION_VERSION_CONFLICT
+    category: CONFLICT
+    http_status: 412
+    grpc_code: FAILED_PRECONDITION
+    title: Configuration version conflict
+    detail_template: >-
+      If-Match specified version {expected} but the active version is {actual}, published
+      at {publishedAt}.
+    remediation: >-
+      Re-read the configuration, re-apply your change to the current document and retry.
+      The platform does not merge configuration documents on a caller's behalf: an
+      automatic merge of two concurrent policy edits produces a policy neither author
+      intended.
+    docs_anchor: /errors/CONFIGURATION_VERSION_CONFLICT
+    raised_by: [control-plane-api]
+    overrides_category: >-
+      412 and FAILED_PRECONDITION rather than 409 and ABORTED. The caller stated a
+      precondition and it did not hold; that is a different diagnosis from a bare
+      conflict, and it tells the caller their If-Match was the problem.
+    go_const: CodeConfigurationVersionConflict
+    since: 1.0.0
+
+  - code: CONFIGURATION_STALE
+    category: INFRASTRUCTURE
+    http_status: 503
+    retryable: true
+    retry_after_seconds: 10
+    title: Configuration snapshot is too stale to serve this merchant
+    detail_template: >-
+      The local configuration snapshot is {ageSeconds}s old, beyond max_config_staleness of
+      {maxAgeSeconds}s, and merchant {merchantId} is not in the last-known-good set.
+    remediation: >-
+      Retry shortly. This is the defined cliff in the fail-static design: the data plane
+      keeps serving merchants it already knows about with their last-known-good
+      configuration, and fails closed only for merchants it has never seen. Failing open
+      would mean processing without limits; failing closed for everyone would mean an
+      outage for merchants whose configuration has not changed in months.
+    docs_anchor: /errors/CONFIGURATION_STALE
+    raised_by: [payment-orchestrator, payment-api]
+    alert: yes
+    go_const: CodeConfigurationStale
+    since: 1.0.0
+    notes: >-
+      Published as CONFIGURATION_STALE. The catalogue previously spelled this
+      CONFIG_SNAPSHOT_TOO_STALE, which no raiser used; internal/platform/config raises
+      CONFIGURATION_STALE. Same condition, one spelling.
+
+  - code: ONBOARDING_ALREADY_IN_PROGRESS
+    category: CONFLICT
+    title: An onboarding workflow is already running for this merchant
+    detail_template: >-
+      Merchant {merchantId} already has case {caseId} on workflow instance {instanceId}.
+    remediation: >-
+      Read the existing case rather than starting a second one. The workflow's business key
+      is the merchant id, so starting twice is normally a no-op that returns the existing
+      case; this error is raised only where the caller explicitly demanded a new instance.
+    docs_anchor: /errors/ONBOARDING_ALREADY_IN_PROGRESS
+    raised_by: [control-plane-api, workflow-worker]
+    overrides_category: >-
+      409 is the CONFLICT default; stated explicitly because the Go registry carries a
+      per-code HTTP override for it and the two must be seen to agree.
+    http_status: 409
+    go_const: CodeOnboardingAlreadyInProgress
+    since: 1.0.0
+    notes: >-
+      Published as ONBOARDING_ALREADY_IN_PROGRESS. The catalogue previously spelled this
+      ONBOARDING_ALREADY_RUNNING, which no raiser used.
+
+  - code: WORKFLOW_SIGNAL_NOT_EXPECTED
+    category: CONFLICT
+    title: The workflow is not waiting for this signal
+    detail_template: >-
+      Instance {instanceId} is in state {state} at step {stepKey} and is not awaiting
+      {signal}.
+    remediation: >-
+      Read the case to see which signal, if any, the current step is blocked on. A signal
+      that arrives before its step is durably stored and applied when the step is reached;
+      this error means the signal can never apply, not that it arrived early.
+    docs_anchor: /errors/WORKFLOW_SIGNAL_NOT_EXPECTED
+    raised_by: [control-plane-api, workflow-worker]
+    go_const: CodeWorkflowSignalNotExpected
+    since: 1.0.0
+
+  - code: WORKFLOW_NOT_FOUND
+    category: NOT_FOUND
+    title: Workflow instance not found
+    detail_template: "No workflow instance {instanceId} exists for this tenant."
+    remediation: >-
+      Read the onboarding case to obtain the current instance identifier. As with every
+      NOT_FOUND, an instance belonging to another tenant is deliberately indistinguishable
+      from one that does not exist.
+    docs_anchor: /errors/WORKFLOW_NOT_FOUND
+    raised_by: [control-plane-api, workflow-worker]
+    go_const: CodeWorkflowNotFound
+    since: 1.0.0
+
+  - code: WORKFLOW_NOT_RESUMABLE
+    category: CONFLICT
+    title: Workflow instance is not in a resumable state
+    detail_template: "Instance {instanceId} is in state {state} and cannot be resumed."
+    remediation: >-
+      Only a FAILED or SUSPENDED instance can be resumed. A RUNNING one needs nothing, and a
+      COMPLETED or COMPENSATED one is terminal - resuming it would replay steps whose effects
+      have already been observed downstream. Not retryable: the state must change first, and
+      only an operator can change it.
+    docs_anchor: /errors/WORKFLOW_NOT_RESUMABLE
+    raised_by: [control-plane-api, workflow-worker]
+    go_const: CodeWorkflowNotResumable
+    since: 1.0.0
+
+  - code: WORKFLOW_STEP_FAILED
+    category: INTERNAL
+    http_status: 500
+    grpc_code: INTERNAL
+    retryable: false
+    title: A workflow step exhausted its retries
+    detail_template: >-
+      Step {stepKey} of instance {instanceId} failed after {attempts} attempts:
+      {lastErrorCode}.
+    remediation: >-
+      The instance moved to FAILED and the step payload is in the workflow DLQ with the
+      full error chain. Fix the underlying cause and resume the instance explicitly; completed
+      steps are not replayed, because every step's result is checkpointed before the next
+      begins. An automatic caller retry is not the recovery path and cannot be.
+    docs_anchor: /errors/WORKFLOW_STEP_FAILED
+    raised_by: [workflow-worker]
+    alert: page
+    overrides_category: >-
+      INTERNAL, not INFRASTRUCTURE, and `retryable: false`. By the time this code is
+      transported to a caller the workflow engine has already applied its own retry
+      classification, exhausted the step's attempts and given up - the code names the terminal
+      case, not a transient one. Publishing it as a retryable INFRASTRUCTURE 503 would invite
+      the caller to re-drive a saga the engine has already declared dead, on top of an incident
+      that pages.
+    go_const: CodeWorkflowStepFailed
+    since: 1.0.0
+
+  - code: COMPLIANCE_ATTESTATION_REQUIRED
+    category: BUSINESS_RULE
+    title: A completed compliance attestation is required
+    detail_template: >-
+      Merchant {merchantId} cannot reach ACTIVE without a completed compliance attestation.
+    remediation: >-
+      Have an authorized principal sign the compliance gate. The signal carries the
+      attestation reference and is itself audited with actor, time, scopes, source address
+      and justification.
+    docs_anchor: /errors/COMPLIANCE_ATTESTATION_REQUIRED
+    raised_by: [control-plane-api, workflow-worker]
+    go_const: CodeComplianceAttestationRequired
+    since: 1.0.0
+
+  - code: CERTIFICATION_REQUIRED
+    category: BUSINESS_RULE
+    title: A passing certification report is required
+    detail_template: >-
+      Merchant {merchantId} cannot reach PRODUCTION_READY without a PASSED production
+      certification report.
+    remediation: >-
+      Run the certification suite. Every (gateway, payment method, currency) cell must pass
+      all seven assertions; there is no partial pass, because a partial pass is a
+      certification that certifies nothing in particular.
+    docs_anchor: /errors/CERTIFICATION_REQUIRED
+    raised_by: [control-plane-api, workflow-worker]
+    go_const: CodeCertificationRequired
+    since: 1.0.0
+
+  - code: CERTIFICATION_FAILED
+    category: BUSINESS_RULE
+    title: Gateway certification did not pass
+    detail_template: >-
+      Certification report {reportId} for connection {connectionId} is FAILED:
+      {failedAssertionCount} assertion(s) did not pass.
+    remediation: >-
+      Read the report, fix the failing cells and re-run the suite. There is no partial pass
+      and no waiver flag; a waiver is the mechanism by which "certified" degrades into an
+      opinion. BUSINESS_RULE rather than GATEWAY: the third party behaved as it does, and it
+      is our acceptance criteria that refused.
+    docs_anchor: /errors/CERTIFICATION_FAILED
+    raised_by: [control-plane-api, workflow-worker, validation-plane]
+    validation_level: L3
+    go_const: CodeCertificationFailed
+    since: 1.0.0
+
+  - code: RECONCILIATION_PENDING
+    category: CONFLICT
+    title: Payment is awaiting reconciliation
+    detail_template: >-
+      Payment {paymentId} has an unresolved {reason} attempt and cannot accept {operation}
+      until it is reconciled.
+    remediation: >-
+      Poll the payment. A reconciler resolves the ambiguous attempt from a gateway lookup,
+      a webhook or a settlement report, usually within seconds and always within the SLO
+      deadline carried on the reconciliation event. Operating on a payment whose true state
+      is unknown is precisely the mistake this error prevents.
+    docs_anchor: /errors/RECONCILIATION_PENDING
+    raised_by: [payment-orchestrator]
+    go_const: CodeReconciliationPending
+    since: 1.0.0
+
+  - code: RATE_LIMITED
+    category: RATE_LIMIT
+    retry_after_seconds: 1
+    title: Rate limit exceeded
+    detail_template: >-
+      {scope} {scopeId} exceeded {limit} requests per {window} on {method} {path}.
+    remediation: >-
+      Back off with jitter and retry after the stated delay. Retrying in lockstep across
+      many clients converts a rate limit into a thundering herd; the adaptive concurrency
+      limiter will shed the load either way, but jitter is what lets throughput recover.
+    docs_anchor: /errors/RATE_LIMITED
+    raised_by: [payment-api, control-plane-api, webhook-ingress]
+    go_const: CodeRateLimited
+    since: 1.0.0
+
+  - code: CONCURRENCY_LIMIT_EXCEEDED
+    category: RATE_LIMIT
+    retryable: true
+    retry_after_seconds: 1
+    title: Too many concurrent requests
+    detail_template: >-
+      Bulkhead {bulkhead} is saturated: {inFlight} in flight against a limit of {limit}.
+    remediation: >-
+      Back off with jitter and retry. RATE_LIMIT rather than INFRASTRUCTURE: nothing is
+      broken, the adaptive concurrency limiter shed this request to keep latency bounded for
+      the ones already in flight, and it is retryable for exactly that reason.
+    docs_anchor: /errors/CONCURRENCY_LIMIT_EXCEEDED
+    raised_by: [payment-api, control-plane-api, payment-orchestrator]
+    alert: on_sustained
+    go_const: CodeConcurrencyLimitExceeded
+    since: 1.0.0
+
+  - code: SERVICE_UNAVAILABLE
+    category: INFRASTRUCTURE
+    retry_after_seconds: 5
+    title: Service temporarily unavailable
+    detail_template: "{component} is unavailable; the request was rejected rather than degraded."
+    remediation: >-
+      Retry with backoff. Payment writes fail closed under partition rather than risking a
+      divergent money state: refusing a payment costs one lost sale, while double-charging
+      costs a chargeback, a fine and trust.
+    docs_anchor: /errors/SERVICE_UNAVAILABLE
+    raised_by: [payment-api, payment-orchestrator, control-plane-api]
+    alert: yes
+    go_const: CodeServiceUnavailable
+    since: 1.0.0
+
+  - code: DEPENDENCY_FAILURE
+    category: INFRASTRUCTURE
+    retryable: true
+    retry_after_seconds: 5
+    title: A downstream dependency failed
+    detail_template: "{dependency} failed: {reason}."
+    remediation: >-
+      Retry with backoff and jitter. Retryable is safe here only because the dependency named
+      is never a gateway - a failed gateway call has an ambiguous money outcome and is
+      reported as GATEWAY_TIMEOUT or GATEWAY_UNAVAILABLE, never as this code. This one covers
+      our own infrastructure, where a failed call moved nothing.
+    docs_anchor: /errors/DEPENDENCY_FAILURE
+    raised_by: [payment-api, payment-orchestrator, control-plane-api, workflow-worker, event-consumer, outbox-relay]
+    alert: yes
+    go_const: CodeDependencyFailure
+    since: 1.0.0
+
+  - code: INTERNAL_ERROR
+    category: INTERNAL
+    title: Internal error
+    detail_template: "An unexpected error occurred. This incident has been recorded."
+    remediation: >-
+      Quote the `requestId` when reporting it. The detail is deliberately opaque: an
+      internal error message is written for our logs, and echoing it to a caller leaks
+      implementation detail without helping them.
+    docs_anchor: /errors/INTERNAL_ERROR
+    raised_by: [payment-api, payment-orchestrator, control-plane-api, workflow-worker, webhook-ingress, outbox-relay, event-consumer]
+    go_const: CodeInternalError
+    since: 1.0.0
+
+# Field-level sub-codes carried inside a problem document's `details[]`.
+#
+# These are NOT top-level error codes: they qualify one, and a client that branches on
+# them is branching too finely. They are catalogued because the OpenAPI examples use
+# them and CI asserts that every sub-code appearing in a contract or in code exists here.
+detail_codes:
+  - code: NOT_ISO_4217
+    applies_to: [VALIDATION_FAILED]
+    message_template: '"{value}" is not a valid ISO 4217 alphabetic code.'
+  - code: TOO_LONG
+    applies_to: [VALIDATION_FAILED]
+    message_template: "Must be at most {max} characters."
+  - code: PAN_DETECTED
+    applies_to: [SENSITIVE_DATA_IN_REQUEST]
+    message_template: "Value redacted. Cardholder data must never reach this API."
+    log_value: false
+  - code: FINGERPRINT_MISMATCH
+    applies_to: [IDEMPOTENCY_KEY_REUSED]
+    message_template: "Stored fingerprint {stored} does not match request fingerprint {actual}."
+  - code: LEASE_HELD
+    applies_to: [IDEMPOTENT_REQUEST_IN_PROGRESS]
+    message_template: "Lease expires at {leaseExpiresAt}."
+  - code: MERCHANT_STATE
+    applies_to: [MERCHANT_NOT_ACTIVE]
+    message_template: "Current state: {actual}. Required: {required}."
+  - code: TRANSITION_NOT_ALLOWED
+    applies_to: [INVALID_STATE_TRANSITION]
+    message_template: "{from} -> {to} is not in the transition table."
+  - code: EXCEEDS_CAPTURABLE
+    applies_to: [PAYMENT_ALREADY_PROCESSED, AMOUNT_EXCEEDS_LIMIT]
+    message_template: "No capturable balance remains on this authorization."
+  - code: EXCEEDS_REFUNDABLE
+    applies_to: [REFUND_EXCEEDS_CAPTURED]
+    message_template: "Maximum refundable amount is {max} minor units."
+  - code: ABOVE_MAX_TRANSACTION_AMOUNT
+    applies_to: [AMOUNT_EXCEEDS_LIMIT]
+    message_template: "Rule L5.AMOUNT_WITHIN_MERCHANT_LIMIT: {actual} > {limit}."
+  - code: VELOCITY_EXCEEDED
+    applies_to: [RISK_DECLINED, VELOCITY_LIMIT_EXCEEDED]
+    message_template: "Rule {ruleId}: {observed} > {limit}."
+  - code: CURRENCY_UNSUPPORTED
+    applies_to: [NO_ELIGIBLE_GATEWAY, CURRENCY_NOT_SUPPORTED]
+    message_template: "Connection {connectionId} is not enabled for {currency}."
+  - code: CIRCUIT_OPEN
+    applies_to: [NO_ELIGIBLE_GATEWAY, GATEWAY_CIRCUIT_OPEN]
+    message_template: "Circuit OPEN for ({gatewayCode}, {operation}) in {region} since {openedAt}."
+  - code: ECHO_MISMATCH
+    applies_to: [GATEWAY_CONTRACT_VIOLATION]
+    message_template: "Sent {sent}, echoed {echoed}."
+  - code: RECONCILIATION_QUEUED
+    applies_to: [GATEWAY_TIMEOUT]
+    message_template: "Resolution deadline {resolveBy}."
+  - code: GATEWAY_NOT_CERTIFIED
+    applies_to: [CONFIGURATION_INVALID]
+    message_template: >-
+      Rule L4.ROUTING_PRIMARY_IS_CERTIFIED - gateway "{gatewayCode}" has no CERTIFIED
+      {environment} connection for this merchant.

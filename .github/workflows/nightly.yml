@@ -1,0 +1,454 @@
+# .github/workflows/nightly.yml — the long-running suite.
+#
+# Everything here is either too slow for a pull request (the four-hour soak, the twenty-five
+# minute chaos matrix) or answers a question about the *world* rather than about the diff
+# (a CVE published today against an image released last month; a backup taken last night).
+#
+# docs/testing.md §10.2 budgets ~70 minutes for the nightly tier; the soak and the DR drill
+# run on their own schedules because they are hours, not minutes.
+#
+# WHY THESE ARE NIGHTLY AND NOT ON EVERY PR
+#   Not cost — correctness of signal. A flaky four-hour job in the PR path gets re-run until
+#   it passes, and after the third re-run nobody reads its output. Moving it to a schedule
+#   where a failure files an issue means a failure is investigated instead of retried.
+#
+#   The vulnerability rescan is the clearest case: it re-scans images that were already
+#   released and already passed their gate. Nothing in the repository changed; the CVE
+#   database did. There is no pull request that could catch it, and no amount of PR-time
+#   scanning that would have.
+
+name: nightly
+
+on:
+  schedule:
+    # 02:00 UTC — after the European working day and before the American one, so a failure
+    # is triaged in the morning rather than discovered at standup.
+    - cron: "0 2 * * *"
+    # Sunday 04:00 UTC: the weekly RD-1 restore drill (disaster-recovery.md §5.3 schedules
+    # it Monday 04:00; the workflow fires Sunday night UTC so the evidence bundle exists
+    # before the Monday review).
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which suite to run"
+        required: false
+        default: all
+        type: choice
+        options: [all, chaos, soak, rescan, dr-drill, traceability, flake-hunt]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.24.7"
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+  IMAGE_REPO: ghcr.io/${{ github.repository }}
+
+jobs:
+
+  # =========================================================================================
+  # Flake hunt — the same unit suite, five times, with the race detector.
+  #
+  # testing.md §9.1: a test that passes 999 times in 1000 is a test that will fail in the
+  # merge queue on a Friday. Running the suite five times under -race on a loaded runner is
+  # the cheapest way to find the ones whose passing depends on scheduling, and the money-path
+  # rule (§9.3) means any flake found here in internal/domain, internal/platform/idempotency
+  # or the payment application package is a blocker rather than a quarantine candidate.
+  # =========================================================================================
+  flake-hunt:
+    name: flake hunt (-count=5 -race)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: github.event.inputs.suite == '' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'flake-hunt'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-go@v5
+        with: { go-version: "${{ env.GO_VERSION }}", cache: true, cache-dependency-path: go.sum }
+
+      - name: Repeat the suite
+        run: |
+          set -euo pipefail
+          # -shuffle=on as well as -count=5: repetition finds a test that is flaky on its
+          # own, shuffling finds the far more common case of a test that only passes because
+          # another test ran first and left global state behind (testing.md §8.3).
+          go test ./... -race -count=5 -shuffle=on -timeout 55m 2>&1 | tee flake-run.txt
+
+      - name: Report the money-path rule
+        if: failure()
+        run: |
+          set -euo pipefail
+          echo "### Flake hunt failed" >> "$GITHUB_STEP_SUMMARY"
+          if grep -qE '^(--- )?FAIL.*(internal/domain|internal/platform/idempotency|internal/platform/tenantctx|internal/application/payment)' flake-run.txt; then
+            echo "::error::a money-path test is flaky. testing.md §9.3: it may NOT be quarantined — it is a blocker."
+          fi
+          grep -E '^(--- )?FAIL' flake-run.txt | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: flake-run, path: flake-run.txt, retention-days: 14 }
+
+  # =========================================================================================
+  # Chaos — the §6.3 scenario matrix against a full local stack with fault injection.
+  # =========================================================================================
+  chaos:
+    name: chaos (C-1 … C-14)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    if: github.event.inputs.suite == '' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'chaos'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-go@v5
+        with: { go-version: "${{ env.GO_VERSION }}", cache: true, cache-dependency-path: go.sum }
+
+      - name: Bring up the full stack
+        run: ./scripts/dev-up.sh --timeout 300
+
+      - name: Run the chaos suite
+        # The scenarios that need a cluster (C-15 node loss, C-16 AZ loss, C-17 region loss)
+        # are game days against real infrastructure, not CI jobs — disaster-recovery.md §9
+        # schedules them monthly and quarterly with a named incident commander. What runs
+        # here is the toxiproxy- and simulator-driven subset, C-1 to C-14, which is every
+        # scenario whose fault can be injected without an AWS API call.
+        run: go test -tags=chaos ./tests/chaos/... -count=1 -timeout 60m -v 2>&1 | tee chaos.txt
+
+      - name: Collect stack logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.dev.yml logs --tail=500 > stack-logs.txt || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-results
+          path: |
+            chaos.txt
+            stack-logs.txt
+          retention-days: 30
+
+      - name: Tear down
+        if: always()
+        run: ./scripts/dev-down.sh --quiet
+
+  # =========================================================================================
+  # Soak — four hours at 3 000 TPS against staging, plus the resource-slope assertions that
+  # k6 cannot make.
+  # =========================================================================================
+  soak:
+    name: soak (4h)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    if: github.event.inputs.suite == 'soak' || github.event.inputs.suite == 'all'
+    environment:
+      name: staging
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: k6 soak
+        env:
+          PP_LOADTEST_BASE: ${{ vars.STAGING_BASE_URL }}
+          PP_LOADTEST_TOKEN: ${{ secrets.STAGING_LOADTEST_TOKEN }}
+        run: ./scripts/loadtest.sh soak
+
+      - name: Resource-slope assertions
+        # The half of the soak that k6 cannot see. tests/load/soak.js asserts the p99 at
+        # hour four against the p99 at hour one, which catches every leak that manifests as
+        # degradation — but a leak that has not yet reached a limit shows no degradation at
+        # all, and that is the one that takes the fleet down on a quiet Sunday.
+        env:
+          PROM_URL: ${{ vars.STAGING_PROMETHEUS_URL }}
+          PROM_TOKEN: ${{ secrets.STAGING_PROMETHEUS_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROM_URL:-}" ]; then
+            echo "::warning::STAGING_PROMETHEUS_URL is not set — the resource-slope half of the soak did NOT run"
+            exit 0
+          fi
+          fail=0
+          check() {
+            local name="$1" query="$2"
+            local v
+            v=$(curl -sS -G --data-urlencode "query=${query}" \
+                  -H "Authorization: Bearer ${PROM_TOKEN}" \
+                  "${PROM_URL}/api/v1/query" | jq -r '.data.result[0].value[1] // "0"')
+            printf '%-34s slope=%s\n' "$name" "$v" | tee -a "$GITHUB_STEP_SUMMARY"
+            # A positive slope over four hours at steady load is a leak. The threshold is
+            # not zero: measurement noise and lazily-grown buffers produce a small positive
+            # number legitimately. It is "growing at a rate that would matter in a week".
+            awk -v x="$v" 'BEGIN{exit !(x+0 > 0.0001)}' && {
+              echo "::error::${name} is growing under steady load — a resource leak"
+              fail=1
+            }
+            return 0
+          }
+          check "goroutines"    'deriv(sum(go_goroutines{job="pp-services"})[4h:1m])'
+          check "heap in use"   'deriv(sum(go_memstats_heap_inuse_bytes{job="pp-services"})[4h:1m])'
+          check "open fds"      'deriv(sum(process_open_fds{job="pp-services"})[4h:1m])'
+          check "pgx conns"     'deriv(sum(pgxpool_acquired_conns{job="pp-services"})[4h:1m])'
+          exit $fail
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: soak-results, path: .loadtest/, retention-days: 60 }
+
+  # =========================================================================================
+  # Vulnerability rescan of RELEASED images.
+  #
+  # This is the job that could not exist as a PR check. It re-scans images that already
+  # passed their gate: nothing in the repository changed, the CVE database did. An image
+  # that was clean at release and is HIGH today is exactly as exploitable as one that was
+  # HIGH at release, and the only way to find out is to look again.
+  # =========================================================================================
+  rescan:
+    name: rescan released images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: github.event.inputs.suite == '' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'rescan'
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - payment-api
+          - payment-orchestrator
+          - control-plane-api
+          - webhook-ingress
+          - workflow-worker
+          - outbox-relay
+          - event-consumer
+          - platformctl
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the digest currently deployed to production
+        id: digest
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Scan what is RUNNING, not what is newest. A CVE in an image nobody deployed is
+          # a backlog item; a CVE in the image serving payments is an incident.
+          if ! gh api "repos/${{ github.repository_owner }}/payments-platform-gitops/contents/environments/prod/image-versions.yaml" \
+                --jq '.content' 2>/dev/null | base64 -d > /tmp/prod-images.yaml; then
+            echo "::notice::cannot read the GitOps prod pins; falling back to the latest tag"
+            echo "ref=${IMAGE_REPO}/${{ matrix.service }}:latest" >> "$GITHUB_OUTPUT"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          d=$(python3 -c "
+          import yaml,sys
+          d=yaml.safe_load(open('/tmp/prod-images.yaml')) or {}
+          print((d.get('images',{}).get('${{ matrix.service }}') or {}).get('digest',''))
+          ")
+          if [ -z "$d" ]; then
+            echo "::notice::${{ matrix.service }} is not pinned in prod yet"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ref=${IMAGE_REPO}/${{ matrix.service }}@${d}" >> "$GITHUB_OUTPUT"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: trivy
+        if: steps.digest.outputs.found == 'true'
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ steps.digest.outputs.ref }}
+          format: sarif
+          output: rescan-${{ matrix.service }}.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: steps.digest.outputs.found == 'true'
+        with:
+          sarif_file: rescan-${{ matrix.service }}.sarif
+          category: rescan-${{ matrix.service }}
+
+      - name: File an issue for a new fixable finding
+        if: steps.digest.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          n=$(jq '[.runs[].results[]] | length' rescan-${{ matrix.service }}.sarif)
+          [ "$n" -eq 0 ] && { echo "clean"; exit 0; }
+          # An issue rather than a red build. The build is red for something the author of
+          # this run can fix; this is not that. An issue is assignable, has a discussion,
+          # and does not block anyone's merge while it is triaged.
+          title="Vulnerability rescan: ${n} fixable HIGH/CRITICAL in ${{ matrix.service }} (production)"
+          existing=$(gh issue list --search "in:title \"$title\"" --state open --json number --jq '.[0].number' || true)
+          body=$(jq -r '.runs[].results[] | "- **\(.ruleId)** \(.message.text)"' \
+                   rescan-${{ matrix.service }}.sarif | head -40)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still present as of $(date -u +%F). ${n} finding(s)."
+          else
+            gh issue create --title "$title" --label "security,vulnerability" \
+              --body "$(printf 'Image: `%s`\n\nThese are **fixable** HIGH/CRITICAL findings in the image currently serving production traffic. They were not present (or not published) when the image passed its release gate.\n\n%s\n\nRemediation is a base-image or dependency bump followed by a normal release — the fix ships through `cd.yml` like anything else.\n' "${{ steps.digest.outputs.ref }}" "$body")"
+          fi
+
+  # =========================================================================================
+  # RD-1 restore drill — Sunday only.
+  # =========================================================================================
+  dr-drill:
+    name: RD-1 restore drill
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    if: github.event.schedule == '0 4 * * 0' || github.event.inputs.suite == 'dr-drill'
+    environment:
+      name: dr-verify
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-go@v5
+        with: { go-version: "${{ env.GO_VERSION }}", cache: true, cache-dependency-path: go.sum }
+
+      - name: Assume the dr-verify role
+        if: vars.AWS_DR_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DR_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+          role-session-name: rd1-${{ github.run_id }}
+
+      - name: Dry run (always, so a broken drill script is visible before the real one)
+        run: ./scripts/dr-drill.sh --dry-run
+
+      - name: RD-1
+        if: vars.AWS_DR_ROLE_ARN != ''
+        env:
+          PP_DRILL_SG: ${{ vars.PP_DRILL_SG }}
+          PP_DRILL_SUBNET_GROUP: ${{ vars.PP_DRILL_SUBNET_GROUP }}
+          PP_DRILL_KMS_KEY: ${{ vars.PP_DRILL_KMS_KEY }}
+          PP_DRILL_DSN_TEMPLATE: ${{ secrets.PP_DRILL_DSN_TEMPLATE }}
+          PP_EVIDENCE_BUCKET: ${{ vars.PP_EVIDENCE_BUCKET }}
+          PP_SOURCE_CLUSTER: ${{ vars.PP_SOURCE_CLUSTER }}
+        run: ./scripts/dr-drill.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: rd1-evidence, path: evidence/, retention-days: 90 }
+
+      - name: Page on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # disaster-recovery.md §5.3: a failed RD-1 pages the on-call at P2 and files a
+          # blocking issue; two consecutive failures escalate to P1, because at that point
+          # the state of the backup system is unknown — which is operationally identical to
+          # having no backups.
+          gh issue create \
+            --title "P2: RD-1 restore drill FAILED ($(date -u +%F))" \
+            --label "incident,p2,disaster-recovery" \
+            --body "The weekly snapshot restore + integrity drill failed.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Evidence bundle is attached to that run as \`rd1-evidence\`.
+
+          **This blocks releases.** A backup that has never been restored is a hypothesis;
+          a backup whose restore has *failed* is a known-bad. Check the previous week's run
+          before closing — two consecutive failures escalate to P1."
+
+  # =========================================================================================
+  # Traceability regeneration.
+  # =========================================================================================
+  traceability:
+    name: regenerate the traceability matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.event.inputs.suite == '' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'traceability'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python3 -m pip install --quiet pyyaml
+
+      - name: Regenerate
+        id: gen
+        # `|| true`: an orphan requirement makes the script exit 1, and the matrix it just
+        # wrote is exactly the artifact needed to see which one. Failing the step here would
+        # discard the output and report "traceability failed" with no detail.
+        run: ./scripts/traceability.sh 2>&1 | tee trace.txt || true
+
+      - name: Open a PR if the matrix changed
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "docs: regenerate the traceability matrix (§26)"
+          branch: chore/traceability
+          delete-branch: true
+          title: "docs: regenerate the traceability matrix"
+          body: |
+            Regenerated by the nightly workflow from the requirement headings in
+            `docs/spec/01`–`03`, the test names and comments, and
+            `tests/critical_paths.yaml`.
+
+            If this PR is non-empty, `main` was carrying a stale matrix. CI runs
+            `scripts/traceability.sh --check` on every merge, so that should not
+            normally happen — a recurring diff here means something regenerates it
+            differently.
+          labels: documentation, automated
+
+      - name: Report orphans
+        run: |
+          set -euo pipefail
+          {
+            echo "### Traceability (§26)"
+            echo '```'
+            grep -E '^\s+(FAIL|PASS)' trace.txt | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # An orphan requirement is a §26 build-failing condition. Reported as a job
+          # failure so it is visible on the schedule page, after the PR above has been
+          # opened with the regenerated matrix.
+          if grep -q 'FAIL' trace.txt; then
+            echo "::error::orphan requirement or orphan test — see the summary"
+            exit 1
+          fi
+
+  # =========================================================================================
+  # Summary — one place to look in the morning.
+  # =========================================================================================
+  report:
+    name: nightly report
+    runs-on: ubuntu-24.04
+    if: always()
+    needs: [flake-hunt, chaos, rescan, traceability]
+    steps:
+      - name: Summarise
+        run: |
+          set -euo pipefail
+          {
+            echo "## Nightly — $(date -u +%F)"
+            echo ""
+            echo "| suite | result |"
+            echo "|---|---|"
+            echo '${{ toJSON(needs) }}' | jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,319 @@
+# Default-deny in every namespace, plus the two allows that are universal.
+#
+# Everything else is per-workload and ships with that workload's chart, so a
+# service's network reachability is reviewed in the same diff as the service.
+#
+# Denied by omission and worth naming explicitly:
+#   * pp-data-plane -> pp-control-plane. The data plane must never have a
+#     synchronous dependency on the control plane (fail-static, baseline §15).
+#     The network makes that architectural rule physically true.
+#   * payment-api -> the internet. It never calls a gateway; only
+#     payment-orchestrator and workflow-worker do. That is the network
+#     expression of the bulkhead in baseline §5.
+#   * any pod -> 169.254.169.254. No allow rule anywhere contains that address,
+#     which closes the SSRF -> instance-credentials chain.
+---
+# pp-control-plane: deny everything, both directions.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: pp-control-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}          # every pod in the namespace
+  policyTypes: [Ingress, Egress]
+---
+# DNS is the only universally granted egress, and it is still scoped to the
+# kube-dns pods on ports 53 only. A blanket "allow UDP/53 to anywhere" is an
+# exfiltration tunnel: DNS is where exfiltration is usually visible first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: pp-control-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Metrics scraping: ingress only, from pp-observability, on 9090. The scraped pod
+# gets no reciprocal egress — a scrape is a pull, and granting the target egress
+# back to the scraper would be a channel nobody needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: pp-control-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pp-observability
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+# pp-data-plane: deny everything, both directions.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: pp-data-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}          # every pod in the namespace
+  policyTypes: [Ingress, Egress]
+---
+# DNS is the only universally granted egress, and it is still scoped to the
+# kube-dns pods on ports 53 only. A blanket "allow UDP/53 to anywhere" is an
+# exfiltration tunnel: DNS is where exfiltration is usually visible first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: pp-data-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Metrics scraping: ingress only, from pp-observability, on 9090. The scraped pod
+# gets no reciprocal egress — a scrape is a pull, and granting the target egress
+# back to the scraper would be a channel nobody needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: pp-data-plane
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pp-observability
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+# pp-automation: deny everything, both directions.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: pp-automation
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}          # every pod in the namespace
+  policyTypes: [Ingress, Egress]
+---
+# DNS is the only universally granted egress, and it is still scoped to the
+# kube-dns pods on ports 53 only. A blanket "allow UDP/53 to anywhere" is an
+# exfiltration tunnel: DNS is where exfiltration is usually visible first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: pp-automation
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Metrics scraping: ingress only, from pp-observability, on 9090. The scraped pod
+# gets no reciprocal egress — a scrape is a pull, and granting the target egress
+# back to the scraper would be a channel nobody needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: pp-automation
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pp-observability
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+# pp-platform: deny everything, both directions.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: pp-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}          # every pod in the namespace
+  policyTypes: [Ingress, Egress]
+---
+# DNS is the only universally granted egress, and it is still scoped to the
+# kube-dns pods on ports 53 only. A blanket "allow UDP/53 to anywhere" is an
+# exfiltration tunnel: DNS is where exfiltration is usually visible first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: pp-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Metrics scraping: ingress only, from pp-observability, on 9090. The scraped pod
+# gets no reciprocal egress — a scrape is a pull, and granting the target egress
+# back to the scraper would be a channel nobody needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: pp-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pp-observability
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+# pp-observability: deny everything, both directions.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}          # every pod in the namespace
+  policyTypes: [Ingress, Egress]
+---
+# DNS is the only universally granted egress, and it is still scoped to the
+# kube-dns pods on ports 53 only. A blanket "allow UDP/53 to anywhere" is an
+# exfiltration tunnel: DNS is where exfiltration is usually visible first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Metrics scraping: ingress only, from pp-observability, on 9090. The scraped pod
+# gets no reciprocal egress — a scrape is a pull, and granting the target egress
+# back to the scraper would be a channel nobody needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: pp-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pp-observability
+      ports:
+        - protocol: TCP
+          port: 9090

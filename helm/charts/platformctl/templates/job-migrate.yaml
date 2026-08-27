@@ -1,0 +1,36 @@
+{{- if .Values.migration.enabled }}
+{{/*
+The database migration Job. PreSync, not PostSync, and never an init container
+(deployment.md §3.3). It takes a Postgres advisory lock, applies pending
+migrations in order inside individual transactions, and records each in
+schema_migrations with its checksum, duration and the job identity.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "pp-common.fullname" . }}-migrate
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+    pp.job: migrate
+  annotations:
+    argocd.argoproj.io/hook: {{ .Values.migration.hook }}
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+    argocd.argoproj.io/sync-wave: {{ .Values.migration.syncWave | quote }}
+spec:
+  # A failed migration must NOT be retried blindly.
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.migration.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+{{- include "pp-common.labels" . | nindent 8 }}
+        pp.job: migrate
+    spec:
+{{- include "platformctl.jobPodSpec" (dict "ctx" . "args" (list
+      "migrate" "up"
+      (printf "--lock-timeout=%s" .Values.migration.lockTimeout)
+      (printf "--statement-timeout=%s" .Values.migration.statementTimeout)
+      (printf "--expect-version=%s" .Values.migration.expectVersion))) | nindent 6 }}
+{{- end }}

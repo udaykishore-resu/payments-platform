@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/envelope.schema.json",
+  "title": "Platform event envelope",
+  "description": "CloudEvents 1.0 structural compatibility plus required platform extensions. This is the published language across every bounded context and the one shape that must never break. Events are immutable, versioned in the type name, additive-only within a major version, and idempotently consumable - consumers deduplicate on (consumer_group, id). A breaking change is a new .v2 type published alongside .v1 until every consumer has migrated, never an in-place edit. The type-specific payload schema for `data` is `<type>.schema.json` in this directory, selected by the `type` field and resolvable from `dataschema`.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "type",
+    "source",
+    "subject",
+    "time",
+    "datacontenttype",
+    "dataschema",
+    "tenantid",
+    "correlationid",
+    "traceparent",
+    "aggregateid",
+    "aggregateversion",
+    "partitionkey",
+    "data"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "specversion": {
+      "description": "CloudEvents structural version. Identifies the envelope shape, not our event version - ours lives in the type name.",
+      "const": "1.0"
+    },
+    "id": {
+      "description": "Globally unique, time-ordered event identifier. THIS IS THE DEDUPLICATION KEY. A redelivery carries the same id and is byte-identical to the first delivery, because the relay republishes the stored envelope verbatim.",
+      "type": "string",
+      "pattern": "^evt_[0-9A-Z]{26}$"
+    },
+    "type": {
+      "description": "`<aggregate>.<past-tense-verb>.v<major>`. The major version is in the type name, not a header, so a consumer subscribing to .v1 can never be handed a .v2 payload.",
+      "type": "string",
+      "pattern": "^[a-z][a-z_]*\\.[a-z][a-z_]*\\.v[1-9][0-9]*$"
+    },
+    "source": {
+      "description": "`/payments-platform/<deployable>` - the producing binary. Used for provenance in incidents, never for routing.",
+      "type": "string",
+      "pattern": "^/payments-platform/[a-z0-9-]+$"
+    },
+    "subject": {
+      "description": "The business subject: the aggregate the event is about. Usually equals aggregateid; differs when an event about a child is published under its root, e.g. an attempt event carries subject=att_... and aggregateid=pay_....",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "time": {
+      "description": "When the fact OCCURRED in the producer's transaction - not when it was published and not when it was consumed. Derived from the domain, so a replayed event carries its original time. RFC 3339, millisecond precision, UTC, Z suffix.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "datacontenttype": {
+      "description": "Always application/json. Topics are also archived to S3 as JSON and read by humans during incidents.",
+      "const": "application/json"
+    },
+    "dataschema": {
+      "description": "Resolvable, immutable per version. The artifact the CI compatibility check runs against. Reusing a URI with different content fails the build.",
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://schemas\\.example\\.com/events/[a-z_]+\\.[a-z_]+\\.v[1-9][0-9]*\\.json$"
+    },
+    "tenantid": {
+      "description": "Present on EVERY event without exception. Consumers filter on it; Kafka ACLs and log views key off it. Platform-scoped events carry the platform tenant.",
+      "type": "string",
+      "pattern": "^ten_[0-9A-Z]{26}$"
+    },
+    "merchantid": {
+      "description": "Required for every merchant-scoped event. Absent only on platform-scoped events (gateway.health_changed.v1) and tenant-level audit records.",
+      "type": "string",
+      "pattern": "^mrc_[0-9A-Z]{26}$"
+    },
+    "correlationid": {
+      "description": "The originating request. Constant across the entire causal fan-out, so one API call's full consequences are one query.",
+      "type": "string",
+      "pattern": "^req_[0-9A-Z]{26}$"
+    },
+    "causationid": {
+      "description": "The id of the event or command that directly caused this one. Absent on events caused by an external API call, where correlationid covers the linkage. Together the two form the causation graph.",
+      "type": "string",
+      "pattern": "^evt_[0-9A-Z]{26}$"
+    },
+    "traceparent": {
+      "description": "W3C trace context propagated from the producing request, linking the event to the trace that produced it.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+    },
+    "aggregateid": {
+      "description": "The aggregate ROOT identifier.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "aggregateversion": {
+      "description": "The root's version AFTER this change. Monotonic per aggregate but NOT dense - a consumer that does not consume every type of an aggregate will legitimately see gaps. Use it to discard out-of-order and stale redeliveries, never to detect loss.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "partitionkey": {
+      "description": "The Kafka message key, fixed per topic by the event catalogue. Duplicated into the envelope so a consumer reading from an archive - where the Kafka key is gone - retains the ordering domain.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "data": {
+      "description": "The type-specific payload, validated against the schema named by `dataschema`. Never null; an event with no payload carries {}. Contains no PAN, no CVV, no track data, no secrets, no bank account numbers and no principal personal data.",
+      "type": "object"
+    }
+  },
+  "x-envelope-rules": {
+    "E1": "Events are immutable. There is no update, no correction and no delete. A wrong event is followed by a compensating event, never amended.",
+    "E2": "Events carry facts, not commands. A consumer that needs an instruction is missing an interface, not an event field.",
+    "E3": "No PAN, no CVV, no track data, no secrets, no bank account numbers, no principal PII in any payload. CI runs the PAN detector over every fixture in this directory.",
+    "E4": "Payloads carry IDs and enums, not embedded aggregates. An embedded copy is stale the moment it is written and creates a second, unversioned schema for someone else's aggregate.",
+    "E5": "Money is always {\"amount\": <int64 minor units>, \"currency\": \"<ISO 4217>\"}. Never a decimal string, never a float, never a bare integer without its currency.",
+    "E6": "Timestamps are RFC 3339 with millisecond precision in UTC with a Z suffix. No local offsets, no epoch integers.",
+    "E7": "Enum values are drawn from the domain's vocabulary, never from a gateway's. A gateway status string in a payload is an anti-corruption-layer failure.",
+    "E8": "Envelope size <= 256 KiB. Larger payloads carry a payloadRef object-storage URI."
+  },
+  "examples": [
+    {
+      "specversion": "1.0",
+      "id": "evt_01JB8Z9K2QW3E4R5T6Y7V8J9N0",
+      "type": "payment.authorized.v1",
+      "source": "/payments-platform/payment-orchestrator",
+      "subject": "pay_01JB8Z9K2QW3E4R5T6Y7V8J9N0",
+      "time": "2026-08-26T14:03:11.412Z",
+      "datacontenttype": "application/json",
+      "dataschema": "https://schemas.example.com/events/payment.authorized.v1.json",
+      "tenantid": "ten_01JB8Z00000000000000000000",
+      "merchantid": "mrc_01JB8Z11111111111111111111",
+      "correlationid": "req_01JB8Z22222222222222222222",
+      "causationid": "evt_01JB8Z33333333333333333333",
+      "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      "aggregateid": "pay_01JB8Z9K2QW3E4R5T6Y7V8J9N0",
+      "aggregateversion": 4,
+      "partitionkey": "pay_01JB8Z9K2QW3E4R5T6Y7V8J9N0",
+      "data": {
+        "attemptId": "att_01JB8Z44444444444444444444",
+        "gatewayCode": "stripe",
+        "authorizedAmount": { "amount": 1050, "currency": "USD" },
+        "gatewayReference": "pi_3OqZ4L2eZvKYlo2C",
+        "authorizationExpiresAt": "2026-09-02T14:03:11.000Z",
+        "threeDsStatus": "AUTHENTICATED",
+        "captureMode": "MANUAL"
+      }
+    },
+    {
+      "specversion": "1.0",
+      "id": "evt_01JB8ZWWWWWWWWWWWWWWWWWWWW",
+      "type": "gateway.health_changed.v1",
+      "source": "/payments-platform/payment-orchestrator",
+      "subject": "stripe",
+      "time": "2026-08-26T14:05:00.000Z",
+      "datacontenttype": "application/json",
+      "dataschema": "https://schemas.example.com/events/gateway.health_changed.v1.json",
+      "tenantid": "ten_00000000000000000000000000",
+      "correlationid": "req_01JB8ZXXXXXXXXXXXXXXXXXXXX",
+      "traceparent": "00-9c1f2e3d4b5a60718293a4b5c6d7e8f9-1a2b3c4d5e6f7081-01",
+      "aggregateid": "stripe",
+      "aggregateversion": 17,
+      "partitionkey": "stripe",
+      "data": {
+        "gatewayId": "stripe",
+        "gatewayCode": "stripe",
+        "operation": "AUTHORIZE",
+        "previousState": "HEALTHY",
+        "state": "DEGRADED",
+        "circuitState": "CLOSED",
+        "errorRate": 0.071,
+        "p99LatencyMs": 1840,
+        "sampleCount": 412,
+        "windowSeconds": 30,
+        "region": "eu-central-1",
+        "changedAt": "2026-08-26T14:05:00.000Z"
+      }
+    }
+  ]
+}

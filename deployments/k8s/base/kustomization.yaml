@@ -1,0 +1,31 @@
+# Cluster-scoped and shared resources only.
+#
+# What is deliberately NOT here: the nine deployables. Those are Helm charts
+# under helm/, deployed per (environment, service) by the ApplicationSet. The
+# split is by *lifecycle*, not by taste — everything in this base changes on the
+# order of once a quarter and is identical for every service, while a workload
+# changes several times a week and differs per service. Mixing them means every
+# image bump re-renders the namespace definitions.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespaces.yaml
+  - resourcequotas.yaml
+  - limitranges.yaml
+  - priorityclasses.yaml
+  - networkpolicies.yaml
+  - serviceaccounts.yaml
+  - otel-agent-daemonset.yaml
+  - otel-gateway-deployment.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: payments-platform
+      app.kubernetes.io/managed-by: kustomize
+
+# includeSelectors: false above matters: adding a label to an existing
+# Deployment's selector is an immutable-field error on apply. Kustomize's default
+# `commonLabels` does inject into selectors, which is a delete-and-recreate of
+# every workload the first time someone adds a label.

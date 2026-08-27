@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.activated.v1.json",
+  "title": "merchant.activated.v1",
+  "description": "A merchant reached ACTIVE and may now process live payments. Published by the Merchant Registry (BC-2) on pp.merchants.merchant.v1, keyed by merchant_id. The payload is deliberately a WARM-CACHE payload: it carries the certified connections, the active configuration version and the supported currencies and methods so the data plane can begin serving immediately rather than issuing a synchronous control-plane read on its first payment.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "previousState",
+    "certifiedConnections",
+    "configurationVersion",
+    "supportedCurrencies",
+    "supportedPaymentMethods",
+    "activatedAt",
+    "activatedBy"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "previousState": {
+      "description": "PRODUCTION_READY for a first activation, SUSPENDED for a resume. The two are materially different to a consumer: a resume must not re-run first-activation side effects such as welcome notifications.",
+      "type": "string",
+      "enum": ["PRODUCTION_READY", "SUSPENDED"]
+    },
+    "certifiedConnections": {
+      "description": "What the data plane may route to. A connection absent here is not routable, whatever the configuration says.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/certifiedConnection" }
+    },
+    "configurationVersion": {
+      "description": "The active configuration version at activation, so a cache can detect that it holds an older document.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "supportedCurrencies": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "pattern": "^[A-Z]{3}$" }
+    },
+    "supportedPaymentMethods": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,31}$" }
+    },
+    "activatedAt": { "type": "string", "format": "date-time" },
+    "activatedBy": {
+      "description": "Actor identifier: a console user, an API client, or system:<component>.",
+      "type": "string",
+      "maxLength": 128
+    }
+  },
+  "$defs": {
+    "certifiedConnection": {
+      "title": "Certified connection",
+      "type": "object",
+      "required": ["connectionId", "gatewayCode", "environment"],
+      "additionalProperties": false,
+      "properties": {
+        "connectionId": { "type": "string", "pattern": "^gwc_[0-9A-Z]{26}$" },
+        "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+        "environment": { "type": "string", "enum": ["SANDBOX", "PRODUCTION"] }
+      }
+    }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "control-plane-api",
+  "x-context": "BC-2 Merchant Registry",
+  "x-consumers": ["Data plane cache", "Audit", "Notification"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "previousState": "route-to-dlq" },
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "previousState": "PRODUCTION_READY",
+      "certifiedConnections": [
+        {
+          "connectionId": "gwc_01JB8Z88888888888888888888",
+          "gatewayCode": "adyen",
+          "environment": "PRODUCTION"
+        }
+      ],
+      "configurationVersion": 7,
+      "supportedCurrencies": ["EUR", "USD"],
+      "supportedPaymentMethods": ["CARD", "IDEAL"],
+      "activatedAt": "2026-08-27T19:00:00.512Z",
+      "activatedBy": "usr_ops_2291"
+    }
+  ]
+}

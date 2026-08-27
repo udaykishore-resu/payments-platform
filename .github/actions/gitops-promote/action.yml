@@ -1,0 +1,242 @@
+# .github/actions/gitops-promote — open (and optionally merge) an image-digest promotion PR
+# against the GitOps repository.
+#
+# Factored out of cd.yml because the same operation happens three times with one word
+# different, and three copies of a git-clone-edit-commit-push sequence is three places for
+# the digest handling to diverge. It is a composite action rather than a script so that the
+# inputs are typed and the call sites read as what they are.
+#
+# WHAT IT DOES, AND WHY IT IS THE ONLY WRITE CI PERFORMS
+#   deployment.md §3.1: CI's write access to production is confined to "may open a PR that
+#   changes an image digest in environments/prod/image-versions.yaml". It holds no cluster
+#   credentials at all. This action is the whole of that capability — it edits one file,
+#   commits, and opens a pull request. ArgoCD pulls the merged result; nothing here pushes
+#   to a cluster.
+#
+#   The consequence worth stating plainly: a compromised CI run can propose a bad digest.
+#   It cannot deploy one. The approvals on the production promotion PR are the control, and
+#   they are a control precisely because this action cannot bypass them.
+#
+# DIGESTS, NOT TAGS
+#   §3.5 rule 1: the artifact never changes. The file this action writes pins
+#   `sha256:…` per service, and the manifests reference the digest. A tag is a pointer that
+#   can be moved after review; a digest is the bytes that were reviewed.
+
+name: gitops-promote
+description: Open a GitOps pull request pinning image digests for one environment
+
+inputs:
+  gitops_repo:
+    description: "owner/name of the GitOps repository"
+    required: true
+  environment:
+    description: "dev | staging | prod"
+    required: true
+  digests_dir:
+    description: "Directory of digest-<service>.txt files, each containing service=sha256:…"
+    required: true
+  image_repo:
+    description: "Registry path prefix, e.g. ghcr.io/org/payments-platform"
+    required: true
+  commit:
+    description: "Application-repo commit SHA being promoted"
+    required: true
+  version:
+    description: "Human-readable version being promoted"
+    required: true
+  auto_merge:
+    description: "true to enable auto-merge (dev and staging); false for production"
+    required: false
+    default: "false"
+  token:
+    description: "Token with pull-request write on the GitOps repository. Nothing more."
+    required: true
+
+outputs:
+  pr_url:
+    description: "URL of the promotion pull request"
+    value: ${{ steps.open.outputs.pr_url }}
+  gitops_sha:
+    description: "Commit SHA created in the GitOps repository"
+    value: ${{ steps.open.outputs.gitops_sha }}
+
+runs:
+  using: composite
+  steps:
+    - id: open
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GITOPS_REPO: ${{ inputs.gitops_repo }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        DIGESTS_DIR: ${{ inputs.digests_dir }}
+        IMAGE_REPO: ${{ inputs.image_repo }}
+        APP_COMMIT: ${{ inputs.commit }}
+        APP_VERSION: ${{ inputs.version }}
+        AUTO_MERGE: ${{ inputs.auto_merge }}
+      run: |
+        set -euo pipefail
+
+        case "$ENVIRONMENT" in
+          dev|staging|prod) ;;
+          *) echo "::error::environment must be dev, staging or prod (got '$ENVIRONMENT')"; exit 1 ;;
+        esac
+
+        shopt -s nullglob
+        files=("$DIGESTS_DIR"/digest-*.txt)
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "::error::no digest files in $DIGESTS_DIR — nothing to promote"
+          exit 1
+        fi
+
+        # Every digest must be a real sha256. A promotion file containing a tag, an empty
+        # string or the literal 'null' is how a cluster ends up running whatever `latest`
+        # pointed at when it happened to pull, and it is silent.
+        declare -A DIGEST=()
+        for f in "${files[@]}"; do
+          entry="$(tr -d '[:space:]' < "$f")"
+          svc="${entry%%=*}"; dg="${entry#*=}"
+          if [[ ! "$dg" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::$f does not contain a valid digest (got '$dg')"
+            exit 1
+          fi
+          DIGEST["$svc"]="$dg"
+        done
+        echo "promoting ${#DIGEST[@]} service(s) to $ENVIRONMENT"
+
+        workdir="$(mktemp -d)"
+        git clone --depth 1 \
+          "https://x-access-token:${GH_TOKEN}@github.com/${GITOPS_REPO}.git" "$workdir/gitops"
+        cd "$workdir/gitops"
+        git config user.name  "payments-platform-ci"
+        git config user.email "ci@users.noreply.github.com"
+
+        target="environments/${ENVIRONMENT}/image-versions.yaml"
+        mkdir -p "$(dirname "$target")"
+        [ -f "$target" ] || printf 'images: {}\n' > "$target"
+
+        # The digests are handed to python through the environment rather than as
+        # arguments: a service name is shell-safe but a future one might not be, and an
+        # argument list is one quoting mistake away from being interpreted.
+        for svc in "${!DIGEST[@]}"; do
+          export "PROMOTE_${svc//-/_}=${DIGEST[$svc]}"
+        done
+
+        # The file is rewritten with python rather than sed. A sed script that edits YAML by
+        # line pattern works until the day a service name is a prefix of another one, and
+        # then it silently pins the wrong image — which is exactly the failure this whole
+        # digest-pinning apparatus exists to prevent.
+        python3 - "$target" <<'PY'
+        import os, sys, datetime
+        try:
+            import yaml
+        except ImportError:
+            sys.exit("PyYAML is required in the promotion runner")
+
+        path = sys.argv[1]
+        with open(path) as fh:
+            doc = yaml.safe_load(fh) or {}
+        images = doc.setdefault("images", {}) or {}
+
+        repo = os.environ["IMAGE_REPO"]
+        env  = os.environ["ENVIRONMENT"]
+
+        changed = []
+        for key, value in os.environ.items():
+            if not key.startswith("PROMOTE_"):
+                continue
+            svc = key[len("PROMOTE_"):].replace("_", "-")
+            entry = images.get(svc) or {}
+            if entry.get("digest") != value:
+                changed.append((svc, entry.get("digest"), value))
+            entry["repository"] = f"{repo}/{svc}"
+            entry["digest"] = value
+            entry["appVersion"] = os.environ["APP_VERSION"]
+            entry["sourceCommit"] = os.environ["APP_COMMIT"]
+            entry["promotedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds").replace("+00:00", "Z")
+            images[svc] = entry
+
+        doc["images"] = images
+        doc["environment"] = env
+
+        with open(path, "w") as fh:
+            fh.write(
+                "# GENERATED by .github/actions/gitops-promote — do not edit by hand.\n"
+                "#\n"
+                "# Each entry pins an image by DIGEST, never by tag (deployment.md §3.5\n"
+                "# rule 2). The same digest travels dev -> staging -> prod unchanged: the\n"
+                "# artifact that passed the dev e2e suite is the artifact production runs.\n"
+                "#\n"
+                "# Changing a digest here is a deployment. Review it as one.\n\n"
+            )
+            yaml.safe_dump(doc, fh, sort_keys=True, default_flow_style=False)
+
+        if changed:
+            print("changed:")
+            for svc, old, new in changed:
+                print(f"  {svc}: {old or '(new)'} -> {new}")
+        else:
+            print("no digest changed")
+        PY
+
+        if git diff --quiet -- "$target"; then
+          echo "::notice::$ENVIRONMENT already pins these digests; no promotion PR needed"
+          echo "pr_url=" >> "$GITHUB_OUTPUT"
+          echo "gitops_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        branch="promote/${ENVIRONMENT}/${APP_COMMIT::7}"
+        git checkout -b "$branch"
+        git add "$target"
+
+        body_file="$(mktemp)"
+        {
+          echo "Promotes application commit \`${APP_COMMIT}\` (\`${APP_VERSION}\`) to **${ENVIRONMENT}**."
+          echo
+          echo "| service | digest |"
+          echo "|---|---|"
+          for svc in $(printf '%s\n' "${!DIGEST[@]}" | sort); do
+            echo "| \`${svc}\` | \`${DIGEST[$svc]}\` |"
+          done
+          echo
+          echo "Every digest above is cosign-signed by the \`cd.yml\` workflow on \`main\`"
+          echo "and carries a CycloneDX SBOM attestation and SLSA provenance. The prod"
+          echo "cluster's Kyverno \`verifyImages\` policy checks the same signature at"
+          echo "admission, so an image that reached the registry by any other route is not"
+          echo "admissible regardless of what this file says."
+          echo
+          echo "Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        } > "$body_file"
+
+        git commit -F - <<COMMIT
+        promote(${ENVIRONMENT}): ${APP_VERSION} @ ${APP_COMMIT::7}
+
+        $(cat "$body_file")
+        COMMIT
+
+        git push origin "$branch"
+
+        pr_url=$(gh pr create \
+          --repo "$GITOPS_REPO" \
+          --base main \
+          --head "$branch" \
+          --title "promote(${ENVIRONMENT}): ${APP_VERSION} @ ${APP_COMMIT::7}" \
+          --body-file "$body_file" \
+          --label "promotion,${ENVIRONMENT}")
+
+        echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
+        echo "gitops_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        echo "opened ${pr_url}"
+
+        if [ "$AUTO_MERGE" = "true" ]; then
+          # Auto-merge, not an immediate merge: the GitOps repository's own required checks
+          # (kubeconform on the rendered manifests, the Kyverno policy check) still have to
+          # pass. Merging directly would bypass exactly the validation that makes a GitOps
+          # repository safer than kubectl.
+          gh pr merge --repo "$GITOPS_REPO" --squash --auto "$pr_url"
+          echo "auto-merge enabled"
+        else
+          echo "::notice::${ENVIRONMENT} promotion requires manual approval — the PR is open at ${pr_url}"
+        fi

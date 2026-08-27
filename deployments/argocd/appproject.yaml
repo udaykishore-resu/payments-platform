@@ -1,0 +1,171 @@
+# One AppProject per environment. A project is the only place where "what may
+# this set of Applications touch" is expressible, and the three environments have
+# genuinely different answers.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: pp-prod
+  namespace: argocd
+  finalizers:
+    # Without this, deleting the project orphans its Applications' resources in
+    # the cluster and Argo forgets it ever owned them.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: Production workloads, eu-west-1 (active) and eu-central-1 (passive).
+  sourceRepos:
+    - https://github.com/example/payments-platform-gitops
+    - https://github.com/example/payments-platform
+  destinations:
+    - name: prod-eu-west-1
+      namespace: pp-data-plane
+    - name: prod-eu-west-1
+      namespace: pp-control-plane
+    - name: prod-eu-west-1
+      namespace: pp-automation
+    - name: prod-eu-west-1
+      namespace: pp-observability
+    - name: prod-eu-west-1
+      namespace: pp-platform
+    - name: prod-eu-central-1
+      namespace: pp-data-plane
+    - name: prod-eu-central-1
+      namespace: pp-control-plane
+    - name: prod-eu-central-1
+      namespace: pp-automation
+    - name: prod-eu-central-1
+      namespace: pp-observability
+    - name: prod-eu-central-1
+      namespace: pp-platform
+  # Cluster-scoped kinds this project may manage. Enumerated, not wildcarded:
+  # an ApplicationSet that can create ClusterRoles can grant itself anything.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: scheduling.k8s.io
+      kind: PriorityClass
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: kyverno.io
+      kind: ClusterPolicy
+  clusterResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+  namespaceResourceBlacklist:
+    # ResourceQuota and LimitRange are the cost and blast-radius controls. They
+    # are applied by the platform team's own Application, and a workload
+    # Application must not be able to raise its own ceiling.
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+  roles:
+    - name: read-only
+      description: Everyone. Production is readable by default and writable by nobody.
+      policies:
+        - p, proj:pp-prod:read-only, applications, get, pp-prod/*, allow
+      groups:
+        - payments-platform:engineering
+    - name: sre-sync
+      description: >-
+        Trigger a sync and abort a rollout. Deliberately excludes `delete` and
+        `override`: the break-glass path for anything destructive is a PR, which
+        takes ninety seconds and leaves a record.
+      policies:
+        - p, proj:pp-prod:sre-sync, applications, sync, pp-prod/*, allow
+        - p, proj:pp-prod:sre-sync, applications, action/argoproj.io/Rollout/abort, pp-prod/*, allow
+      groups:
+        - payments-platform:sre
+  syncWindows:
+    # Deploys are blocked outside business hours and on Fridays after noon. Not
+    # because deploying is dangerous, but because *diagnosing* a bad deploy at
+    # 02:00 on a Saturday with one person awake is. A manual override exists and
+    # is audited.
+    - kind: deny
+      schedule: "0 18 * * 1-4"
+      duration: 14h
+      applications:
+        - "*"
+      manualSync: true
+    - kind: deny
+      schedule: "0 12 * * 5"
+      duration: 68h
+      applications:
+        - "*"
+      manualSync: true
+  orphanedResources:
+    # Warn, never delete. An orphan in production is a question, not a
+    # self-service cleanup task.
+    warn: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: pp-staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: Staging. Production-shaped, synthetic data only.
+  sourceRepos:
+    - https://github.com/example/payments-platform-gitops
+    - https://github.com/example/payments-platform
+  destinations:
+    - name: staging-eu-west-1
+      namespace: "pp-*"
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: scheduling.k8s.io
+      kind: PriorityClass
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: kyverno.io
+      kind: ClusterPolicy
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+  roles:
+    - name: developer-read
+      policies:
+        - p, proj:pp-staging:developer-read, applications, get, pp-staging/*, allow
+      groups:
+        - payments-platform:engineering
+    - name: sre-write
+      policies:
+        - p, proj:pp-staging:sre-write, applications, *, pp-staging/*, allow
+      groups:
+        - payments-platform:sre
+  orphanedResources:
+    warn: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: pp-dev
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: Dev and ephemeral PR previews. Relaxed guardrails, hard cost caps.
+  sourceRepos:
+    - "*"
+  destinations:
+    - name: dev-eu-west-1
+      namespace: "pp-*"
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  roles:
+    - name: developer-admin
+      description: Developers have admin in dev. The guardrail here is the budget, not RBAC.
+      policies:
+        - p, proj:pp-dev:developer-admin, applications, *, pp-dev/*, allow
+      groups:
+        - payments-platform:engineering
+  orphanedResources:
+    # Dev accumulates orphans from deleted preview branches; warning on them is
+    # noise nobody acts on.
+    warn: false

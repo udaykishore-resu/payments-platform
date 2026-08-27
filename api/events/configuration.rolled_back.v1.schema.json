@@ -1,0 +1,541 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/configuration.rolled_back.v1.json",
+  "title": "configuration.rolled_back.v1",
+  "description": "A merchant configuration was rolled back to an earlier version. Produced by Configuration & Policy (BC-5) on pp.config.configuration.v1, keyed by merchant_id. A rollback is an APPEND, never a deletion: the restored document is published as a NEW version n+1, so the version being abandoned stays in the history. This event is the audit and operator signal; a configuration.published.v1 is emitted alongside it and is what the data plane's ordinary handler consumes, so rollback needs no special path in the data plane. The target document is re-validated at rollback time rather than trusted because it was valid when first published - a gateway may since have been de-registered or a certification expired, and restoring a document the data plane cannot honour would turn an attempted recovery into an outage.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "configurationId",
+    "configurationVersionId",
+    "version",
+    "rolledBackFrom",
+    "restoredFrom",
+    "document",
+    "documentChecksum",
+    "reason",
+    "rolledBackBy",
+    "rolledBackAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": {
+      "type": "string",
+      "pattern": "^mrc_[0-9A-Z]{26}$"
+    },
+    "configurationId": {
+      "description": "Stable identifier of the merchant's configuration record across versions.",
+      "type": "string",
+      "pattern": "^cfg_[0-9A-Z]{26}$"
+    },
+    "configurationVersionId": {
+      "description": "Identifier of the NEW version created by this rollback.",
+      "type": "string",
+      "pattern": "^cfv_[0-9A-Z]{26}$"
+    },
+    "version": {
+      "description": "The NEW version number. A rollback increments; it never rewinds the counter.",
+      "type": "integer",
+      "minimum": 2
+    },
+    "rolledBackFrom": {
+      "description": "The version being abandoned.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "restoredFrom": {
+      "description": "The version whose document was re-published. The new version's checksum equals this version's checksum, which is the machine-checkable proof that the rollback is faithful.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "environment": {
+      "type": "string",
+      "enum": [
+        "sandbox",
+        "production"
+      ]
+    },
+    "document": {
+      "$ref": "#/$defs/configurationDocument"
+    },
+    "documentChecksum": {
+      "description": "sha256 of the JCS-canonical document. Equal to the restored version's checksum by construction.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "reason": {
+      "description": "Why the rollback was performed. Required: an unexplained production rollback is an incident nobody can reconstruct later.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "rolledBackBy": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "rolledBackAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": [
+        "amount",
+        "currency"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "amount": {
+          "type": "integer"
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      }
+    },
+    "configurationDocument": {
+      "title": "Merchant configuration document",
+      "description": "The canonical desired-state document, complete.",
+      "type": "object",
+      "required": [
+        "merchantId",
+        "version",
+        "status",
+        "environment",
+        "supportedCurrencies",
+        "paymentMethods",
+        "countries",
+        "routing",
+        "risk",
+        "limits",
+        "settlement"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "merchantId": {
+          "type": "string",
+          "pattern": "^mrc_[0-9A-Z]{26}$"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "DRAFT",
+            "ACTIVE",
+            "SUPERSEDED",
+            "ROLLED_BACK"
+          ]
+        },
+        "environment": {
+          "type": "string",
+          "enum": [
+            "sandbox",
+            "production"
+          ]
+        },
+        "supportedCurrencies": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z]{3}$"
+          }
+        },
+        "paymentMethods": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{1,31}$"
+          }
+        },
+        "countries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z]{2}$"
+          }
+        },
+        "routing": {
+          "type": "object",
+          "required": [
+            "strategy",
+            "primary"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": [
+                "PRIORITY_WITH_FALLBACK",
+                "WEIGHTED",
+                "LEAST_COST",
+                "LOWEST_LATENCY"
+              ]
+            },
+            "primary": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{1,31}$"
+            },
+            "fallback": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]{1,31}$"
+              }
+            },
+            "rules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "when",
+                  "then"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "when": {
+                    "type": "object"
+                  },
+                  "then": {
+                    "type": "object"
+                  }
+                }
+              }
+            },
+            "weights": {
+              "description": "Must sum to 1.0. A set that does not is rejected by L4 rather than normalised: silent normalisation hides a typo that changes traffic distribution.",
+              "type": "object",
+              "required": [
+                "health",
+                "successRate",
+                "cost",
+                "latency"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "health": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "successRate": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "cost": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "latency": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            }
+          }
+        },
+        "risk": {
+          "type": "object",
+          "required": [
+            "maxTransactionAmount",
+            "dailyVolumeLimit",
+            "velocity"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "maxTransactionAmount": {
+              "$ref": "#/$defs/money"
+            },
+            "require3DSAbove": {
+              "$ref": "#/$defs/money"
+            },
+            "dailyVolumeLimit": {
+              "$ref": "#/$defs/money"
+            },
+            "velocity": {
+              "type": "object",
+              "required": [
+                "maxPaymentsPerMinute",
+                "maxPerCardPerHour"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "maxPaymentsPerMinute": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "maxPerCardPerHour": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            "blockedCountries": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Z]{2}$"
+              }
+            },
+            "fallbackDecision": {
+              "type": "string",
+              "enum": [
+                "ALLOW",
+                "REQUIRE_3DS",
+                "DECLINE"
+              ]
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "required": [
+            "maxRefundWindowDays",
+            "maxPartialCaptures"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "maxRefundWindowDays": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxPartialCaptures": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "webhooks": {
+          "type": "object",
+          "required": [
+            "endpoints",
+            "retryPolicy"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "endpoints": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "url",
+                  "events",
+                  "secretRef"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "pattern": "^https://"
+                  },
+                  "events": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "secretRef": {
+                    "description": "A secrets-manager path. The secret itself never appears in a configuration document, an event or a log line.",
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "active": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "retryPolicy": {
+              "type": "object",
+              "required": [
+                "maxAttempts",
+                "backoff"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "maxAttempts": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "backoff": {
+                  "type": "string",
+                  "enum": [
+                    "EXPONENTIAL_JITTER",
+                    "EXPONENTIAL",
+                    "LINEAR"
+                  ]
+                },
+                "initialDelaySeconds": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "maxDelaySeconds": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          }
+        },
+        "settlement": {
+          "type": "object",
+          "required": [
+            "schedule",
+            "currency",
+            "holdDays"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "schedule": {
+              "type": "string",
+              "enum": [
+                "DAILY",
+                "WEEKLY",
+                "BIWEEKLY",
+                "MONTHLY",
+                "MANUAL"
+              ]
+            },
+            "currency": {
+              "type": "string",
+              "pattern": "^[A-Z]{3}$"
+            },
+            "holdDays": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "weeklyAnchorDay": {
+              "type": "string"
+            }
+          }
+        },
+        "featureFlags": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  },
+  "x-topic": "pp.config.configuration.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "control-plane-api",
+  "x-context": "BC-5 Configuration & Policy",
+  "x-consumers": [
+    "Data plane cache",
+    "Audit"
+  ],
+  "x-revision": 1,
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "configurationId": "cfg_01JB8ZBBBBBBBBBBBBBBBBBBBB",
+      "configurationVersionId": "cfv_01JB8ZDDDDDDDDDDDDDDDDDDDD",
+      "version": 8,
+      "rolledBackFrom": 7,
+      "restoredFrom": 6,
+      "environment": "production",
+      "document": {
+        "merchantId": "mrc_01JB8Z11111111111111111111",
+        "version": 8,
+        "status": "ACTIVE",
+        "environment": "production",
+        "supportedCurrencies": [
+          "EUR",
+          "USD"
+        ],
+        "paymentMethods": [
+          "CARD",
+          "IDEAL"
+        ],
+        "countries": [
+          "DE",
+          "NL"
+        ],
+        "routing": {
+          "strategy": "PRIORITY_WITH_FALLBACK",
+          "primary": "adyen",
+          "fallback": [
+            "stripe"
+          ],
+          "rules": [],
+          "weights": {
+            "health": 0.4,
+            "successRate": 0.3,
+            "cost": 0.2,
+            "latency": 0.1
+          }
+        },
+        "risk": {
+          "maxTransactionAmount": {
+            "amount": 1000000,
+            "currency": "EUR"
+          },
+          "require3DSAbove": {
+            "amount": 50000,
+            "currency": "EUR"
+          },
+          "dailyVolumeLimit": {
+            "amount": 50000000,
+            "currency": "EUR"
+          },
+          "velocity": {
+            "maxPaymentsPerMinute": 300,
+            "maxPerCardPerHour": 5
+          },
+          "blockedCountries": [
+            "KP",
+            "IR"
+          ]
+        },
+        "limits": {
+          "maxRefundWindowDays": 180,
+          "maxPartialCaptures": 5
+        },
+        "webhooks": {
+          "endpoints": [
+            {
+              "url": "https://hooks.acme.example/pp/events",
+              "events": [
+                "payment.*"
+              ],
+              "secretRef": "/production/ten_01JB8Z00000000000000000000/mrc_01JB8Z11111111111111111111/webhook-signing",
+              "active": true
+            }
+          ],
+          "retryPolicy": {
+            "maxAttempts": 8,
+            "backoff": "EXPONENTIAL_JITTER"
+          }
+        },
+        "settlement": {
+          "schedule": "DAILY",
+          "currency": "EUR",
+          "holdDays": 2
+        },
+        "featureFlags": {
+          "networkTokens": true,
+          "partialCapture": true
+        }
+      },
+      "documentChecksum": "b4e011224f7a9c3d6e8b0a2f5c7d9e1b3a5c7e9f1d3b5a7c9e1f3d5b7a9c1e30",
+      "reason": "Routing weights caused authorization-rate regression, INC-4471",
+      "rolledBackBy": "usr_ops_2291",
+      "rolledBackAt": "2026-08-27T21:04:00.190Z"
+    }
+  ]
+}

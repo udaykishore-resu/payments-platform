@@ -1,0 +1,369 @@
+# One Application per (environment, service).
+#
+# A matrix generator over {clusters} x {services}: 3 clusters x 8 deployables =
+# 24 Applications, each pointing at one subchart. The alternative — one
+# Application for the umbrella chart — was rejected because a render error in one
+# subchart would then block the sync of all eight, and because rolling back one
+# service would mean rolling back the release.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: pp-services
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  # Preserve a live Application whose generator element disappears, rather than
+  # deleting it. A typo in the elements list must not delete production.
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+  strategy:
+    type: RollingSync
+    rollingSync:
+      steps:
+        # Sync in wave order, and require each step healthy before the next.
+        # Wave 0 is the migration Application: the schema must be forward-
+        # compatible before a single new pod starts.
+        - matchExpressions:
+            - key: pp.wave
+              operator: In
+              values: ["0"]
+        - matchExpressions:
+            - key: pp.wave
+              operator: In
+              values: ["2"]
+        - matchExpressions:
+            - key: pp.wave
+              operator: In
+              values: ["3"]
+  generators:
+    - matrix:
+        generators:
+          - list:
+              elements:
+                - cluster: prod-eu-west-1
+                  env: prod
+                  region: eu-west-1
+                  active: "true"
+                  project: pp-prod
+                  # Production self-heals. A `kubectl edit` made during an
+                  # incident is reverted within minutes, and that is intentional:
+                  # undocumented drift is how "re-apply Git and you have the
+                  # cluster back" quietly stops being true. Emergency changes go
+                  # through a break-glass PR with a one-approver rule.
+                  selfHeal: true
+                  # Prune is ON in prod. A resource removed from Git and left
+                  # running is a resource nobody reviews, nobody patches and
+                  # nobody can explain during an audit.
+                  prune: true
+                - cluster: prod-eu-central-1
+                  env: prod
+                  region: eu-central-1
+                  active: "false"
+                  project: pp-prod
+                  selfHeal: true
+                  prune: true
+                - cluster: staging-eu-west-1
+                  env: staging
+                  region: eu-west-1
+                  active: "true"
+                  project: pp-staging
+                  selfHeal: true
+                  prune: true
+                - cluster: dev-eu-west-1
+                  env: dev
+                  region: eu-west-1
+                  active: "true"
+                  project: pp-dev
+                  # Dev does NOT self-heal. Developers have admin in dev and
+                  # debug by editing live objects; a controller that reverts
+                  # their edit every three minutes makes the cluster unusable for
+                  # the one thing dev is for. The cost is drift, which is
+                  # acceptable because dev's state is disposable.
+                  selfHeal: false
+                  # Prune is off in dev for the same reason: a developer's
+                  # scratch object should survive the next sync.
+                  prune: false
+          - list:
+              elements:
+                # Wave 0: migrations. Nothing else may start until the schema is
+                # at the expected version.
+                - app: platformctl
+                  namespace: pp-control-plane
+                  wave: "0"
+                # Wave 2: the request-serving tier.
+                - app: payment-api
+                  namespace: pp-data-plane
+                  wave: "2"
+                - app: payment-orchestrator
+                  namespace: pp-data-plane
+                  wave: "2"
+                - app: webhook-ingress
+                  namespace: pp-data-plane
+                  wave: "2"
+                - app: control-plane-api
+                  namespace: pp-control-plane
+                  wave: "2"
+                # Wave 3: the async tier, after its producers are healthy.
+                - app: outbox-relay
+                  namespace: pp-data-plane
+                  wave: "3"
+                - app: event-consumer
+                  namespace: pp-data-plane
+                  wave: "3"
+                - app: workflow-worker
+                  namespace: pp-automation
+                  wave: "3"
+  # templatePatch is rendered as a Go template and merged over the Application
+  # produced by `template`. It is the only way to set a BOOLEAN field per
+  # generator element: `prune: {{.prune}}` inside `template` is not valid YAML,
+  # and a quoted string does not coerce into Application.spec's typed bool.
+  templatePatch: |
+    spec:
+      syncPolicy:
+        automated:
+          prune: {{ .prune }}
+          selfHeal: {{ .selfHeal }}
+  template:
+    metadata:
+      name: '{{.app}}-{{.cluster}}'
+      labels:
+        pp.wave: '{{.wave}}'
+        pp.env: '{{.env}}'
+        pp.app: '{{.app}}'
+      annotations:
+        argocd.argoproj.io/sync-wave: '{{.wave}}'
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: pp-deploys
+        notifications.argoproj.io/subscribe.on-health-degraded.slack: pp-deploys
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: '{{.project}}'
+      sources:
+        - repoURL: https://github.com/example/payments-platform
+          targetRevision: main
+          path: 'helm/charts/{{.app}}'
+          helm:
+            releaseName: '{{.app}}'
+            valueFiles:
+              # $values resolves against the GitOps repo below, so the chart
+              # stays in the application repo and the *configuration* stays in
+              # the deployment repo. CI's write access to production is confined
+              # to "may open a PR that changes an image digest".
+              - $values/environments/{{.env}}/values-{{.app}}.yaml
+              - $values/environments/{{.env}}/image-versions-{{.app}}.yaml
+            parameters:
+              - name: global.environment
+                value: '{{.env}}'
+              - name: global.region
+                value: '{{.region}}'
+              - name: global.regionActive
+                value: '{{.active}}'
+              - name: global.clusterName
+                value: '{{.cluster}}'
+        - repoURL: https://github.com/example/payments-platform-gitops
+          targetRevision: main
+          ref: values
+      destination:
+        name: '{{.cluster}}'
+        namespace: '{{.namespace}}'
+      syncPolicy:
+        automated:
+          # prune / selfHeal are set per environment by templatePatch below.
+          # They cannot be templated here: `prune: {{.prune}}` is not valid YAML
+          # (a `{{` opens a flow mapping), and Application.spec is a typed
+          # object, so a quoted string would not coerce to the boolean field.
+          # templatePatch exists precisely for this — it is a string field whose
+          # rendered result is merged as YAML.
+          prune: false
+          selfHeal: false
+          # Never sync an empty manifest set. An empty render is almost always a
+          # broken values file, and with prune on it would delete the workload.
+          allowEmpty: false
+        syncOptions:
+          # Namespaces come from the Kustomize base in a separate Application,
+          # applied at wave -2. A workload Application creating its own namespace
+          # would race the ResourceQuota and the PodSecurity labels, and pods
+          # admitted before those labels exist bypass restricted enforcement.
+          - CreateNamespace=false
+          - ApplyOutOfSyncOnly=true
+          # Server-side apply: these manifests exceed the 256KB
+          # last-applied-configuration annotation limit, and SSA gives field
+          # ownership, so Argo and the HPA can each own `replicas` without a
+          # fight.
+          - ServerSideApply=true
+          - RespectIgnoreDifferences=true
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 5m
+      ignoreDifferences:
+        # The HPA and KEDA own the live replica count. Without this, every scale
+        # event marks the Application OutOfSync and selfHeal fights the
+        # autoscaler — the classic GitOps-vs-HPA flap.
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas
+        - group: argoproj.io
+          kind: Rollout
+          jsonPointers:
+            - /spec/replicas
+---
+# Platform and observability: cluster-scoped resources from the Kustomize
+# overlays, at wave -2, before anything references them.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: pp-platform-base
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+  generators:
+    - list:
+        elements:
+          - cluster: prod-eu-west-1
+            env: prod
+            project: pp-prod
+            selfHeal: true
+            prune: false
+          - cluster: prod-eu-central-1
+            env: prod
+            project: pp-prod
+            selfHeal: true
+            prune: false
+          - cluster: staging-eu-west-1
+            env: staging
+            project: pp-staging
+            selfHeal: true
+            prune: false
+          - cluster: dev-eu-west-1
+            env: dev
+            project: pp-dev
+            selfHeal: false
+            prune: false
+  templatePatch: |
+    spec:
+      syncPolicy:
+        automated:
+          selfHeal: {{ .selfHeal }}
+  template:
+    metadata:
+      name: 'platform-base-{{.cluster}}'
+      annotations:
+        argocd.argoproj.io/sync-wave: "-2"
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: pp-deploys
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: '{{.project}}'
+      source:
+        repoURL: https://github.com/example/payments-platform
+        targetRevision: main
+        path: 'deployments/k8s/overlays/{{.env}}'
+      destination:
+        name: '{{.cluster}}'
+        namespace: pp-platform
+      syncPolicy:
+        automated:
+          # selfHeal is set per environment by templatePatch below.
+          #
+          # PRUNE IS OFF HERE, IN EVERY ENVIRONMENT, INCLUDING PRODUCTION.
+          #
+          # This Application owns Namespaces, PriorityClasses, ResourceQuotas and
+          # the default-deny NetworkPolicies. Pruning a Namespace cascades to
+          # everything inside it; pruning a PriorityClass leaves every pod that
+          # names it unschedulable at the next reschedule; pruning a default-deny
+          # NetworkPolicy silently opens the data plane. None of those failures
+          # is recoverable by "sync again".
+          #
+          # Removing one of these is a deliberate two-step: merge the removal,
+          # then delete it by hand with a named ticket.
+          prune: false
+          selfHeal: false
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=false
+          - ServerSideApply=true
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 5m
+---
+# Observability rules and dashboards. Separate from the workloads so a dashboard
+# edit cannot fail a payment-api sync, and so the rules can be applied to a
+# cluster that is not yet running any workload.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: pp-observability
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - matrix:
+        generators:
+          - list:
+              elements:
+                - cluster: prod-eu-west-1
+                  env: prod
+                  project: pp-prod
+                - cluster: prod-eu-central-1
+                  env: prod
+                  project: pp-prod
+                - cluster: staging-eu-west-1
+                  env: staging
+                  project: pp-staging
+                - cluster: dev-eu-west-1
+                  env: dev
+                  project: pp-dev
+          - list:
+              elements:
+                - component: prometheus
+                  path: deployments/prometheus
+                - component: grafana
+                  path: deployments/grafana
+  template:
+    metadata:
+      name: '{{.component}}-{{.cluster}}'
+      annotations:
+        argocd.argoproj.io/sync-wave: "1"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: '{{.project}}'
+      source:
+        repoURL: https://github.com/example/payments-platform
+        targetRevision: main
+        path: '{{.path}}'
+      destination:
+        name: '{{.cluster}}'
+        namespace: pp-observability
+      syncPolicy:
+        automated:
+          # Prune ON: a deleted alert rule must actually stop firing, and a
+          # deleted dashboard must actually disappear. An orphaned alert nobody
+          # owns is worse than no alert.
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=false
+          - ServerSideApply=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 5m

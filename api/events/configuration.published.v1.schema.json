@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/configuration.published.v1.json",
+  "title": "configuration.published.v1",
+  "description": "A new merchant configuration version was published. Produced by Configuration & Policy (BC-5) on pp.config.configuration.v1, keyed by merchant_id, on a COMPACTED topic. The payload carries the COMPLETE document rather than a diff: compaction guarantees only the last record per key survives, and a consumer rebuilding a lost cache must reach a usable state from one record. That requirement is the whole reason this event is shaped the way it is.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "configurationId",
+    "configurationVersionId",
+    "version",
+    "environment",
+    "document",
+    "documentChecksum",
+    "publishedBy",
+    "publishedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "configurationId": {
+      "description": "Stable identifier of the merchant's configuration record across versions.",
+      "type": "string",
+      "pattern": "^cfg_[0-9A-Z]{26}$"
+    },
+    "configurationVersionId": {
+      "description": "Unique per version.",
+      "type": "string",
+      "pattern": "^cfv_[0-9A-Z]{26}$"
+    },
+    "version": {
+      "description": "Dense and monotonic per merchant.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "previousVersion": {
+      "description": "Absent on version 1.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "environment": { "type": "string", "enum": ["sandbox", "production"] },
+    "document": { "$ref": "#/$defs/configurationDocument" },
+    "documentChecksum": {
+      "description": "sha256 of the JCS-canonical document. A mismatch is config corruption and the consumer MUST reject rather than apply - applying a corrupt configuration is how a merchant silently loses its limits.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "publishedBy": { "type": "string", "maxLength": 128 },
+    "publishedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    },
+    "configurationDocument": {
+      "title": "Merchant configuration document",
+      "description": "The canonical desired-state document, complete.",
+      "type": "object",
+      "required": [
+        "merchantId",
+        "version",
+        "status",
+        "environment",
+        "supportedCurrencies",
+        "paymentMethods",
+        "countries",
+        "routing",
+        "risk",
+        "limits",
+        "settlement"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+        "version": { "type": "integer", "minimum": 1 },
+        "status": { "type": "string", "enum": ["DRAFT", "ACTIVE", "SUPERSEDED", "ROLLED_BACK"] },
+        "environment": { "type": "string", "enum": ["sandbox", "production"] },
+        "supportedCurrencies": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Z]{3}$" }
+        },
+        "paymentMethods": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,31}$" }
+        },
+        "countries": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Z]{2}$" }
+        },
+        "routing": {
+          "type": "object",
+          "required": ["strategy", "primary"],
+          "additionalProperties": false,
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["PRIORITY_WITH_FALLBACK", "WEIGHTED", "LEAST_COST", "LOWEST_LATENCY"]
+            },
+            "primary": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+            "fallback": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" }
+            },
+            "rules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["when", "then"],
+                "additionalProperties": false,
+                "properties": {
+                  "when": { "type": "object" },
+                  "then": { "type": "object" }
+                }
+              }
+            },
+            "weights": {
+              "description": "Must sum to 1.0. A set that does not is rejected by L4 rather than normalised: silent normalisation hides a typo that changes traffic distribution.",
+              "type": "object",
+              "required": ["health", "successRate", "cost", "latency"],
+              "additionalProperties": false,
+              "properties": {
+                "health": { "type": "number", "minimum": 0, "maximum": 1 },
+                "successRate": { "type": "number", "minimum": 0, "maximum": 1 },
+                "cost": { "type": "number", "minimum": 0, "maximum": 1 },
+                "latency": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          }
+        },
+        "risk": {
+          "type": "object",
+          "required": ["maxTransactionAmount", "dailyVolumeLimit", "velocity"],
+          "additionalProperties": false,
+          "properties": {
+            "maxTransactionAmount": { "$ref": "#/$defs/money" },
+            "require3DSAbove": { "$ref": "#/$defs/money" },
+            "dailyVolumeLimit": { "$ref": "#/$defs/money" },
+            "velocity": {
+              "type": "object",
+              "required": ["maxPaymentsPerMinute", "maxPerCardPerHour"],
+              "additionalProperties": false,
+              "properties": {
+                "maxPaymentsPerMinute": { "type": "integer", "minimum": 1 },
+                "maxPerCardPerHour": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "blockedCountries": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[A-Z]{2}$" }
+            },
+            "fallbackDecision": {
+              "type": "string",
+              "enum": ["ALLOW", "REQUIRE_3DS", "DECLINE"]
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "required": ["maxRefundWindowDays", "maxPartialCaptures"],
+          "additionalProperties": false,
+          "properties": {
+            "maxRefundWindowDays": { "type": "integer", "minimum": 1 },
+            "maxPartialCaptures": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "webhooks": {
+          "type": "object",
+          "required": ["endpoints", "retryPolicy"],
+          "additionalProperties": false,
+          "properties": {
+            "endpoints": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["url", "events", "secretRef"],
+                "additionalProperties": false,
+                "properties": {
+                  "url": { "type": "string", "pattern": "^https://" },
+                  "events": { "type": "array", "items": { "type": "string" } },
+                  "secretRef": {
+                    "description": "A secrets-manager path. The secret itself never appears in a configuration document, an event or a log line.",
+                    "type": "string"
+                  },
+                  "description": { "type": "string" },
+                  "active": { "type": "boolean" }
+                }
+              }
+            },
+            "retryPolicy": {
+              "type": "object",
+              "required": ["maxAttempts", "backoff"],
+              "additionalProperties": false,
+              "properties": {
+                "maxAttempts": { "type": "integer", "minimum": 1 },
+                "backoff": {
+                  "type": "string",
+                  "enum": ["EXPONENTIAL_JITTER", "EXPONENTIAL", "LINEAR"]
+                },
+                "initialDelaySeconds": { "type": "integer", "minimum": 1 },
+                "maxDelaySeconds": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        },
+        "settlement": {
+          "type": "object",
+          "required": ["schedule", "currency", "holdDays"],
+          "additionalProperties": false,
+          "properties": {
+            "schedule": {
+              "type": "string",
+              "enum": ["DAILY", "WEEKLY", "BIWEEKLY", "MONTHLY", "MANUAL"]
+            },
+            "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+            "holdDays": { "type": "integer", "minimum": 0 },
+            "weeklyAnchorDay": { "type": "string" }
+          }
+        },
+        "featureFlags": {
+          "type": "object",
+          "additionalProperties": { "type": "boolean" }
+        }
+      }
+    }
+  },
+  "x-topic": "pp.config.configuration.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "control-plane-api",
+  "x-context": "BC-5 Configuration & Policy",
+  "x-consumers": ["Data plane cache", "Audit"],
+  "x-revision": 1,
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "configurationId": "cfg_01JB8ZBBBBBBBBBBBBBBBBBBBB",
+      "configurationVersionId": "cfv_01JB8ZCCCCCCCCCCCCCCCCCCCC",
+      "version": 7,
+      "previousVersion": 6,
+      "environment": "production",
+      "document": {
+        "merchantId": "mrc_01JB8Z11111111111111111111",
+        "version": 7,
+        "status": "ACTIVE",
+        "environment": "production",
+        "supportedCurrencies": ["EUR", "USD"],
+        "paymentMethods": ["CARD", "IDEAL"],
+        "countries": ["DE", "NL"],
+        "routing": {
+          "strategy": "PRIORITY_WITH_FALLBACK",
+          "primary": "adyen",
+          "fallback": ["stripe"],
+          "rules": [],
+          "weights": { "health": 0.4, "successRate": 0.3, "cost": 0.2, "latency": 0.1 }
+        },
+        "risk": {
+          "maxTransactionAmount": { "amount": 1000000, "currency": "EUR" },
+          "require3DSAbove": { "amount": 50000, "currency": "EUR" },
+          "dailyVolumeLimit": { "amount": 50000000, "currency": "EUR" },
+          "velocity": { "maxPaymentsPerMinute": 300, "maxPerCardPerHour": 5 },
+          "blockedCountries": ["KP", "IR"]
+        },
+        "limits": { "maxRefundWindowDays": 180, "maxPartialCaptures": 5 },
+        "webhooks": {
+          "endpoints": [
+            {
+              "url": "https://hooks.acme.example/pp/events",
+              "events": ["payment.*"],
+              "secretRef": "/production/ten_01JB8Z00000000000000000000/mrc_01JB8Z11111111111111111111/webhook-signing",
+              "active": true
+            }
+          ],
+          "retryPolicy": { "maxAttempts": 8, "backoff": "EXPONENTIAL_JITTER" }
+        },
+        "settlement": { "schedule": "DAILY", "currency": "EUR", "holdDays": 2 },
+        "featureFlags": { "networkTokens": true, "partialCapture": true }
+      },
+      "documentChecksum": "7c1a9de0f3b6a2c85e41d079b3c6a51f8e2d4b70c9a63f18e5d20b74a9c1f6e3",
+      "publishedBy": "cli_01JB8Z55555555555555555555",
+      "publishedAt": "2026-08-27T18:59:12.006Z"
+    }
+  ]
+}

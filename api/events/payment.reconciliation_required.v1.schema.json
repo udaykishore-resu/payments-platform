@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.reconciliation_required.v1.json",
+  "title": "payment.reconciliation_required.v1",
+  "description": "A payment is parked because we do not know whether money moved. Published by Payment Orchestration (BC-6) on pp.payments.payment.v1, keyed by payment_id. THIS EVENT ALERTS. It is the direct consequence of the timeout rule: an ambiguous gateway call never fails the payment, it produces this. The payload carries the deterministic gateway idempotency key, which is what lets the reconciler look the transaction up at the gateway - the key is derived from the attempt id and therefore survives a crash of the process that issued it.",
+  "type": "object",
+  "required": [
+    "attemptId",
+    "gatewayCode",
+    "gatewayIdempotencyKey",
+    "reason",
+    "paymentState",
+    "amountAtRisk",
+    "requestSentAt",
+    "resolveBy"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "attemptId": {
+      "description": "The attempt whose outcome is unknown.",
+      "type": "string",
+      "pattern": "^att_[0-9A-Z]{26}$"
+    },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "gatewayIdempotencyKey": {
+      "description": "The key the reconciler looks the transaction up by. Deterministic in the attempt id - base32(HMAC-SHA256(attempt_id, gateway_salt)) truncated to 32 characters - which is precisely why it is reproducible after a crash. It is not the client's idempotency key and must never be confused with it.",
+      "type": "string",
+      "pattern": "^[A-Z2-7]{32}$"
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "TIMEOUT_UNKNOWN",
+        "AMBIGUOUS_TRANSPORT_ERROR",
+        "RESPONSE_VALIDATION_FAILED",
+        "WEBHOOK_STATE_CONFLICT",
+        "SETTLEMENT_MISMATCH"
+      ]
+    },
+    "paymentState": {
+      "description": "The state the payment is parked in. Only PROCESSING or PENDING are legal here: an ambiguous outcome never moves a payment to a terminal state.",
+      "type": "string",
+      "enum": ["PROCESSING", "PENDING"]
+    },
+    "amountAtRisk": {
+      "$ref": "#/$defs/money",
+      "description": "Drives alert severity. A EUR 3 ambiguity and a EUR 30,000 ambiguity are not the same page."
+    },
+    "requestSentAt": { "type": "string", "format": "date-time" },
+    "resolveBy": {
+      "description": "SLO deadline. Breaching it opens a CRITICAL reconciliation exception rather than letting the payment sit indefinitely.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer", "minimum": 1 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-6 Payment Orchestration",
+  "x-consumers": ["Reconciler (alerting)"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "reason": "route-to-dlq", "paymentState": "route-to-dlq" },
+  "examples": [
+    {
+      "attemptId": "att_01JB8ZHHHHHHHHHHHHHHHHHHHH",
+      "gatewayCode": "adyen",
+      "gatewayIdempotencyKey": "K7QF2R4M3CDVB5YTNA3EWJ5HZP6LSU77",
+      "reason": "TIMEOUT_UNKNOWN",
+      "paymentState": "PROCESSING",
+      "amountAtRisk": { "amount": 1050, "currency": "USD" },
+      "requestSentAt": "2026-08-26T14:03:11.001Z",
+      "resolveBy": "2026-08-27T14:03:11.001Z"
+    }
+  ]
+}

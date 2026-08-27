@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.authorized.v1.json",
+  "title": "payment.authorized.v1",
+  "description": "Funds were held. Published by Payment Orchestration (BC-6) on pp.payments.payment.v1, keyed by payment_id. The attempt named here is the one holding the payment's single successful-terminal slot, which a partial unique index enforces at the database level - that constraint is what makes double-charging structurally impossible rather than merely unlikely.",
+  "type": "object",
+  "required": ["attemptId", "gatewayCode", "authorizedAmount", "gatewayReference", "authorizationExpiresAt", "captureMode"],
+  "additionalProperties": false,
+  "properties": {
+    "attemptId": { "type": "string", "pattern": "^att_[0-9A-Z]{26}$" },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "authorizedAmount": {
+      "$ref": "#/$defs/money",
+      "description": "May be LESS than the payment amount for a partial authorization, which is why it is carried rather than assumed equal."
+    },
+    "gatewayReference": {
+      "description": "The gateway's transaction identifier. Needed for capture, void and reconciliation, so it must survive into the event and not only into the attempt row.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "authorizationExpiresAt": {
+      "description": "Drives the auth-expiry sweeper. An authorization that expires uncaptured is revenue lost silently unless something is watching this field.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "threeDsStatus": {
+      "description": "Strong customer authentication outcome. Exemptions are modelled explicitly and audited: claiming one is a decision the platform must be able to defend to a regulator, so it is never implicit.",
+      "type": "string",
+      "enum": ["AUTHENTICATED", "ATTEMPTED", "EXEMPT_TRA", "EXEMPT_LOW_VALUE", "EXEMPT_MIT", "NOT_APPLICABLE"]
+    },
+    "captureMode": { "type": "string", "enum": ["AUTOMATIC", "MANUAL"] },
+    "networkTransactionId": {
+      "description": "Scheme reference chaining later merchant-initiated transactions to this cardholder-initiated authorization.",
+      "type": "string",
+      "maxLength": 64
+    }
+  },
+  "$defs": {
+    "money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer", "minimum": 1 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-6 Payment Orchestration",
+  "x-consumers": ["Ledger", "Notification", "Analytics"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "threeDsStatus": "route-to-dlq", "captureMode": "route-to-dlq" },
+  "examples": [
+    {
+      "attemptId": "att_01JB8Z44444444444444444444",
+      "gatewayCode": "stripe",
+      "authorizedAmount": { "amount": 1050, "currency": "USD" },
+      "gatewayReference": "pi_3OqZ4L2eZvKYlo2C",
+      "authorizationExpiresAt": "2026-09-02T14:03:11.000Z",
+      "threeDsStatus": "EXEMPT_LOW_VALUE",
+      "captureMode": "MANUAL",
+      "networkTransactionId": "MCC0826114031"
+    }
+  ]
+}

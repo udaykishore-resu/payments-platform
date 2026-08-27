@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.validated.v1.json",
+  "title": "merchant.validated.v1",
+  "description": "L2 merchant validation completed for an onboarding case. Published by Onboarding (BC-3) at the end of workflow step 1 on pp.merchants.merchant.v1, keyed by merchant_id. Only WARNING-severity outcomes are carried: an ERROR would have failed the step, and this event would not exist.",
+  "type": "object",
+  "required": ["merchantId", "caseId", "rulesEvaluated", "validatedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": {
+      "description": "The validated merchant.",
+      "type": "string",
+      "pattern": "^mrc_[0-9A-Z]{26}$"
+    },
+    "caseId": {
+      "description": "The onboarding case this validation belongs to.",
+      "type": "string",
+      "pattern": "^onb_[0-9A-Z]{26}$"
+    },
+    "rulesEvaluated": {
+      "description": "Count of L2 rules run. A drop in this number between releases means rules were lost, which is why it is carried rather than inferred.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "warnings": {
+      "description": "WARNING-severity rule outcomes. Recorded and surfaced to operators; they do not block the workflow.",
+      "type": "array",
+      "maxItems": 100,
+      "items": { "$ref": "#/$defs/annotation" }
+    },
+    "validatedAt": {
+      "description": "When validation completed, RFC 3339 UTC with millisecond precision.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "annotation": {
+      "title": "Validation annotation",
+      "type": "object",
+      "required": ["ruleId", "severity", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "ruleId": {
+          "description": "Stable validation-plane rule identifier. Every rule id is documented with its meaning and remediation, and CI fails the build if one is not.",
+          "type": "string",
+          "pattern": "^L[1-7]\\.[A-Z0-9_]+$"
+        },
+        "severity": { "type": "string", "enum": ["ERROR", "WARNING"] },
+        "message": { "type": "string", "maxLength": 1024 }
+      }
+    }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "workflow-worker",
+  "x-context": "BC-3 Onboarding",
+  "x-consumers": ["Onboarding", "Audit"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "severity": "route-to-dlq" },
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "caseId": "onb_01JB8Z66666666666666666666",
+      "rulesEvaluated": 34,
+      "warnings": [
+        {
+          "ruleId": "L2.WEBSITE_NOT_REACHABLE",
+          "severity": "WARNING",
+          "message": "https://acme.example returned 503"
+        }
+      ],
+      "validatedAt": "2026-08-26T09:12:04.221Z"
+    }
+  ]
+}

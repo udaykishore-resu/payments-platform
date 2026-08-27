@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.kyc_failed.v1.json",
+  "title": "merchant.kyc_failed.v1",
+  "description": "The KYC/KYB vendor returned a rejection and the merchant moved KYC_PENDING -> KYC_FAILED. Published by Onboarding (BC-3) on pp.merchants.merchant.v1, keyed by merchant_id. KYC_FAILED is not terminal: resubmission returns the merchant to KYC_PENDING and starts a NEW workflow instance, keeping each instance a single auditable attempt. The one exception is SANCTIONS_HIT, which is never resubmittable.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "caseId",
+    "kycReference",
+    "provider",
+    "decidedAt",
+    "reasonCode",
+    "resubmissionAllowed",
+    "resubmissionCount"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "caseId": { "type": "string", "pattern": "^onb_[0-9A-Z]{26}$" },
+    "kycReference": {
+      "description": "Vendor case reference only. Never the vendor's raw reason text, which routinely contains personal data.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "provider": { "type": "string", "maxLength": 64 },
+    "decidedAt": { "type": "string", "format": "date-time" },
+    "reasonCode": {
+      "description": "Normalized rejection reason. The merchant-facing message is derived from this code, never from the vendor's own string.",
+      "type": "string",
+      "enum": [
+        "IDENTITY_UNVERIFIED",
+        "DOCUMENT_INVALID",
+        "SANCTIONS_HIT",
+        "PEP_REVIEW_REQUIRED",
+        "ADVERSE_MEDIA",
+        "INCOMPLETE"
+      ]
+    },
+    "resubmissionAllowed": {
+      "description": "False for SANCTIONS_HIT - a sanctions hit is never resubmittable, and encoding that here means no consumer has to know the rule.",
+      "type": "boolean"
+    },
+    "resubmissionCount": {
+      "description": "How many times this merchant has already resubmitted. Rising counts are a fraud signal in their own right.",
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "workflow-worker",
+  "x-context": "BC-3 Onboarding",
+  "x-consumers": ["Onboarding", "Audit", "Notification"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "reasonCode": "route-to-dlq" },
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "caseId": "onb_01JB8Z66666666666666666666",
+      "kycReference": "kyc-8f21ba",
+      "provider": "vendor-a",
+      "decidedAt": "2026-08-27T11:40:02.000Z",
+      "reasonCode": "DOCUMENT_INVALID",
+      "resubmissionAllowed": true,
+      "resubmissionCount": 1
+    },
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "caseId": "onb_01JB8Z66666666666666666666",
+      "kycReference": "kyc-4c09de",
+      "provider": "vendor-a",
+      "decidedAt": "2026-08-27T11:52:19.000Z",
+      "reasonCode": "SANCTIONS_HIT",
+      "resubmissionAllowed": false,
+      "resubmissionCount": 0
+    }
+  ]
+}

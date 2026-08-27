@@ -1,0 +1,55 @@
+# staging overlay — pp-staging account, production-shaped, synthetic data only.
+#
+# Staging is deliberately the same SHAPE as prod and a smaller SIZE. The things
+# that must not differ are the ones that change behaviour: PodSecurity level,
+# NetworkPolicy set, PriorityClasses, the canary steps, the probe semantics. The
+# things that may differ are quotas and replica counts.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+patches:
+  - target:
+      kind: ResourceQuota
+      name: pp-data-plane-quota
+    patch: |-
+      - op: replace
+        path: /spec/hard/requests.cpu
+        value: "120"
+      - op: replace
+        path: /spec/hard/requests.memory
+        value: 240Gi
+      - op: replace
+        path: /spec/hard/limits.memory
+        value: 360Gi
+      - op: replace
+        path: /spec/hard/pods
+        value: "120"
+  - target:
+      kind: ResourceQuota
+      name: pp-control-plane-quota
+    patch: |-
+      - op: replace
+        path: /spec/hard/requests.cpu
+        value: "20"
+      - op: replace
+        path: /spec/hard/pods
+        value: "40"
+  - target:
+      kind: ResourceQuota
+      name: pp-automation-quota
+    patch: |-
+      - op: replace
+        path: /spec/hard/requests.cpu
+        value: "20"
+      - op: replace
+        path: /spec/hard/pods
+        value: "30"
+  - target:
+      kind: ServiceAccount
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/eks.amazonaws.com~1role-arn
+        value: arn:aws:iam::777788889999:role/pp-staging-workload

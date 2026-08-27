@@ -1,0 +1,51 @@
+version: v2
+
+# Code generation for the internal gRPC surface.
+#
+# Run from `api/proto`:
+#   buf generate
+#
+# Output lands in the repository root's `api/proto/payments/v1` Go package path, which
+# matches the `go_package` option in every .proto file. Generated files are committed:
+# a build that regenerates protobuf output cannot be reproduced from a tag alone once a
+# plugin version drifts, and reviewers should be able to see the wire shape change in
+# the diff that changes it.
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/udaykishore-resu/payments-platform/api/proto
+  disable:
+    # java_package and csharp_namespace are set explicitly per file; managed mode must
+    # not override an author's deliberate choice.
+    - file_option: java_package
+      path: payments/v1
+    - file_option: csharp_namespace
+      path: payments/v1
+
+plugins:
+  # Message types.
+  - remote: buf.build/protocolbuffers/go:v1.36.4
+    out: ../..
+    opt:
+      - paths=source_relative
+
+  # Service stubs.
+  - remote: buf.build/grpc/go:v1.5.1
+    out: ../..
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=true
+
+  # Runtime validation generated from the same source of truth as the docs, so a field
+  # constraint cannot drift between the contract and the server.
+  - remote: buf.build/bufbuild/validate-go:v1.2.1
+    out: ../..
+    opt:
+      - paths=source_relative
+
+  # A descriptor set for the schema registry, the gRPC reflection service and the
+  # contract tests in `tests/contract`.
+  - local: protoc-gen-descriptor-set
+    out: ../../build/descriptors
+    strategy: all

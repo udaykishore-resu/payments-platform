@@ -1,0 +1,42 @@
+{{- $root := . }}
+{{- range $name, $cj := .Values.cronJobs }}
+{{- if $cj.enabled }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pp-common.fullname" $root }}-{{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" $root | nindent 4 }}
+    pp.cronjob: {{ $name }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  schedule: {{ $cj.schedule | quote }}
+  timeZone: "Etc/UTC"
+  # In the passive region the sweeps that resolve money state are suspended:
+  # two regions independently reconciling the same payments is how a single
+  # ambiguity becomes two conflicting resolutions.
+  suspend: {{ and $cj.suspendInPassiveRegion (ne $root.Values.global.regionActive "true") }}
+  concurrencyPolicy: {{ $cj.concurrencyPolicy }}
+  startingDeadlineSeconds: {{ $cj.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ $cj.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $cj.failedJobsHistoryLimit }}
+  jobTemplate:
+    metadata:
+      labels:
+{{- include "pp-common.labels" $root | nindent 8 }}
+        pp.cronjob: {{ $name }}
+    spec:
+      backoffLimit: {{ $cj.backoffLimit }}
+      activeDeadlineSeconds: {{ $cj.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+{{- include "pp-common.labels" $root | nindent 12 }}
+            pp.cronjob: {{ $name }}
+        spec:
+{{- include "platformctl.jobPodSpec" (dict "ctx" $root "args" $cj.args) | nindent 10 }}
+{{- end }}
+{{- end }}

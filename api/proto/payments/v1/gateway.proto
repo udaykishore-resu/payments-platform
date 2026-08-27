@@ -1,0 +1,476 @@
+// Gateway Registry and Integration (BC-4) internal interface.
+//
+// Two halves with different availability classes, deliberately in one file because they
+// share a vocabulary:
+//   * The registry (control plane): gateways, capability descriptors, connections.
+//   * Health and provisioning (data plane and automation plane): the feedback loop from
+//     Observability back into Control, and the workflow activity callbacks for steps
+//     5-7 and for credential rotation.
+//
+// No gateway type ever appears in the domain. Everything here is already translated by
+// the anti-corruption layer.
+syntax = "proto3";
+
+package payments.v1;
+
+import "google/protobuf/timestamp.proto";
+import "payments/v1/common.proto";
+
+option go_package = "github.com/udaykishore-resu/payments-platform/api/proto/payments/v1;paymentsv1";
+option java_multiple_files = true;
+option java_package = "com.example.payments.v1";
+option java_outer_classname = "GatewayProto";
+option csharp_namespace = "Example.Payments.V1";
+
+// Catalogue status: ACTIVE -> DEPRECATED -> DISABLED.
+//
+// A DEPRECATED gateway may not be named as a routing primary in a newly published
+// configuration, but existing connections keep working. DISABLED is terminal for
+// routing and not for reconciliation: payments already in flight still resolve.
+enum GatewayStatus {
+  GATEWAY_STATUS_UNSPECIFIED = 0;
+  GATEWAY_STATUS_ACTIVE = 1;
+  GATEWAY_STATUS_DEPRECATED = 2;
+  GATEWAY_STATUS_DISABLED = 3;
+}
+
+// The operations health is tracked for. Health is per (gateway, operation) and
+// deliberately never per merchant: per-merchant samples are too sparse to be
+// statistically meaningful.
+enum GatewayOperation {
+  GATEWAY_OPERATION_UNSPECIFIED = 0;
+  GATEWAY_OPERATION_AUTHORIZE = 1;
+  GATEWAY_OPERATION_CAPTURE = 2;
+  GATEWAY_OPERATION_REFUND = 3;
+  GATEWAY_OPERATION_VOID = 4;
+  GATEWAY_OPERATION_LOOKUP = 5;
+  GATEWAY_OPERATION_PROVISION = 6;
+}
+
+// Health of one (gateway, operation) pair.
+//
+// HEALTHY -> DEGRADED above 5% errors over 30 s with at least 20 samples.
+// DEGRADED -> UNHEALTHY above 25% errors or p99 over 5 s, opening the circuit.
+// UNHEALTHY -> PROBING after cool-down. PROBING -> HEALTHY after 3 consecutive
+// successes, or back to UNHEALTHY on any failure with the cool-down doubled, capped at
+// 5 minutes. DEGRADED never transitions straight to PROBING.
+enum HealthState {
+  HEALTH_STATE_UNSPECIFIED = 0;
+  HEALTH_STATE_HEALTHY = 1;
+  HEALTH_STATE_DEGRADED = 2;
+  HEALTH_STATE_UNHEALTHY = 3;
+  HEALTH_STATE_PROBING = 4;
+}
+
+// Circuit breaker position, tracked alongside health state.
+enum CircuitState {
+  CIRCUIT_STATE_UNSPECIFIED = 0;
+  CIRCUIT_STATE_CLOSED = 1;
+  CIRCUIT_STATE_OPEN = 2;
+  CIRCUIT_STATE_HALF_OPEN = 3;
+}
+
+// How a gateway signs the webhooks it sends us.
+enum WebhookSignatureScheme {
+  WEBHOOK_SIGNATURE_SCHEME_UNSPECIFIED = 0;
+  WEBHOOK_SIGNATURE_SCHEME_HMAC_SHA256 = 1;
+  WEBHOOK_SIGNATURE_SCHEME_ED25519 = 2;
+  WEBHOOK_SIGNATURE_SCHEME_JWS = 3;
+}
+
+// Lifecycle of one merchant's binding to one gateway.
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  CONNECTION_STATE_UNPROVISIONED = 1;
+  CONNECTION_STATE_PROVISIONING = 2;
+  CONNECTION_STATE_PROVISIONED = 3;
+  CONNECTION_STATE_CERTIFYING = 4;
+  // Requires a passing report for THIS environment plus stored credential and webhook
+  // references. A production connection is never certified on a sandbox report.
+  CONNECTION_STATE_CERTIFIED = 5;
+  CONNECTION_STATE_DEGRADED = 6;
+  CONNECTION_STATE_REVOKED = 7;
+}
+
+// Why credentials are being rotated.
+enum RotationReason {
+  ROTATION_REASON_UNSPECIFIED = 0;
+  // The routine 90-day rotation, with dual-run overlap.
+  ROTATION_REASON_SCHEDULED = 1;
+  // Skips the overlap and revokes immediately, accepting in-flight failures. A
+  // compromised credential outranks a handful of retryable errors.
+  ROTATION_REASON_SUSPECTED_COMPROMISE = 2;
+  ROTATION_REASON_OPERATOR_REQUEST = 3;
+  ROTATION_REASON_GATEWAY_REQUEST = 4;
+}
+
+// Progress of a rotation.
+enum RotationState {
+  ROTATION_STATE_UNSPECIFIED = 0;
+  ROTATION_STATE_SCHEDULED = 1;
+  ROTATION_STATE_RUNNING = 2;
+  // New credential provisioned and verified; old one still valid.
+  ROTATION_STATE_DUAL_RUN = 3;
+  ROTATION_STATE_COMPLETED = 4;
+  ROTATION_STATE_FAILED = 5;
+}
+
+// A declarative statement of what a gateway supports.
+//
+// Routing treats an absent capability as a hard exclusion, never as "probably fine":
+// discovering at authorization time that a gateway does not support a currency costs a
+// declined payment and a merchant call.
+message GatewayCapabilities {
+  // ISO 3166-1 alpha-2 codes.
+  repeated string countries = 1;
+  // ISO 4217 codes.
+  repeated string currencies = 2;
+  // Domain payment methods, e.g. "CARD".
+  repeated string payment_methods = 3;
+  repeated GatewayOperation operations = 4;
+  bool supports_3ds = 5;
+  bool supports_partial_capture = 6;
+  bool supports_multi_capture = 7;
+  bool supports_network_tokens = 8;
+  // How long after capture the gateway accepts a refund. A merchant's configured
+  // refund window may not exceed this.
+  int32 refund_window_days = 9;
+  WebhookSignatureScheme webhook_signature_scheme = 10;
+  // Per-currency ceilings in minor units, keyed by ISO 4217 code. An absent entry means
+  // no gateway-imposed ceiling beyond the merchant's own risk policy.
+  map<string, int64> max_amount_by_currency = 11;
+
+  reserved 12 to 19;
+}
+
+// A third-party payment processor.
+//
+// Platform-global and read-only to tenants: this is the one aggregate that carries no
+// tenant identifier.
+message Gateway {
+  // `gw_` + ULID.
+  string id = 1;
+  // Stable, immutable, globally unique code used in configuration documents, metric
+  // labels and webhook paths, where an opaque ULID would be unusable.
+  string code = 2;
+  string display_name = 3;
+  GatewayStatus status = 4;
+  // Version of the anti-corruption adapter currently deployed for this gateway.
+  string adapter_version = 5;
+  GatewayCapabilities capabilities = 6;
+  // Regions in which this gateway may be selected. Routing will not select a gateway
+  // whose region violates the tenant's residency policy.
+  repeated string regions = 7;
+  google.protobuf.Timestamp deprecated_at = 8;
+  int64 version = 9;
+
+  reserved 10 to 15;
+}
+
+// The binding of one merchant to one gateway.
+message GatewayConnection {
+  // `gwc_` + ULID.
+  string id = 1;
+  string tenant_id = 2;
+  string merchant_id = 3;
+  string gateway_id = 4;
+  string gateway_code = 5;
+  Environment environment = 6;
+  ConnectionState state = 7;
+  // The gateway's sub-account identifier.
+  string external_account_ref = 8;
+  // Secrets-manager path. NEVER credential material - only the reference lives here,
+  // and the material lives in the secrets manager under an IAM path scoped to
+  // (env, tenant, merchant, gateway).
+  string credential_ref = 9;
+  // The gateway's identifier for our registered webhook.
+  string webhook_registration_ref = 10;
+  // Secrets-manager path of the webhook signing secret.
+  string webhook_secret_ref = 11;
+  // A PASSED report for this environment. Required for CERTIFIED.
+  string certification_report_id = 12;
+  google.protobuf.Timestamp certified_at = 13;
+  google.protobuf.Timestamp credential_rotated_at = 14;
+  // Never later than credential_rotated_at + 90 days.
+  google.protobuf.Timestamp credential_expires_at = 15;
+  // Last failure, for operator diagnosis. Redacted of secrets.
+  string last_error = 16;
+  int64 version = 17;
+
+  reserved 18 to 25;
+  reserved "credentials", "api_key", "api_secret";
+}
+
+// Health of one (gateway, operation) pair in one region.
+message GatewayHealth {
+  string gateway_id = 1;
+  string gateway_code = 2;
+  GatewayOperation operation = 3;
+  HealthState state = 4;
+  HealthState previous_state = 5;
+  CircuitState circuit_state = 6;
+  // Error rate over the evaluation window, as a fraction 0-1.
+  double error_rate = 7;
+  int32 p99_latency_ms = 8;
+  // Carried so consumers can judge confidence: below 20 samples the transition to
+  // DEGRADED is not taken at all.
+  int32 sample_count = 9;
+  // Length of the sliding evaluation window. 30 by default.
+  int32 window_seconds = 10;
+  // Remaining cool-down while UNHEALTHY. Doubles per failed probe, capped at 300.
+  int32 cooldown_seconds = 11;
+  // Successful probes so far while PROBING. Three promote to HEALTHY.
+  int32 consecutive_probe_successes = 12;
+  // Health is measured per region; a consumer in another region must not act on it.
+  string region = 13;
+  google.protobuf.Timestamp state_changed_at = 14;
+  // How stale this snapshot is. Health reads are AP - a stale answer with a stated age
+  // beats no answer.
+  int64 observed_at_age_ms = 15;
+
+  reserved 16 to 19;
+}
+
+// Read one gateway.
+message GetGatewayRequest {
+  TenantContext context = 1;
+  // Either the `gw_` identifier or the stable code. Exactly one must be set.
+  string gateway_id = 2;
+  string gateway_code = 3;
+}
+
+// The gateway with its capability descriptor.
+message GetGatewayResponse {
+  Gateway gateway = 1;
+}
+
+// Cursor-paginated gateway catalogue listing.
+message ListGatewaysRequest {
+  TenantContext context = 1;
+  PageRequest page = 2;
+  GatewayStatus status = 3;
+  // Only gateways whose descriptor supports this ISO 4217 currency.
+  string currency = 4;
+  // Only gateways whose descriptor supports this domain payment method.
+  string payment_method = 5;
+  // Only gateways available in this region.
+  string region = 6;
+}
+
+// A page of gateways.
+message ListGatewaysResponse {
+  repeated Gateway gateways = 1;
+  PageResponse page = 2;
+}
+
+// Read health for one gateway.
+message GetGatewayHealthRequest {
+  TenantContext context = 1;
+  string gateway_id = 2;
+  // Defaults to the caller's home region.
+  string region = 3;
+  // Restrict to specific operations. Empty means all.
+  repeated GatewayOperation operations = 4;
+}
+
+// Health, one entry per operation.
+message GetGatewayHealthResponse {
+  repeated GatewayHealth health = 1;
+}
+
+// Subscribe to health transitions.
+//
+// Server-streaming because the routing engine must react to a circuit opening in
+// milliseconds, and polling a control-plane endpoint at that cadence would put the data
+// plane's latency budget at the mercy of the control plane's availability. The stream
+// is an accelerator: Kafka gossip remains the durable path, so a dropped stream degrades
+// reaction time and never correctness.
+message WatchGatewayHealthRequest {
+  TenantContext context = 1;
+  string region = 2;
+  // Restrict to specific gateways. Empty means all.
+  repeated string gateway_ids = 3;
+  // Send the current state of every matching pair before streaming changes, so a
+  // reconnecting consumer does not have to wait for a transition to learn the world.
+  bool send_initial_snapshot = 4;
+}
+
+// One health transition, or one snapshot entry.
+message WatchGatewayHealthResponse {
+  GatewayHealth health = 1;
+  // True when this message is part of the initial snapshot rather than a live change.
+  bool is_snapshot = 2;
+}
+
+// Report an observed gateway interaction into the health window.
+//
+// The hot path is an in-process sliding window per orchestrator pod; this RPC is the
+// gossip/consensus point and is called on STATE CHANGE only, never per sample. Writing
+// every sample would be a 5000 TPS write amplifier for no benefit.
+message ReportHealthTransitionRequest {
+  TenantContext context = 1;
+  string gateway_id = 2;
+  GatewayOperation operation = 3;
+  HealthState observed_state = 4;
+  CircuitState circuit_state = 5;
+  double error_rate = 6;
+  int32 p99_latency_ms = 7;
+  int32 sample_count = 8;
+  int32 window_seconds = 9;
+  string region = 10;
+  // The reporting pod, for provenance when two pods disagree.
+  string reporter = 11;
+  google.protobuf.Timestamp observed_at = 12;
+}
+
+// The consolidated health after the report was merged.
+message ReportHealthTransitionResponse {
+  GatewayHealth health = 1;
+  // True when this report caused a state change and therefore published
+  // gateway.health_changed.v1.
+  bool state_changed = 2;
+}
+
+// Read one connection.
+message GetGatewayConnectionRequest {
+  TenantContext context = 1;
+  string connection_id = 2;
+}
+
+// The connection.
+message GetGatewayConnectionResponse {
+  GatewayConnection connection = 1;
+}
+
+// List a merchant's connections.
+message ListGatewayConnectionsRequest {
+  TenantContext context = 1;
+  PageRequest page = 2;
+  string merchant_id = 3;
+  Environment environment = 4;
+  repeated ConnectionState states = 5;
+}
+
+// A page of connections.
+message ListGatewayConnectionsResponse {
+  repeated GatewayConnection connections = 1;
+  PageResponse page = 2;
+}
+
+// Workflow activity callback for step 5. Provisions a merchant sub-account at a
+// gateway. Idempotent on the external account reference, so a retry after an ambiguous
+// failure adopts the existing sub-account rather than creating a second one.
+message ProvisionConnectionRequest {
+  TenantContext context = 1;
+  string merchant_id = 2;
+  string gateway_code = 3;
+  Environment environment = 4;
+  // Opaque, JSON-encoded provisioning payload assembled by the workflow from the
+  // merchant's business profile. Contains no secrets.
+  string provisioning_payload_json = 5;
+  IdempotencyOptions idempotency = 6;
+}
+
+// The connection after provisioning.
+message ProvisionConnectionResponse {
+  GatewayConnection connection = 1;
+  // Set when the gateway requires the merchant to complete a hosted consent flow before
+  // provisioning can finish. The workflow parks on a gateway-consent signal rather than
+  // failing - this is the one provisioning step the platform cannot complete alone.
+  string merchant_action_url = 2;
+  bool awaiting_merchant_consent = 3;
+  IdempotencyResult idempotency = 4;
+}
+
+// Workflow activity callback for step 7. Registers our webhook endpoint at the gateway.
+message RegisterWebhookRequest {
+  TenantContext context = 1;
+  string connection_id = 2;
+  // The ingress URL the gateway should call.
+  string callback_url = 3;
+  IdempotencyOptions idempotency = 4;
+}
+
+// The connection with its webhook registration recorded. The signing secret itself is
+// written straight to the secrets manager and only its reference appears here.
+message RegisterWebhookResponse {
+  GatewayConnection connection = 1;
+  WebhookSignatureScheme signature_scheme = 2;
+  IdempotencyResult idempotency = 3;
+}
+
+// Rotate a connection's gateway credentials.
+message RotateCredentialsRequest {
+  TenantContext context = 1;
+  string connection_id = 2;
+  RotationReason reason = 3;
+  string note = 4;
+  IdempotencyOptions idempotency = 5;
+}
+
+// Rotation metadata only. Credential material never crosses this boundary in either
+// direction.
+message RotateCredentialsResponse {
+  string connection_id = 1;
+  RotationState state = 2;
+  // Secrets-manager path of the new credential. A reference, never material.
+  string credential_ref = 3;
+  // When the outgoing credential is revoked, closing the dual-run overlap.
+  google.protobuf.Timestamp previous_expires_at = 4;
+  google.protobuf.Timestamp started_at = 5;
+  IdempotencyResult idempotency = 6;
+}
+
+// Mark a connection degraded or revoked, e.g. after L3 validation fails on a scheduled
+// probe or after the gateway de-provisions the sub-account.
+message UpdateConnectionStateRequest {
+  TenantContext context = 1;
+  string connection_id = 2;
+  ConnectionState target_state = 3;
+  string reason = 4;
+  Precondition precondition = 5;
+  IdempotencyOptions idempotency = 6;
+}
+
+// The connection after the transition.
+message UpdateConnectionStateResponse {
+  GatewayConnection connection = 1;
+  IdempotencyResult idempotency = 2;
+}
+
+// Gateway registry, health and provisioning (BC-4).
+service GatewayService {
+  // Read one gateway by identifier or by code.
+  rpc GetGateway(GetGatewayRequest) returns (GetGatewayResponse);
+
+  // Cursor-paginated catalogue listing with capability filters.
+  rpc ListGateways(ListGatewaysRequest) returns (ListGatewaysResponse);
+
+  // Read health for one gateway, per operation, in one region.
+  rpc GetGatewayHealth(GetGatewayHealthRequest) returns (GetGatewayHealthResponse);
+
+  // Stream health transitions to the routing engine. An accelerator over the durable
+  // Kafka path, never a replacement for it.
+  rpc WatchGatewayHealth(WatchGatewayHealthRequest) returns (stream WatchGatewayHealthResponse);
+
+  // Report a health state change from an orchestrator pod. Called on transition only.
+  rpc ReportHealthTransition(ReportHealthTransitionRequest) returns (ReportHealthTransitionResponse);
+
+  // Read one merchant-gateway connection.
+  rpc GetGatewayConnection(GetGatewayConnectionRequest) returns (GetGatewayConnectionResponse);
+
+  // List a merchant's connections.
+  rpc ListGatewayConnections(ListGatewayConnectionsRequest) returns (ListGatewayConnectionsResponse);
+
+  // Workflow activity callback: provision a merchant sub-account at a gateway.
+  rpc ProvisionConnection(ProvisionConnectionRequest) returns (ProvisionConnectionResponse);
+
+  // Workflow activity callback: register our webhook endpoint at the gateway.
+  rpc RegisterWebhook(RegisterWebhookRequest) returns (RegisterWebhookResponse);
+
+  // Rotate gateway credentials with a dual-run overlap.
+  rpc RotateCredentials(RotateCredentialsRequest) returns (RotateCredentialsResponse);
+
+  // Transition a connection's state, e.g. to DEGRADED or REVOKED.
+  rpc UpdateConnectionState(UpdateConnectionStateRequest) returns (UpdateConnectionStateResponse);
+}

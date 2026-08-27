@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.failed.v1.json",
+  "title": "payment.failed.v1",
+  "description": "A payment reached the terminal state FAILED. Published by Payment Orchestration (BC-6) on pp.payments.payment.v1, keyed by payment_id. Note what this event does NOT represent: a gateway timeout. A timed-out call leaves the payment in PROCESSING with a TIMEOUT_UNKNOWN attempt and produces payment.reconciliation_required.v1, because we do not know whether money moved and no timer may decide that it did not.",
+  "type": "object",
+  "required": ["failureStage", "errorCode", "attemptsMade", "terminal", "failedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "attemptId": {
+      "description": "Absent for pre-flight rejections, where no attempt was ever created.",
+      "type": "string",
+      "pattern": "^att_[0-9A-Z]{26}$"
+    },
+    "gatewayCode": {
+      "description": "Absent for pre-flight rejections.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{1,31}$"
+    },
+    "failureStage": {
+      "description": "Where in the request pipeline the payment died. This is the field an on-call engineer reads first: it separates 'our validation refused it' from 'the gateway refused it' without a trace lookup.",
+      "type": "string",
+      "enum": ["VALIDATION", "RISK", "ROUTING", "GATEWAY", "RESPONSE_VALIDATION", "STATE", "EXPIRY", "CANCELED"]
+    },
+    "errorCode": {
+      "description": "Platform error code from api/errors/catalog.yaml.",
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{2,63}$"
+    },
+    "declineReasonCode": {
+      "description": "Normalized decline reason, never the gateway's raw string.",
+      "type": "string",
+      "maxLength": 64
+    },
+    "declineIsRetryable": {
+      "description": "Whether another gateway could plausibly have succeeded. False means a hard decline and no failover was attempted, deliberately.",
+      "type": "boolean"
+    },
+    "attemptsMade": {
+      "description": "How many gateways were tried before giving up. Zero for a pre-flight rejection.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "gatewaysTried": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" }
+    },
+    "terminal": {
+      "description": "Always true - FAILED is terminal. Present so a consumer never has to infer terminality from a state name it may not recognise.",
+      "type": "boolean",
+      "const": true
+    },
+    "failedAt": { "type": "string", "format": "date-time" }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-6 Payment Orchestration",
+  "x-consumers": ["Ledger", "Notification", "Routing feedback"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "failureStage": "route-to-dlq" },
+  "examples": [
+    {
+      "attemptId": "att_01JB8ZFFFFFFFFFFFFFFFFFFFF",
+      "gatewayCode": "adyen",
+      "failureStage": "GATEWAY",
+      "errorCode": "GATEWAY_DECLINED",
+      "declineReasonCode": "INSUFFICIENT_FUNDS",
+      "declineIsRetryable": false,
+      "attemptsMade": 2,
+      "gatewaysTried": ["stripe", "adyen"],
+      "terminal": true,
+      "failedAt": "2026-08-26T14:03:19.334Z"
+    },
+    {
+      "failureStage": "ROUTING",
+      "errorCode": "NO_ELIGIBLE_GATEWAY",
+      "attemptsMade": 0,
+      "terminal": true,
+      "failedAt": "2026-08-26T14:07:02.115Z"
+    }
+  ]
+}

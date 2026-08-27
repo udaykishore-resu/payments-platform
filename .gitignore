@@ -1,0 +1,129 @@
+# .gitignore
+#
+# Ordered by what it is protecting against, most serious first.
+
+# --- credentials: the entries that matter -----------------------------------------------
+# Nothing here is recoverable once committed. Git history is the one place a secret cannot
+# be deleted from, which is why scripts/check-secrets.sh runs on every push as well —
+# .gitignore prevents the accident, the scan catches the one that got past it.
+.env
+.env.*
+!.env.example
+# .env.dev is the shared local-development variable set (see its header). It carries no
+# credential material — only the well-known local-stack password that config/dev.yaml and
+# deploy/docker-compose.dev.yml already use — and every `make run-*` target sources it, so
+# it has to be in the repository or the targets work only for whoever wrote them.
+!.env.dev
+
+# Local development scratch: the dev issuer's key and the ids dev-up.sh discovers.
+.dev/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.json
+service-account*.json
+kubeconfig
+*.kubeconfig
+.aws/
+.netrc
+!testdata/**/*.pem
+
+# --- terraform state: credentials by another name ----------------------------------------
+# tfstate contains every resource attribute, including generated passwords and connection
+# strings, in plaintext. State lives in the S3 backend (deployment.md §2), never in git.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.tfstate.lock.info
+crash.log
+crash.*.log
+*.tfplan
+*.tfvars
+!example.tfvars
+!*.auto.tfvars.example
+
+# --- build output ---------------------------------------------------------------------------
+/bin/
+/dist/
+/build/
+/out/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# --- test and profiling artifacts ------------------------------------------------------------
+*.test
+*.out
+coverage.out
+coverage.html
+coverage-*.out
+cover.out
+*.prof
+*.cpu
+*.mem
+*.trace
+# testify/rapid failure archives: reproducible from the seed, not worth versioning
+.rapid/
+/testdata/fuzz/
+
+# --- tooling artifacts ------------------------------------------------------------------------
+.loadtest/
+evidence/
+/sbom/
+*.cyclonedx.json
+*.spdx.json
+.golangci-cache/
+.gocache/
+
+# --- local stack ------------------------------------------------------------------------------
+# The postgres binary that appears at the repo root on some local setups: a 4 MB artifact
+# nobody meant to commit.
+/postgres
+/redis-server
+docker-compose.override.yml
+
+# --- editors and OS ---------------------------------------------------------------------------
+.idea/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- language tooling -------------------------------------------------------------------------
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- deliberately NOT ignored -------------------------------------------------------------------
+# go.sum          — the integrity record; ignoring it defeats module verification entirely
+# .golangci.yml   — the lint configuration is part of the contract, not a local preference
+# scripts/secrets-allowlist.txt — hashes, not secrets; each entry is a reviewed exemption
+# scripts/licence-exceptions.txt — a reviewed licence decision
+
+# Compiled service binaries. `go build ./cmd/...` drops these in the repo root; they are
+# 25-40MB each and there is no reason for one to be committed. Build into ./bin via the
+# Makefile instead.
+/control-plane-api
+/payment-api
+/payment-orchestrator
+/workflow-worker
+/webhook-ingress
+/outbox-relay
+/event-consumer
+/gateway-simulator
+/platformctl
+/bin/

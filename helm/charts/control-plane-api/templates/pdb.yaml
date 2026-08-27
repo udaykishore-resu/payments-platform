@@ -1,0 +1,30 @@
+{{- if .Values.pdb.enabled }}
+{{/*
+Sized so a voluntary disruption cannot take the service below its SLO capacity.
+A node drain, an AZ drain and a rolling upgrade are all voluntary; the PDB is the
+only thing that makes them refuse to proceed rather than proceed destructively.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pp-common.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+{{- if .Values.pdb.minAvailable }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+{{- else if .Values.pdb.maxUnavailable }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+{{- else }}
+{{- fail (printf "%s: pdb.enabled is true but neither minAvailable nor maxUnavailable is set" (include "pp-common.name" .)) }}
+{{- end }}
+{{- if and .Values.pdb.minAvailable .Values.pdb.maxUnavailable }}
+{{- fail (printf "%s: set exactly one of pdb.minAvailable / pdb.maxUnavailable" (include "pp-common.name" .)) }}
+{{- end }}
+  selector:
+    matchLabels:
+{{- include "pp-common.selectorLabels" . | nindent 6 }}
+{{- end }}

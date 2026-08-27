@@ -1,0 +1,97 @@
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pp-common.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+{{- with .Values.service.annotations }}
+{{ toYaml . | indent 4 }}
+{{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+{{- include "pp-common.selectorLabels" . | nindent 4 }}
+  ports:
+{{- if .Values.ports.http }}
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+      protocol: TCP
+{{- end }}
+{{- if .Values.ports.grpc }}
+    - name: grpc
+      port: {{ .Values.ports.grpc }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: kubernetes.io/h2c
+{{- end }}
+    - name: metrics
+      port: {{ .Values.ports.metrics }}
+      targetPort: metrics
+      protocol: TCP
+{{- if and .Values.rollout.enabled (or .Values.ports.http .Values.ports.grpc) }}
+---
+# Canary and stable Services exist so Argo Rollouts can shift a traffic weight
+# between two ReplicaSets. maxUnavailable: 0 means the stable set is never scaled
+# down during the canary, so an abort is a weight change, not a re-deploy.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pp-common.fullname" . }}-canary
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+    pp.rollout-role: canary
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  type: ClusterIP
+  selector:
+{{- include "pp-common.selectorLabels" . | nindent 4 }}
+  ports:
+{{- if .Values.ports.http }}
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+      protocol: TCP
+{{- end }}
+{{- if .Values.ports.grpc }}
+    - name: grpc
+      port: {{ .Values.ports.grpc }}
+      targetPort: grpc
+      protocol: TCP
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pp-common.fullname" . }}-stable
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+    pp.rollout-role: stable
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  type: ClusterIP
+  selector:
+{{- include "pp-common.selectorLabels" . | nindent 4 }}
+  ports:
+{{- if .Values.ports.http }}
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+      protocol: TCP
+{{- end }}
+{{- if .Values.ports.grpc }}
+    - name: grpc
+      port: {{ .Values.ports.grpc }}
+      targetPort: grpc
+      protocol: TCP
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: pp-observability
+
+# Dashboards as code. The Grafana sidecar (or the Amazon Managed Grafana
+# provisioner) watches for ConfigMaps carrying grafana_dashboard=1 and loads
+# them; a dashboard edited in the UI is overwritten on the next sync, which is
+# the intended outcome — an unversioned dashboard is a dashboard nobody can
+# review, diff or restore.
+configMapGenerator:
+  - name: pp-dashboards
+    files:
+      - dashboard-executive.json
+      - dashboard-service-health.json
+      - dashboard-gateway-health.json
+      - dashboard-onboarding-funnel.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+        app.kubernetes.io/part-of: payments-platform
+      annotations:
+        argocd.argoproj.io/sync-wave: "1"
+        k8s-sidecar-target-directory: /tmp/dashboards/payments-platform
+
+generatorOptions:
+  # A hash suffix would create a new ConfigMap on every dashboard edit and leave
+  # the old ones behind for the sidecar to keep loading.
+  disableNameSuffixHash: true

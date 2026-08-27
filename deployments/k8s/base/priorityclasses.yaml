@@ -1,0 +1,92 @@
+# PriorityClasses, ordered by the graceful-degradation ladder
+# (docs/failure-handling.md §4) read backwards: what must survive longest gets
+# the highest value. Under node pressure the eviction order is the reverse —
+# batch first, then observability, then the control plane, and the money path
+# last.
+#
+# Applied in sync wave -2, before any workload can reference one: a pod naming
+# a PriorityClass that does not exist is rejected at admission.
+---
+# Rung 8 of the degradation ladder is 'money-out only': refunds, voids, disputes and webhook ingest must survive everything else. outbox-relay is here although it is asynchronous, because those outcomes are events and an undrained outbox is money that moved with nobody downstream informed.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pp-money-path
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "payment-api, payment-orchestrator, webhook-ingress, outbox-relay"
+---
+# Cluster plumbing the money path depends on. otel-agent is an exception at this tier because it is a DaemonSet whose eviction produces no capacity relief anyway.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pp-platform-critical
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+value: 900000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "CoreDNS, kube-proxy, CNI, otel-agent, Karpenter"
+---
+# Losing the ability to configure the platform is worse than losing metrics, so this ranks above observability. Projections and the ledger can lag and catch up, so event-consumer sits here rather than on the money path.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pp-control-plane
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+value: 500000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "control-plane-api, workflow-worker, event-consumer"
+---
+# Below the control plane, above batch: losing metrics during an incident is bad, losing the ability to configure the platform is worse.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pp-observability
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+value: 400000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Prometheus, otel-gateway, fluent-bit"
+---
+# Evicted first. A sweep can wait; a payment cannot.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pp-batch
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+value: 100000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "CronJobs, certification runs, reconciliation sweeps"
+---
+# Value 0 so a preview namespace is always the first thing to go, and can never preempt anything.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pp-preview
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+value: 0
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Ephemeral preview environments (dev cluster only)"

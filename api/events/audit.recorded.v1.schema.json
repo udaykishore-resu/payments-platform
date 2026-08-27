@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/audit.recorded.v1.json",
+  "title": "audit.recorded.v1",
+  "description": "An auditable action was recorded. Published by Audit (BC-9) on pp.audit.v1, keyed by tenant_id. The hash chain is carried in the payload so a SIEM can verify tamper-evidence WITHOUT database access: each record's entryHash covers its own content plus the prevHash, so a missing or altered record breaks the chain verifiably. Audit is the one topic with min.insync.replicas=3, because an audit gap is a compliance finding and stalling is the correct failure mode there.",
+  "type": "object",
+  "required": [
+    "auditId",
+    "actorType",
+    "actorId",
+    "action",
+    "resourceType",
+    "resourceId",
+    "outcome",
+    "prevHash",
+    "entryHash",
+    "recordedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "auditId": { "type": "string", "pattern": "^aud_[0-9A-Z]{26}$" },
+    "actorType": {
+      "type": "string",
+      "enum": ["USER", "API_CLIENT", "SYSTEM", "WORKFLOW"]
+    },
+    "actorId": {
+      "description": "The acting principal.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "action": {
+      "description": "`<resource>.<verb>`, e.g. merchant.transition_status. A stable vocabulary, so SIEM correlation rules do not break on a refactor.",
+      "type": "string",
+      "pattern": "^[a-z_]+\\.[a-z_]+$"
+    },
+    "resourceType": { "type": "string", "maxLength": 64 },
+    "resourceId": { "type": "string", "maxLength": 128 },
+    "outcome": {
+      "description": "FAILURE records matter more than SUCCESS ones: a denied action is the signal an intrusion detection rule fires on.",
+      "type": "string",
+      "enum": ["SUCCESS", "FAILURE"]
+    },
+    "diff": {
+      "description": "Field-level before/after. Secrets are [REDACTED] and personal data is omitted entirely - an audit record that leaks the data it was protecting is worse than no audit record.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["before", "after"],
+        "additionalProperties": false,
+        "properties": {
+          "before": {},
+          "after": {}
+        }
+      }
+    },
+    "sourceIp": {
+      "description": "Omitted for SYSTEM and WORKFLOW actors, which have no meaningful client address.",
+      "type": "string",
+      "maxLength": 45
+    },
+    "userAgent": { "type": "string", "maxLength": 512 },
+    "prevHash": {
+      "description": "The previous record's entryHash in this tenant's chain. All zeros for the first record.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "entryHash": {
+      "description": "sha256 over this record's canonical content concatenated with prevHash. The chain link.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "recordedAt": { "type": "string", "format": "date-time" }
+  },
+  "x-topic": "pp.audit.v1",
+  "x-partition-key": "tenant_id",
+  "x-producer": "event-consumer",
+  "x-context": "BC-9 Audit",
+  "x-consumers": ["Audit sink", "SIEM"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "actorType": "route-to-dlq", "outcome": "route-to-dlq" },
+  "examples": [
+    {
+      "auditId": "aud_01JB8ZKKKKKKKKKKKKKKKKKKKK",
+      "actorType": "USER",
+      "actorId": "usr_ops_2291",
+      "action": "merchant.transition_status",
+      "resourceType": "merchant",
+      "resourceId": "mrc_01JB8Z11111111111111111111",
+      "outcome": "SUCCESS",
+      "diff": {
+        "status": { "before": "PRODUCTION_READY", "after": "ACTIVE" }
+      },
+      "sourceIp": "203.0.113.24",
+      "userAgent": "pp-console/4.2.1",
+      "prevHash": "a1b2ff003c5d7e9f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b1c3d5e7f",
+      "entryHash": "c3d411990e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2a4b",
+      "recordedAt": "2026-08-27T19:00:00.512Z"
+    },
+    {
+      "auditId": "aud_01JB8ZRRRRRRRRRRRRRRRRRRRR",
+      "actorType": "API_CLIENT",
+      "actorId": "cli_01JB8Z55555555555555555555",
+      "action": "payment.refund",
+      "resourceType": "payment",
+      "resourceId": "pay_01JB8Z9K2QW3E4R5T6Y7V8J9N0",
+      "outcome": "FAILURE",
+      "sourceIp": "198.51.100.7",
+      "userAgent": "acme-checkout/2.9.0",
+      "prevHash": "c3d411990e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2a4b",
+      "entryHash": "e5f622aa1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e1f2a4b6c8d0e2f4a6b8c0d2e",
+      "recordedAt": "2026-08-28T09:31:02.884Z"
+    }
+  ]
+}

@@ -1,0 +1,112 @@
+# Namespaces map to planes. The separation is not cosmetic: it is the unit of
+# quota, of NetworkPolicy, of PodSecurity enforcement and of node placement.
+---
+# control-plane-api and the control-plane CronJobs. Different availability target (99.9%), different blast radius, and the most privileged IAM in the estate: config writes and credential rotation.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pp-control-plane
+  labels:
+    # PodSecurity admission. `enforce` blocks, `audit` and `warn` are also set to
+    # restricted so a violation surfaces in CI and at apply time rather than only
+    # at admission, when it is most expensive to discover.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    # Selected by NetworkPolicy from other namespaces.
+    kubernetes.io/metadata.name: pp-control-plane
+    pp.plane: control
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+---
+# The money path. Strictest NetworkPolicy, strictest PodSecurity, its own node group, its own quota.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pp-data-plane
+  labels:
+    # PodSecurity admission. `enforce` blocks, `audit` and `warn` are also set to
+    # restricted so a violation surfaces in CI and at apply time rather than only
+    # at admission, when it is most expensive to discover.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    # Selected by NetworkPolicy from other namespaces.
+    kubernetes.io/metadata.name: pp-data-plane
+    pp.plane: data
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+---
+# workflow-worker and the workflow CronJobs. Long-running leases and multi-day workflows; must never be evicted by data-plane scale-up pressure.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pp-automation
+  labels:
+    # PodSecurity admission. `enforce` blocks, `audit` and `warn` are also set to
+    # restricted so a violation surfaces in CI and at apply time rather than only
+    # at admission, when it is most expensive to discover.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    # Selected by NetworkPolicy from other namespaces.
+    kubernetes.io/metadata.name: pp-automation
+    pp.plane: automation
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+---
+# Cluster machinery: Argo CD, Argo Rollouts, cert-manager, External Secrets, KEDA, Karpenter, Kyverno, ingress-nginx, egress-proxy. Failure here degrades CHANGE, not TRAFFIC.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pp-platform
+  labels:
+    # PodSecurity admission. `enforce` blocks, `audit` and `warn` are also set to
+    # restricted so a violation surfaces in CI and at apply time rather than only
+    # at admission, when it is most expensive to discover.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    # Selected by NetworkPolicy from other namespaces.
+    kubernetes.io/metadata.name: pp-platform
+    pp.plane: platform
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+---
+# otel-agent, otel-gateway, Prometheus agent, fluent-bit, Grafana Agent. Must not compete with the money path for CPU, and must survive data-plane pressure in order to report on it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pp-observability
+  labels:
+    # PodSecurity admission. `enforce` blocks, `audit` and `warn` are also set to
+    # restricted so a violation surfaces in CI and at apply time rather than only
+    # at admission, when it is most expensive to discover.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    # Selected by NetworkPolicy from other namespaces.
+    kubernetes.io/metadata.name: pp-observability
+    pp.plane: observability
+    app.kubernetes.io/part-of: payments-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"

@@ -1,0 +1,163 @@
+{
+  "Version": "2012-10-17",
+  "Comment": "The CI deploy role. Applied by the bootstrap stack (terraform/README.md section 1), never by an env stack: a role that can edit its own policy is not a boundary. Rendered with templatefile(state_bucket, lock_table, account_id, environment).",
+  "Statement": [
+    {
+      "Sid": "ReadWriteThisEnvironmentsStateOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetObjectVersion",
+        "s3:ListBucketVersions"
+      ],
+      "Resource": "arn:aws:s3:::${state_bucket}/${environment}/*"
+    },
+    {
+      "Sid": "ListTheStateBucketUnderThisPrefixOnly",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::${state_bucket}",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "${environment}/*"
+        }
+      }
+    },
+    {
+      "Sid": "TakeAndReleaseTheStateLock",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": "arn:aws:dynamodb:*:${account_id}:table/${lock_table}"
+    },
+    {
+      "Sid": "ManageTheEstate",
+      "Effect": "Allow",
+      "Action": [
+        "acm:*",
+        "application-autoscaling:*",
+        "aps:*",
+        "backup:*",
+        "backup-storage:*",
+        "budgets:*",
+        "cloudwatch:*",
+        "dynamodb:*",
+        "ec2:*",
+        "ecr:Describe*",
+        "eks:*",
+        "elasticache:*",
+        "elasticloadbalancing:*",
+        "events:*",
+        "grafana:*",
+        "kafka:*",
+        "kms:*",
+        "lambda:*",
+        "logs:*",
+        "network-firewall:*",
+        "rds:*",
+        "route53:*",
+        "route53resolver:*",
+        "s3:*",
+        "secretsmanager:*",
+        "shield:*",
+        "sns:*",
+        "sqs:*",
+        "wafv2:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ManageIamOnlyForPlatformNamedRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:ListRoles",
+        "iam:UpdateRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:PassRole",
+        "iam:PutRolePermissionsBoundary",
+        "iam:CreateServiceLinkedRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::${account_id}:role/pp-*",
+        "arn:aws:iam::${account_id}:role/aws-service-role/*"
+      ]
+    },
+    {
+      "Sid": "ManagePoliciesAndOidcProviders",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion",
+        "iam:TagPolicy",
+        "iam:CreateOpenIDConnectProvider",
+        "iam:DeleteOpenIDConnectProvider",
+        "iam:GetOpenIDConnectProvider",
+        "iam:TagOpenIDConnectProvider",
+        "iam:UpdateOpenIDConnectProviderThumbprint"
+      ],
+      "Resource": [
+        "arn:aws:iam::${account_id}:policy/pp-*",
+        "arn:aws:iam::${account_id}:oidc-provider/*"
+      ]
+    },
+    {
+      "Sid": "NeverReadASecretValue",
+      "Comment": "The deploy role creates secret CONTAINERS and never reads a value. This is what keeps credentials out of the Terraform state file.",
+      "Effect": "Deny",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:BatchGetSecretValue"
+      ],
+      "NotResource": [
+        "arn:aws:secretsmanager:*:${account_id}:secret:${environment}/_platform/bootstrap/*"
+      ]
+    },
+    {
+      "Sid": "NeverTouchIamUsersOrAccessKeys",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "iam:CreateLoginProfile",
+        "iam:UpdateLoginProfile",
+        "iam:DeactivateMFADevice"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NeverDeleteEvidence",
+      "Effect": "Deny",
+      "Action": [
+        "s3:DeleteObjectVersion",
+        "s3:BypassGovernanceRetention",
+        "backup:DeleteRecoveryPoint",
+        "backup:DeleteBackupVaultLockConfiguration",
+        "cloudtrail:StopLogging",
+        "cloudtrail:DeleteTrail"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

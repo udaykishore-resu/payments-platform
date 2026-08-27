@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/payment.attempted.v1.json",
+  "title": "payment.attempted.v1",
+  "description": "One gateway interaction was dispatched or completed. Published by Payment Orchestration (BC-6) on pp.payments.payment.v1, keyed by payment_id. The envelope's subject is the attemptId and the aggregateid is the paymentId, because an attempt is a child of the payment aggregate and must share its ordering domain. Failover produces a NEW attempt and therefore a new event; it never amends an earlier one.",
+  "type": "object",
+  "required": [
+    "paymentId",
+    "attemptId",
+    "attemptNumber",
+    "gatewayId",
+    "gatewayCode",
+    "connectionId",
+    "operation",
+    "state",
+    "configSnapshotAgeMs",
+    "attemptedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "paymentId": { "type": "string", "pattern": "^pay_[0-9A-Z]{26}$" },
+    "attemptId": { "type": "string", "pattern": "^att_[0-9A-Z]{26}$" },
+    "attemptNumber": {
+      "description": "Dense from 1, unique per payment.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "gatewayId": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+    "gatewayCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" },
+    "connectionId": { "type": "string", "pattern": "^gwc_[0-9A-Z]{26}$" },
+    "operation": {
+      "type": "string",
+      "enum": ["AUTHORIZE", "CAPTURE", "REFUND", "VOID"]
+    },
+    "state": {
+      "description": "DISPATCHED while the gateway call is in flight, COMPLETED once a response or a timeout has been recorded.",
+      "type": "string",
+      "enum": ["DISPATCHED", "COMPLETED"]
+    },
+    "outcome": {
+      "description": "Absent while DISPATCHED. TIMEOUT_UNKNOWN means we do not know whether money moved and the attempt is NEVER retried automatically.",
+      "type": "string",
+      "enum": ["SUCCESS", "DECLINED", "ERROR", "TIMEOUT_UNKNOWN"]
+    },
+    "declineReasonCode": {
+      "description": "Normalized, never the gateway's raw string.",
+      "type": "string",
+      "maxLength": 64
+    },
+    "declineIsRetryable": {
+      "description": "Required when outcome is DECLINED. THE ROUTING FEEDBACK LOOP KEYS ON THIS. False means a hard decline, which must never be retried on another gateway - that is card-testing behaviour and gets a platform de-registered.",
+      "type": "boolean"
+    },
+    "normalizedErrorCode": {
+      "description": "Platform error code from api/errors/catalog.yaml.",
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{2,63}$"
+    },
+    "latencyMs": { "type": "integer", "minimum": 0 },
+    "routingReasons": {
+      "description": "Why this gateway was chosen.",
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,63}$" }
+    },
+    "configSnapshotAgeMs": {
+      "description": "How stale the merchant configuration was when this routing decision was made. The field that makes a staleness incident diagnosable after the fact, rather than a matter of reconstruction from deploy timestamps.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "attemptedAt": { "type": "string", "format": "date-time" }
+  },
+  "x-topic": "pp.payments.payment.v1",
+  "x-partition-key": "payment_id",
+  "x-producer": "payment-orchestrator",
+  "x-context": "BC-6 Payment Orchestration",
+  "x-consumers": ["Analytics", "Routing feedback"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "outcome": "route-to-dlq", "operation": "route-to-dlq" },
+  "examples": [
+    {
+      "paymentId": "pay_01JB8Z9K2QW3E4R5T6Y7V8J9N0",
+      "attemptId": "att_01JB8Z44444444444444444444",
+      "attemptNumber": 1,
+      "gatewayId": "stripe",
+      "gatewayCode": "stripe",
+      "connectionId": "gwc_01JB8Z88888888888888888888",
+      "operation": "AUTHORIZE",
+      "state": "COMPLETED",
+      "outcome": "SUCCESS",
+      "latencyMs": 412,
+      "routingReasons": ["PRIMARY_BY_POLICY"],
+      "configSnapshotAgeMs": 4180,
+      "attemptedAt": "2026-08-26T14:03:11.001Z"
+    },
+    {
+      "paymentId": "pay_01JB8Z9K2QW3E4R5T6Y7V8J9N0",
+      "attemptId": "att_01JB8ZFFFFFFFFFFFFFFFFFFFF",
+      "attemptNumber": 2,
+      "gatewayId": "stripe",
+      "gatewayCode": "adyen",
+      "connectionId": "gwc_01JB8Z88888888888888888888",
+      "operation": "AUTHORIZE",
+      "state": "COMPLETED",
+      "outcome": "DECLINED",
+      "declineReasonCode": "INSUFFICIENT_FUNDS",
+      "declineIsRetryable": false,
+      "normalizedErrorCode": "GATEWAY_DECLINED",
+      "latencyMs": 288,
+      "routingReasons": ["FALLBACK_BY_POLICY"],
+      "configSnapshotAgeMs": 4190,
+      "attemptedAt": "2026-08-26T14:03:19.100Z"
+    }
+  ]
+}

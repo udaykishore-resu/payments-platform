@@ -1,0 +1,29 @@
+{{- if and .Values.autoscaling.enabled (eq .Values.autoscaling.type "hpa") }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "pp-common.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    # Wave 4: applied after the workload exists, so the HPA never targets a
+    # Rollout/Deployment that is not yet there.
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  scaleTargetRef:
+{{- if .Values.rollout.enabled }}
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+{{- else }}
+    apiVersion: apps/v1
+    kind: Deployment
+{{- end }}
+    name: {{ include "pp-common.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+{{- toYaml .Values.autoscaling.metrics | nindent 4 }}
+  behavior:
+{{- toYaml .Values.autoscaling.behavior | nindent 4 }}
+{{- end }}

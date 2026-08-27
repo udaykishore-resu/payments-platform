@@ -1,124 +1,599 @@
-# CD: builds and pushes the image once on merge to main, then progressively deploys it through
-# staging -> prod, gated by automated canary analysis at the prod step. Manual approval
-# ("environment: production" below) is the Release Manager's sign-off point referenced in
-# docs/09-production-checklist.md.
+# .github/workflows/cd.yml — build, sign, publish, and promote.
+#
+# Implements docs/deployment.md §3.5 (image promotion) and §4.1 stages 14–22.
+#
+# ---------------------------------------------------------------------------------------
+# The one rule everything else follows from
+# ---------------------------------------------------------------------------------------
+# §3.5 rule 1: **the artifact never changes**. One image is built per commit to main, and
+# the same DIGEST — not the same tag, the digest — is what dev, staging and both production
+# regions run. Environments differ only in configuration.
+#
+# This is why there is no per-environment build job here, and why every promotion step
+# passes `${{ needs.publish.outputs.digest_<service> }}` around rather than a tag. A
+# rebuild per environment means production runs a binary that nothing tested, and the
+# difference is invisible until the one time it matters.
+#
+# ---------------------------------------------------------------------------------------
+# CI holds no cluster credentials
+# ---------------------------------------------------------------------------------------
+# §3.1: this workflow's write access to production is exactly "may open a pull request that
+# changes an image digest in the GitOps repository". It cannot `kubectl apply`, it has no
+# kubeconfig, and it cannot reach the cluster's API server. ArgoCD pulls; CI does not push.
+#
+# The consequence worth stating: a compromised CI run can propose a bad digest. It cannot
+# deploy one. The two approvals on the production promotion PR are the control, and they
+# are a control precisely because CI cannot bypass them.
+#
+# ---------------------------------------------------------------------------------------
+# Rollback
+# ---------------------------------------------------------------------------------------
+# Two mechanisms, at different timescales:
+#
+#   * Argo Rollouts (§3.4) aborts the canary automatically on an analysis-template failure
+#     and shifts traffic back to the stable ReplicaSet in seconds. No workflow is involved,
+#     because a rollback that waits for a GitHub Actions runner to schedule is not a
+#     rollback. This workflow's smoke tests are a second opinion, not the primary one.
+#   * `rollback` below reverts the GitOps commit, which is what makes the cluster's desired
+#     state match again. Without it ArgoCD would re-apply the bad digest on its next sync
+#     and undo the Rollouts abort.
+
 name: cd
 
 on:
   push:
     branches: [main]
-    paths:
-      - "services/payments-api/**"
-      - "deploy/k8s/**"
+  workflow_dispatch:
+    inputs:
+      promote_to:
+        description: "Promote an existing digest to this environment"
+        required: false
+        type: choice
+        options: [dev, staging, prod]
 
 permissions:
-  id-token: write # required for OIDC federation to the AWS deploy role — no static AWS keys in CI, mirroring docs/05-security-architecture.md's IRSA principle for the cluster itself
   contents: read
 
+concurrency:
+  # NOT cancel-in-progress. Cancelling a deployment mid-promotion leaves the GitOps
+  # repository claiming one digest and the cluster running another, which is the worst of
+  # both states. Runs queue instead.
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
-  ECR_REPOSITORY: payments-api
-  AWS_REGION: us-east-1
+  GO_VERSION: "1.24.7"
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+  REGISTRY: ghcr.io
+  IMAGE_REPO: ghcr.io/${{ github.repository }}
+  GITOPS_REPO: ${{ github.repository_owner }}/payments-platform-gitops
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+
+  # =========================================================================================
+  # prepare
+  # =========================================================================================
+  prepare:
+    name: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
-      image_tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.id.outputs.version }}
+      commit: ${{ steps.id.outputs.commit }}
+      short_sha: ${{ steps.id.outputs.short_sha }}
+      build_date: ${{ steps.id.outputs.build_date }}
+      source_date_epoch: ${{ steps.id.outputs.source_date_epoch }}
+      services: ${{ steps.svc.outputs.services }}
     steps:
       - uses: actions/checkout@v4
-      - id: tag
-        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::ACCOUNT_ID:role/github-actions-ci-deploy
-          aws-region: ${{ env.AWS_REGION }}
-      - uses: aws-actions/amazon-ecr-login@v2
-        id: ecr-login
+        with: { fetch-depth: 0, persist-credentials: false }
+      - id: id
+        run: |
+          set -euo pipefail
+          {
+            echo "version=$(git describe --tags --always 2>/dev/null || echo 0.0.0-${GITHUB_SHA::7})"
+            echo "commit=${GITHUB_SHA}"
+            echo "short_sha=${GITHUB_SHA::7}"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source_date_epoch=$(git log -1 --pretty=%ct)"
+          } >> "$GITHUB_OUTPUT"
+      - id: svc
+        run: |
+          set -euo pipefail
+          # gateway-simulator is excluded here and only here. §5 makes it a test-only
+          # deployable, and this workflow is the path to production: not building it is the
+          # first of the two independent controls (the second is the prod cluster's Kyverno
+          # ClusterPolicy denying any Pod whose image matches gateway-simulator).
+          svcs=$(for d in cmd/*/; do
+                   s=$(basename "$d")
+                   [ "$s" = "gateway-simulator" ] && continue
+                   compgen -G "$d*.go" >/dev/null && printf '%s\n' "$s"
+                 done | jq -R . | jq -sc .)
+          echo "services=${svcs:-[]}" >> "$GITHUB_OUTPUT"
+
+  # =========================================================================================
+  # Stage 14, 16, 17 — build, push, SBOM, sign, attest.
+  # =========================================================================================
+  publish:
+    name: build · push · sign (${{ matrix.service }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: prepare
+    if: needs.prepare.outputs.services != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.prepare.outputs.services) }}
+    permissions:
+      contents: read
+      packages: write
+      # cosign keyless signing. The OIDC token IS the identity: cosign records the workflow
+      # ref, the repository and the run into the certificate and logs it to Rekor. There is
+      # no private key to store, rotate, or leak — which removes the single most valuable
+      # secret a supply-chain attacker could take from this repository.
+      id-token: write
+      attestations: write
+    outputs:
+      digests: ${{ steps.collect.outputs.digests }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v5
+
+      - uses: docker/login-action@v3
         with:
-          context: services/payments-api
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64,linux/amd64
           push: true
+          build-args: |
+            SERVICE=${{ matrix.service }}
+            VERSION=${{ needs.prepare.outputs.version }}
+            COMMIT=${{ needs.prepare.outputs.commit }}
+            BUILD_DATE=${{ needs.prepare.outputs.build_date }}
+            SOURCE_DATE_EPOCH=${{ needs.prepare.outputs.source_date_epoch }}
+          # Immutable tags only (§3.5 rule 2). There is no `latest`: a mutable tag means the
+          # manifest and the running image can disagree, and "which build is in prod" stops
+          # having an answer.
           tags: |
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:staging-latest
+            ${{ env.IMAGE_REPO }}/${{ matrix.service }}:sha-${{ needs.prepare.outputs.short_sha }}
+            ${{ env.IMAGE_REPO }}/${{ matrix.service }}:${{ needs.prepare.outputs.version }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
 
-  deploy-staging:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    environment: staging
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with: { cosign-release: v2.4.1 }
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate the CycloneDX SBOM (stage 16)
+        run: |
+          set -euo pipefail
+          syft "${IMAGE_REPO}/${{ matrix.service }}@${{ steps.build.outputs.digest }}" \
+            -o cyclonedx-json="sbom-${{ matrix.service }}.cyclonedx.json"
+          n=$(jq '.components | length' "sbom-${{ matrix.service }}.cyclonedx.json")
+          [ "$n" -gt 0 ] || { echo "::error::empty SBOM for ${{ matrix.service }}"; exit 1; }
+          echo "SBOM components: $n"
+
+      - name: Scan the pushed image (stage 15)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ env.IMAGE_REPO }}/${{ matrix.service }}@${{ steps.build.outputs.digest }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: cosign sign (stage 17)
+        # By DIGEST, never by tag. Signing a tag signs a pointer that can be moved; signing
+        # a digest signs the bytes. The prod cluster's Kyverno verifyImages rule checks the
+        # digest's signature and the certificate identity below, so an image that reaches
+        # the registry by any other route is not admissible.
+        run: |
+          set -euo pipefail
+          cosign sign --yes \
+            "${IMAGE_REPO}/${{ matrix.service }}@${{ steps.build.outputs.digest }}"
+
+      - name: cosign attest the SBOM
+        run: |
+          set -euo pipefail
+          cosign attest --yes \
+            --predicate "sbom-${{ matrix.service }}.cyclonedx.json" \
+            --type cyclonedx \
+            "${IMAGE_REPO}/${{ matrix.service }}@${{ steps.build.outputs.digest }}"
+
+      - name: SLSA provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE_REPO }}/${{ matrix.service }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the signature we just made
+        # Verifying our own signature immediately is not ceremony. It is the only way to
+        # find out that the certificate identity does not match what the admission policy
+        # expects — here, in twenty seconds, rather than at 03:00 when the prod cluster
+        # refuses the deploy and nobody can tell whether the image or the policy is wrong.
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/cd\.yml@refs/heads/main$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE_REPO}/${{ matrix.service }}@${{ steps.build.outputs.digest }}" \
+            | jq -r '.[0].optional.Subject // "verified"'
+
+      - id: collect
+        run: |
+          set -euo pipefail
+          printf '%s\n' '${{ matrix.service }}=${{ steps.build.outputs.digest }}' \
+            > "digest-${{ matrix.service }}.txt"
+          echo "digests=${{ matrix.service }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.service }}
+          path: digest-${{ matrix.service }}.txt
+          retention-days: 90
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.cyclonedx.json
+          retention-days: 90
+
+  # =========================================================================================
+  # Stage 21-22 — traceability and the SLO budget gate, on the merged result.
+  # =========================================================================================
+  post-merge-gates:
+    name: traceability · SLO budget
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: prepare
     steps:
       - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::ACCOUNT_ID:role/github-actions-ci-deploy
-          aws-region: ${{ env.AWS_REGION }}
-      - name: point kubeconfig at staging cluster
-        run: aws eks update-kubeconfig --name payments-staging --region ${{ env.AWS_REGION }}
-      - uses: imranismail/setup-kustomize@v2
-      - name: set image tag and apply
-        working-directory: deploy/k8s/overlays/staging
-        run: |
-          kustomize edit set image ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/payments-api=ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
-          kustomize build . | kubectl apply -f -
-          kubectl -n payments-staging rollout status deployment/payments-api --timeout=5m
-      - name: smoke test staging
-        run: ./scripts/smoke-test.sh https://payments-api.staging.internal
+        with: { fetch-depth: 0, persist-credentials: false }
+      - uses: actions/setup-go@v5
+        with: { go-version: "${{ env.GO_VERSION }}", cache: true, cache-dependency-path: go.sum }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python3 -m pip install --quiet pyyaml jsonschema
 
-  deploy-prod:
-    needs: [build-and-push, deploy-staging]
-    runs-on: ubuntu-latest
-    # Requires a human reviewer to approve in the GitHub Environments UI before this job runs —
-    # the concrete implementation of the Release Manager sign-off gate in
-    # docs/09-production-checklist.md. Configure required reviewers on the "production"
-    # environment in repo settings.
-    environment: production
+      - name: Traceability (stage 21)
+        run: ./scripts/traceability.sh --check
+
+      - name: SLO budget gate (stage 22)
+        # observability.md §4.4: burn > 2× freezes features, > 10× in an hour is an incident
+        # and a rollback. The gate reads the current burn rate from the Prometheus workspace
+        # and blocks a non-exempt deploy in the freeze tier. It is a *deploy* gate rather
+        # than a merge gate: code can land while the budget is spent, it just cannot ship.
+        run: |
+          set -euo pipefail
+          if [ ! -x scripts/slo-gate.sh ]; then
+            echo "::warning::scripts/slo-gate.sh is not present — the SLO budget gate did NOT run"
+            exit 0
+          fi
+          ./scripts/slo-gate.sh --environment prod
+
+  # =========================================================================================
+  # dev — auto-promoted, no gate.
+  # =========================================================================================
+  promote-dev:
+    name: promote → dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [prepare, publish, post-merge-gates]
+    environment:
+      name: dev
+      url: https://api.dev.example.com
     steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: "digest-*", merge-multiple: true, path: digests }
+
+      - name: Open the GitOps promotion PR
+        id: pr
+        uses: ./.github/actions/gitops-promote
         with:
-          role-to-assume: arn:aws:iam::ACCOUNT_ID:role/github-actions-ci-deploy
-          aws-region: ${{ env.AWS_REGION }}
-      - name: point kubeconfig at prod cluster
-        run: aws eks update-kubeconfig --name payments-prod --region ${{ env.AWS_REGION }}
-      - uses: imranismail/setup-kustomize@v2
+          gitops_repo: ${{ env.GITOPS_REPO }}
+          environment: dev
+          digests_dir: digests
+          image_repo: ${{ env.IMAGE_REPO }}
+          commit: ${{ needs.prepare.outputs.commit }}
+          version: ${{ needs.prepare.outputs.version }}
+          # dev auto-merges: the whole point of dev is that it is where the e2e suite runs
+          # against a real cluster, and a human approval in front of that is a human
+          # approving something nobody has any information about yet.
+          auto_merge: "true"
+          token: ${{ secrets.GITOPS_TOKEN }}
 
-      - name: canary — deploy to 10% of pods
-        working-directory: deploy/k8s/overlays/prod
+      - name: Wait for ArgoCD to sync dev
         run: |
-          kustomize edit set image ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/payments-api=ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
-          # Progressive delivery: this repo's baseline uses a plain RollingUpdate (see
-          # docs/09-production-checklist.md's canary-analysis requirement). A cluster with Argo
-          # Rollouts or Flagger installed replaces this step with a Rollout resource that shifts
-          # traffic 10% -> 50% -> 100% automatically, gated on the same error-rate/latency
-          # comparison this workflow does manually below. Documented here as the concrete next
-          # step rather than silently pretending the RollingUpdate strategy alone is canarying.
-          kustomize build . | kubectl apply -f -
-          kubectl -n payments rollout status deployment/payments-api --timeout=10m
-
-      - name: automated canary analysis
-        run: |
-          # Compares error rate and P99 latency for the new revision against the pre-deploy
-          # baseline over a bake window, querying Prometheus directly. Fails (non-zero exit) if
-          # the new revision's SLO burn rate exceeds docs/07-reliability-slo.md's fast-burn
-          # threshold — this is the automated half of "automated rollback on canary-analysis
-          # failure" from docs/09-production-checklist.md.
-          ./scripts/canary-analysis.sh \
-            --prometheus-url "$PROMETHEUS_URL" \
-            --deployment payments-api \
-            --namespace payments \
-            --bake-seconds 300 \
-            --max-error-rate 0.01 \
-            --max-p99-ms 600
+          set -euo pipefail
+          echo "ArgoCD auto-syncs dev on merge (§3.2). Waiting for the rollout to report healthy."
+          # The wait is on the GitOps repo's status, not on the cluster: CI has no cluster
+          # credentials (§3.1). ArgoCD writes a commit status back when the sync completes.
+          for i in $(seq 1 60); do
+            state=$(gh api "repos/${GITOPS_REPO}/commits/main/status" --jq '.state' 2>/dev/null || echo unknown)
+            [ "$state" = "success" ] && { echo "dev synced"; exit 0; }
+            [ "$state" = "failure" ] && { echo "::error::ArgoCD reported a failed sync"; exit 1; }
+            sleep 20
+          done
+          echo "::error::timed out waiting for the dev sync"
+          exit 1
         env:
-          PROMETHEUS_URL: ${{ secrets.PROMETHEUS_URL }}
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
 
-      - name: rollback on canary failure
-        if: failure()
+  # =========================================================================================
+  # dev smoke — the e2e and contract suites against a real cluster.
+  # =========================================================================================
+  smoke-dev:
+    name: smoke (dev)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [prepare, promote-dev]
+    environment:
+      name: dev
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-go@v5
+        with: { go-version: "${{ env.GO_VERSION }}", cache: true, cache-dependency-path: go.sum }
+
+      - name: e2e suite
+        env:
+          PP_E2E_BASE_URL: https://api.dev.example.com
+          PP_E2E_TOKEN: ${{ secrets.DEV_E2E_TOKEN }}
+        run: go test -tags=e2e ./tests/e2e/... -count=1 -timeout 25m
+
+      - name: Contract suite against the dev gateways
+        env:
+          PP_CONTRACT_TARGET: dev
+        run: go test -tags=contract ./tests/contract/... -count=1 -timeout 15m
+
+  # =========================================================================================
+  # staging — promoted when dev is green.
+  # =========================================================================================
+  promote-staging:
+    name: promote → staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [prepare, publish, smoke-dev]
+    environment:
+      name: staging
+      url: https://api.staging.example.com
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: "digest-*", merge-multiple: true, path: digests }
+      - uses: ./.github/actions/gitops-promote
+        with:
+          gitops_repo: ${{ env.GITOPS_REPO }}
+          environment: staging
+          digests_dir: digests
+          image_repo: ${{ env.IMAGE_REPO }}
+          commit: ${{ needs.prepare.outputs.commit }}
+          version: ${{ needs.prepare.outputs.version }}
+          auto_merge: "true"
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+  smoke-staging:
+    name: smoke (staging)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [prepare, promote-staging]
+    environment:
+      name: staging
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-go@v5
+        with: { go-version: "${{ env.GO_VERSION }}", cache: true, cache-dependency-path: go.sum }
+
+      - name: e2e suite
+        env:
+          PP_E2E_BASE_URL: https://api.staging.example.com
+          PP_E2E_TOKEN: ${{ secrets.STAGING_E2E_TOKEN }}
+        run: go test -tags=e2e ./tests/e2e/... -count=1 -timeout 25m
+
+      - name: k6 steady-state (abbreviated)
+        # §3.5 rule 5 requires a 24-hour soak plus a load test before production. The soak
+        # runs in nightly.yml against whatever staging holds; this is the fast confidence
+        # check that the new digest is not obviously slower — ten minutes, not four hours.
+        # The full pre-release matrix is `scripts/loadtest.sh all`.
+        env:
+          PP_LOADTEST_BASE: https://api.staging.example.com
+          PP_LOADTEST_TOKEN: ${{ secrets.STAGING_LOADTEST_TOKEN }}
+        run: ./scripts/loadtest.sh steady-state --duration 10m
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-loadtest-summary
+          path: .loadtest/
+          retention-days: 30
+
+  # =========================================================================================
+  # production — the manual gate.
+  #
+  # The `production` GitHub environment carries required reviewers, so this job does not
+  # start until two humans approve it (deployment.md §4.2: two approvals for anything
+  # touching domain, migrations, terraform or api). The approval is on the ENVIRONMENT, not
+  # on a step, which means it is recorded, auditable, and cannot be skipped by re-running
+  # the workflow.
+  # =========================================================================================
+  promote-prod:
+    name: promote → production (manual gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [prepare, publish, smoke-staging]
+    environment:
+      name: production
+      url: https://api.example.com
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      gitops_sha: ${{ steps.promote.outputs.gitops_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { pattern: "digest-*", merge-multiple: true, path: digests }
+
+      - name: Verify every digest is signed before proposing it
+        # The last chance to catch an unsigned image before it is proposed to production.
+        # Kyverno would refuse it at admission anyway, but a promotion PR that will be
+        # refused wastes two approvals and an on-call's evening.
         run: |
-          kubectl -n payments rollout undo deployment/payments-api
-          kubectl -n payments rollout status deployment/payments-api --timeout=5m
-          echo "::error::Canary analysis failed — automatically rolled back. See docs/08-runbook.md section 8."
+          set -euo pipefail
+          curl -sSL -o /usr/local/bin/cosign \
+            https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64
+          chmod +x /usr/local/bin/cosign
+          for f in digests/digest-*.txt; do
+            entry=$(cat "$f"); svc="${entry%%=*}"; digest="${entry#*=}"
+            echo "verifying $svc @ $digest"
+            cosign verify \
+              --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/cd\.yml@refs/heads/main$" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${IMAGE_REPO}/${svc}@${digest}" > /dev/null
+          done
+          echo "every digest is signed by this workflow on main"
 
-      - name: post-deploy smoke test
-        run: ./scripts/smoke-test.sh https://payments-api.internal
+      - id: promote
+        uses: ./.github/actions/gitops-promote
+        with:
+          gitops_repo: ${{ env.GITOPS_REPO }}
+          environment: prod
+          digests_dir: digests
+          image_repo: ${{ env.IMAGE_REPO }}
+          commit: ${{ needs.prepare.outputs.commit }}
+          version: ${{ needs.prepare.outputs.version }}
+          # NOT auto-merged. §3.5 rule 3: promotion is a PR, so promotion history is git
+          # history — who, when, which digest, which approvals. The PR requires two
+          # approvals and a change record in the GitOps repository's own branch protection.
+          auto_merge: "false"
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Production promotion proposed"
+            echo ""
+            echo "The GitOps PR is open and needs **two approvals**. On merge, ArgoCD"
+            echo "syncs \`prod-eu-west-1\` and Argo Rollouts runs the canary"
+            echo "1 → 10 → 25 → 50 → 100 with the analysis templates of §3.4."
+            echo ""
+            echo "\`prod-eu-central-1\` receives the same digest 30 minutes after"
+            echo "eu-west-1 stabilises (§3.5 rule 4) — a DR region running a different"
+            echo "build is a DR plan that has not been tested."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =========================================================================================
+  # Automatic rollback.
+  #
+  # Runs when a promotion job fails. It reverts the GitOps commit so that the cluster's
+  # desired state matches the last known-good digest again.
+  #
+  # What this is NOT: the primary rollback. Argo Rollouts aborts the canary and shifts
+  # traffic back to the stable ReplicaSet within seconds of an analysis failure, without
+  # any workflow running — a rollback that waits for a GitHub runner to be scheduled is not
+  # a rollback. This job exists because ArgoCD would otherwise re-apply the bad digest on
+  # its next sync and undo what Rollouts did.
+  # =========================================================================================
+  rollback:
+    name: rollback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [prepare, promote-dev, smoke-dev, promote-staging, smoke-staging, promote-prod]
+    if: |
+      always() && (
+        needs.smoke-dev.result == 'failure' ||
+        needs.smoke-staging.result == 'failure' ||
+        needs.promote-staging.result == 'failure' ||
+        needs.promote-prod.result == 'failure'
+      )
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Determine what to revert
+        id: what
+        run: |
+          set -euo pipefail
+          if   [ "${{ needs.smoke-staging.result }}" = "failure" ] || \
+               [ "${{ needs.promote-staging.result }}" = "failure" ]; then env=staging
+          elif [ "${{ needs.promote-prod.result }}" = "failure" ]; then env=prod
+          else env=dev
+          fi
+          echo "environment=$env" >> "$GITHUB_OUTPUT"
+          echo "rolling back $env"
+
+      - name: Revert the GitOps commit
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          ENVIRONMENT: ${{ steps.what.outputs.environment }}
+        run: |
+          set -euo pipefail
+          git clone --depth 20 "https://x-access-token:${GH_TOKEN}@github.com/${GITOPS_REPO}.git" gitops
+          cd gitops
+          git config user.name  "payments-platform-ci"
+          git config user.email "ci@users.noreply.github.com"
+          # Find the commit this run introduced for this environment and revert exactly it.
+          # `git revert` rather than a force-push or a reset: the history of what was
+          # deployed and un-deployed is the audit trail, and rewriting it destroys the one
+          # record of the incident.
+          target=$(git log --format='%H %s' -- "environments/${ENVIRONMENT}/image-versions.yaml" \
+                   | grep -m1 "${{ needs.prepare.outputs.short_sha }}" | cut -d' ' -f1 || true)
+          if [ -z "$target" ]; then
+            echo "::warning::no GitOps commit for ${{ needs.prepare.outputs.short_sha }} in $ENVIRONMENT — nothing to revert"
+            exit 0
+          fi
+          git revert --no-edit "$target"
+          git push origin main
+          echo "reverted $target in $ENVIRONMENT"
+
+      - name: Raise an incident issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh issue create \
+            --title "Deployment rolled back: ${{ needs.prepare.outputs.short_sha }} in ${{ steps.what.outputs.environment }}" \
+            --label "incident,deployment" \
+            --body "$(cat <<EOF
+          The promotion of \`${{ needs.prepare.outputs.commit }}\` to
+          **${{ steps.what.outputs.environment }}** failed and the GitOps commit has been
+          reverted.
+
+          | | |
+          |---|---|
+          | Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+          | dev smoke | ${{ needs.smoke-dev.result }} |
+          | staging promote | ${{ needs.promote-staging.result }} |
+          | staging smoke | ${{ needs.smoke-staging.result }} |
+          | prod promote | ${{ needs.promote-prod.result }} |
+
+          Argo Rollouts will have already shifted traffic back to the stable ReplicaSet if
+          the canary analysis failed (deployment.md §3.4). This revert is what stops ArgoCD
+          re-applying the failed digest on its next sync.
+
+          Next: read the analysis-template output and the smoke-test artifacts on the run
+          above before re-promoting. Do not re-run this workflow to "try again" — the
+          digest is unchanged, so the result will be too.
+          EOF
+          )"

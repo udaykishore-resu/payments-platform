@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.gateway_provisioned.v1.json",
+  "title": "merchant.gateway_provisioned.v1",
+  "description": "A gateway sub-account was provisioned for a merchant and the connection reached PROVISIONED. Published by Gateway Registry (BC-4) on pp.merchants.merchant.v1, keyed by merchant_id. Credentials are never carried - only the fact that a reference exists. The capabilities block is the RESOLVED INTERSECTION of what the gateway supports and what the merchant asked for, so a consumer does not have to recompute it.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "connectionId",
+    "gatewayId",
+    "gatewayCode",
+    "environment",
+    "externalAccountRef",
+    "webhookRegistered",
+    "credentialsStored",
+    "capabilities",
+    "provisionedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": { "type": "string", "pattern": "^mrc_[0-9A-Z]{26}$" },
+    "connectionId": {
+      "description": "The merchant-to-gateway binding.",
+      "type": "string",
+      "pattern": "^gwc_[0-9A-Z]{26}$"
+    },
+    "gatewayId": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+    "gatewayCode": {
+      "description": "Stable gateway code, e.g. stripe, adyen, paypal.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{1,31}$"
+    },
+    "environment": {
+      "description": "A SANDBOX provisioning never certifies a PRODUCTION connection.",
+      "type": "string",
+      "enum": ["SANDBOX", "PRODUCTION"]
+    },
+    "externalAccountRef": {
+      "description": "The gateway's sub-account identifier. Provisioning is idempotent on this value, so a retry after an ambiguous failure adopts the existing sub-account instead of creating a second one.",
+      "type": "string",
+      "maxLength": 256
+    },
+    "webhookRegistered": { "type": "boolean" },
+    "credentialsStored": {
+      "description": "That a credential reference exists. NEVER the credentials themselves - the material lives only in the secrets manager under an IAM path scoped to (env, tenant, merchant, gateway).",
+      "type": "boolean"
+    },
+    "capabilities": { "$ref": "#/$defs/resolvedCapabilities" },
+    "provisionedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "resolvedCapabilities": {
+      "title": "Resolved capabilities",
+      "description": "The intersection of the gateway's capability descriptor and the merchant's requested scope. Routing treats an absent capability as a hard exclusion, never as 'probably fine'.",
+      "type": "object",
+      "required": ["currencies", "paymentMethods", "countries", "supports3DS", "supportsPartialCapture"],
+      "additionalProperties": false,
+      "properties": {
+        "currencies": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Z]{3}$" }
+        },
+        "paymentMethods": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,31}$" }
+        },
+        "countries": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Z]{2}$" }
+        },
+        "supports3DS": { "type": "boolean" },
+        "supportsPartialCapture": { "type": "boolean" }
+      }
+    }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "workflow-worker",
+  "x-context": "BC-4 Gateway Registry",
+  "x-consumers": ["Onboarding", "Configuration", "Audit"],
+  "x-revision": 1,
+  "x-unknown-behaviour": { "environment": "route-to-dlq" },
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "connectionId": "gwc_01JB8Z88888888888888888888",
+      "gatewayId": "stripe",
+      "gatewayCode": "adyen",
+      "environment": "PRODUCTION",
+      "externalAccountRef": "AcmeGmbH_ECOM",
+      "webhookRegistered": true,
+      "credentialsStored": true,
+      "capabilities": {
+        "currencies": ["EUR", "USD"],
+        "paymentMethods": ["CARD", "IDEAL"],
+        "countries": ["DE", "NL"],
+        "supports3DS": true,
+        "supportsPartialCapture": true
+      },
+      "provisionedAt": "2026-08-27T14:21:09.882Z"
+    }
+  ]
+}

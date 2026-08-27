@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/events/merchant.created.v1.json",
+  "title": "merchant.created.v1",
+  "description": "A merchant was registered under a tenant and is in state CREATED. Published by the Merchant Registry (BC-2) on the topic pp.merchants.merchant.v1, keyed by merchant_id. Registration does not start onboarding; the Onboarding context consumes this event and waits for an explicit start.",
+  "type": "object",
+  "required": [
+    "merchantId",
+    "displayName",
+    "legalName",
+    "incorporationCountry",
+    "mcc",
+    "residencyRegion",
+    "declaredMonthlyVolume",
+    "createdBy"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "merchantId": {
+      "description": "The new merchant.",
+      "type": "string",
+      "pattern": "^mrc_[0-9A-Z]{26}$"
+    },
+    "externalReference": {
+      "description": "The tenant's own identifier for this merchant, if supplied. Unique within the tenant.",
+      "type": "string",
+      "maxLength": 128
+    },
+    "displayName": {
+      "description": "Human-readable name used in consoles and notifications.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "legalName": {
+      "description": "Registered legal name from the business profile.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "incorporationCountry": {
+      "description": "ISO 3166-1 alpha-2 country of incorporation.",
+      "type": "string",
+      "pattern": "^[A-Z]{2}$"
+    },
+    "mcc": {
+      "description": "ISO 18245 merchant category code. Drives risk policy, gateway eligibility and prohibited-category checks.",
+      "type": "string",
+      "pattern": "^[0-9]{4}$"
+    },
+    "residencyRegion": {
+      "description": "Determines where this merchant's personal data may live, and constrains which gateways routing may later select.",
+      "type": "string",
+      "maxLength": 32
+    },
+    "declaredMonthlyVolume": {
+      "$ref": "#/$defs/money",
+      "description": "Self-declared expected monthly processing volume. A risk and gateway-selection input, and the baseline against which volume anomalies are measured."
+    },
+    "selectedGateways": {
+      "description": "Gateway codes requested at signup. Advisory: the onboarding workflow provisions what is actually eligible.",
+      "type": "array",
+      "maxItems": 8,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" }
+    },
+    "createdBy": {
+      "description": "Actor identifier: an API client, a console user, or system:<component>.",
+      "type": "string",
+      "maxLength": 128
+    }
+  },
+  "$defs": {
+    "money": {
+      "title": "Money",
+      "description": "Integer minor units plus ISO 4217 code. Never a float, never a decimal string.",
+      "type": "object",
+      "required": ["amount", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  },
+  "x-topic": "pp.merchants.merchant.v1",
+  "x-partition-key": "merchant_id",
+  "x-producer": "control-plane-api",
+  "x-context": "BC-2 Merchant Registry",
+  "x-consumers": ["Onboarding", "Audit", "Analytics"],
+  "x-revision": 1,
+  "examples": [
+    {
+      "merchantId": "mrc_01JB8Z11111111111111111111",
+      "externalReference": "acme-eu-01",
+      "displayName": "Acme GmbH",
+      "legalName": "Acme Handels GmbH",
+      "incorporationCountry": "DE",
+      "mcc": "5812",
+      "residencyRegion": "eu-central-1",
+      "declaredMonthlyVolume": { "amount": 25000000, "currency": "EUR" },
+      "selectedGateways": ["adyen", "stripe"],
+      "createdBy": "cli_01JB8Z55555555555555555555"
+    }
+  ]
+}

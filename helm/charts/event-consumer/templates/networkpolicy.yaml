@@ -1,0 +1,237 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $ns := .Release.Namespace }}
+{{- $np := .Values.networkPolicy }}
+{{- $g := .Values.global }}
+{{/*
+Explicit allows only. There is no catch-all rule anywhere in this file: the
+namespace default-deny (deployments/k8s/base/networkpolicy-default-deny.yaml)
+denies both directions, and every flow below is one of the enumerated flows in
+security.md §2.3. Anything absent is denied -- including pp-data -> pp-control,
+which is how the fail-static architectural rule is made physically true, and
+169.254.169.254 (IMDS), which no CIDR below contains.
+*/}}
+---
+# --- DNS: the only universally granted egress, and still port- and
+# namespace-scoped. A blanket "allow UDP/53 anywhere" is an exfiltration tunnel.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pp-common.fullname" . }}-egress-dns
+  namespace: {{ $ns }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector:
+    matchLabels:
+{{- include "pp-common.selectorLabels" . | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.dns.namespace }}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- if or $np.ingress.fromIngressController $np.ingress.fromPaymentAPI $np.ingress.fromPrometheus }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pp-common.fullname" . }}-ingress
+  namespace: {{ $ns }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector:
+    matchLabels:
+{{- include "pp-common.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+{{- if $np.ingress.fromIngressController }}
+    # Public ingress arrives only through ingress-nginx, never directly.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $g.namespaces.ingress }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.http }}
+{{- end }}
+{{- if $np.ingress.fromPaymentAPI }}
+    # payment-api is the ONLY caller of the orchestrator. Selected by identity
+    # label, not by IP.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-api
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.grpc }}
+{{- end }}
+{{- if $np.ingress.fromPrometheus }}
+    # Scraping is ingress-only: the scraped pod gets no reciprocal egress.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $g.namespaces.observability }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.metrics }}
+{{- end }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pp-common.fullname" . }}-egress-data
+  namespace: {{ $ns }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  podSelector:
+    matchLabels:
+{{- include "pp-common.selectorLabels" . | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+{{- if $np.egress.database }}
+    # Aurora, in the data subnets. Those subnets have no NAT and no IGW at all --
+    # the absence of a route is a stronger control than a security-group rule.
+    - to:
+{{- range $g.networkCidrs.database }}
+        - ipBlock:
+            cidr: {{ . }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $np.ports.database }}
+{{- end }}
+{{- if $np.egress.redis }}
+    # ElastiCache, TLS in transit, auth token from Secrets Manager.
+    - to:
+{{- range $g.networkCidrs.database }}
+        - ipBlock:
+            cidr: {{ . }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $np.ports.redis }}
+{{- end }}
+{{- if $np.egress.kafka }}
+    # MSK, SASL_SSL with IAM auth.
+    - to:
+{{- range $g.networkCidrs.streaming }}
+        - ipBlock:
+            cidr: {{ . }}
+{{- end }}
+      ports:
+{{- range $np.ports.kafka }}
+        - protocol: TCP
+          port: {{ . }}
+{{- end }}
+{{- end }}
+{{- if $np.egress.toOrchestrator }}
+    # The internal gRPC hop. mTLS-terminated pod-to-pod; the orchestrator still
+    # re-derives the tenant from the propagated identity and re-applies the
+    # isolation guard -- "it came from payment-api" is not a trust shortcut.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-orchestrator
+      ports:
+        - protocol: TCP
+          port: 9443
+{{- end }}
+{{- if $np.egress.otelAgent }}
+    # Node-local otel-agent DaemonSet, reached on the host IP. Expressed as the
+    # pod/node subnets because a NetworkPolicy cannot select "my own node".
+    - to:
+{{- range $g.networkCidrs.pods }}
+        - ipBlock:
+            cidr: {{ . }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $np.ports.otel }}
+{{- end }}
+{{- if $np.egress.awsEndpoints }}
+    # Interface VPC endpoints (Secrets Manager, KMS, STS, ECR, CloudWatch). AWS
+    # traffic never touches the internet; the endpoint policy is a second,
+    # non-IAM check on top of the IRSA role.
+    - to:
+{{- range $g.networkCidrs.pods }}
+        - ipBlock:
+            cidr: {{ . }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $np.ports.https }}
+{{- end }}
+{{- if $np.egress.gatewayProxy }}
+---
+{{/*
+Per-gateway egress. Two hops, deliberately: the pod may reach ONLY the
+domain-allowlisting egress proxy, and the proxy holds the destination list.
+A NetworkPolicy cannot express a DNS name, so a CIDR-only rule would allow the
+whole internet on 443 -- the single largest exfiltration channel in a payments
+platform. The gateways this service may be configured to reach are enumerated in
+.Values.networkPolicy.gateways and asserted against
+terraform/modules/egress-allowlist in CI.
+{{ range $np.gateways }}  gateway: {{ .name }} -> {{ .host }}
+{{ end }}
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pp-common.fullname" . }}-egress-gateways
+  namespace: {{ $ns }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+    pp.gateways: {{ range $i, $gw := $np.gateways }}{{ if $i }},{{ end }}{{ $gw.name }}{{ end }}
+spec:
+  podSelector:
+    matchLabels:
+{{- include "pp-common.selectorLabels" . | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $g.namespaces.platform }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: egress-proxy
+      ports:
+        - protocol: TCP
+          port: {{ $np.ports.egressProxy }}
+{{- if $np.egress.natEgress }}
+    # The NAT-attached egress subnets. Reachable only from the services that
+    # actually call a gateway; payment-api has no rule like this at all, which is
+    # the network expression of the bulkhead in baseline §5.
+    - to:
+{{- range $g.networkCidrs.egress }}
+        - ipBlock:
+            cidr: {{ . }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $np.ports.https }}
+{{- end }}
+{{- end }}
+{{- end }}

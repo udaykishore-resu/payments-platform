@@ -1,0 +1,81 @@
+# Umbrella defaults. Production-shaped, because a default that is only
+# correct in dev is a default nobody notices is wrong in prod.
+#
+# Per-environment overrides: values-dev.yaml / values-staging.yaml /
+# values-prod.yaml. Image digests are NOT set here — they come from the
+# GitOps repo's environments/<env>/image-versions.yaml, so a promotion is a
+# one-line reviewable diff and the artifact never changes between
+# environments.
+
+global:
+  environment: prod
+  region: eu-west-1
+  regionActive: "true"
+  imageRegistry: 111122223333.dkr.ecr.eu-west-1.amazonaws.com/payments-platform
+  accountId: "111122223333"
+  clusterDomain: cluster.local
+  networkCidrs:
+    pods:      ["10.20.16.0/20", "10.20.80.0/20", "10.20.96.0/20"]
+    database:  ["10.20.32.0/22", "10.20.36.0/22", "10.20.40.0/22"]
+    streaming: ["10.20.48.0/22", "10.20.52.0/22", "10.20.56.0/22"]
+    egress:    ["10.20.64.0/22", "10.20.68.0/22", "10.20.72.0/22"]
+  namespaces:
+    platform: pp-platform
+    observability: pp-observability
+    ingress: pp-platform
+
+# PriorityClasses are cluster-scoped and owned by
+# deployments/k8s/base/priorityclasses.yaml, applied in sync wave -2 before
+# any workload references one. Enable this only for a standalone
+# `helm install` into a cluster where the Kustomize base has not been
+# applied (a preview environment, a kind cluster).
+priorityClasses:
+  create: false
+
+control-plane-api:
+  enabled: true
+  replicaCount: 3
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+payment-api:
+  enabled: true
+  replicaCount: 12
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+payment-orchestrator:
+  enabled: true
+  replicaCount: 12
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+workflow-worker:
+  enabled: true
+  replicaCount: 3
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+webhook-ingress:
+  enabled: true
+  replicaCount: 6
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+outbox-relay:
+  enabled: true
+  replicaCount: 4
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+event-consumer:
+  enabled: true
+  replicaCount: 6
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+platformctl:
+  enabled: true
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+

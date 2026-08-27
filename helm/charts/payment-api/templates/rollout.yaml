@@ -1,0 +1,70 @@
+{{- if .Values.rollout.enabled }}
+{{/*
+Argo Rollouts canary (deployment.md §3.4). The pod spec is IDENTICAL to the
+Deployment alternative -- both include pp-common.podSpec -- so switching the flag
+changes the delivery mechanism and nothing about the workload.
+*/}}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "pp-common.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "pp-common.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWave | default "2" | quote }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.rollout.revisionHistoryLimit }}
+  progressDeadlineSeconds: {{ .Values.rollout.progressDeadlineSeconds }}
+  selector:
+    matchLabels:
+{{- include "pp-common.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+{{- include "pp-common.labels" . | nindent 8 }}
+      annotations:
+{{- include "pp-common.podAnnotations" . | nindent 8 }}
+    spec:
+{{- include "pp-common.podSpec" . | nindent 6 }}
+  strategy:
+    canary:
+{{- if or .Values.ports.http .Values.ports.grpc }}
+      canaryService: {{ include "pp-common.fullname" . }}-canary
+      stableService: {{ include "pp-common.fullname" . }}-stable
+{{- if .Values.rollout.trafficRouting.alb }}
+      trafficRouting:
+        alb:
+          ingress: {{ .Values.rollout.trafficRouting.ingressName }}
+          servicePort: {{ .Values.ports.http }}
+{{- end }}
+{{- end }}
+      maxSurge: {{ .Values.rollout.maxSurge | quote }}
+      # Never reduce capacity to deploy. The old ReplicaSet is never scaled down
+      # during the canary, which is what makes an abort a weight change rather
+      # than a re-deploy -- traffic shifts back within one reconcile (~10s).
+      maxUnavailable: {{ .Values.rollout.maxUnavailable }}
+{{- if .Values.rollout.analysis.enabled }}
+      analysis:
+        templates:
+          - templateName: {{ include "pp-common.fullname" . }}-sli
+        startingStep: {{ .Values.rollout.analysis.startingStep }}
+        args:
+          - name: service
+            value: {{ include "pp-common.name" . }}
+          - name: canary-hash
+            valueFrom:
+              podTemplateHashValue: Latest
+{{- end }}
+      steps:
+{{- range .Values.rollout.steps }}
+{{- if hasKey . "setWeight" }}
+        - setWeight: {{ .setWeight }}
+{{- else }}
+        - pause:
+            duration: {{ .pause }}
+{{- end }}
+{{- end }}
+        - setWeight: 100
+{{- end }}

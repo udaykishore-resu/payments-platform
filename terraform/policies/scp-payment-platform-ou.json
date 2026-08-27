@@ -1,0 +1,197 @@
+{
+  "Version": "2012-10-17",
+  "Comment": "Applied at the OU level from pp-org-management. NOT applied by this repository - an account inside the OU cannot attach its own SCP, which is the point. Reproduced here so the outer boundary is reviewable alongside the stacks that operate inside it. See docs/deployment.md 2.1.",
+  "Statement": [
+    {
+      "Sid": "DenyDisablingSecurityTelemetry",
+      "Effect": "Deny",
+      "Action": [
+        "cloudtrail:StopLogging",
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:UpdateTrail",
+        "cloudtrail:PutEventSelectors",
+        "guardduty:DeleteDetector",
+        "guardduty:DisassociateFromMasterAccount",
+        "guardduty:UpdateDetector",
+        "securityhub:DisableSecurityHub",
+        "securityhub:DeleteMembers",
+        "config:DeleteConfigurationRecorder",
+        "config:StopConfigurationRecorder",
+        "config:DeleteDeliveryChannel",
+        "access-analyzer:DeleteAnalyzer"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/pp-break-glass-*"
+        }
+      }
+    },
+    {
+      "Sid": "DenyKmsKeyDeletionOutsideBreakGlass",
+      "Effect": "Deny",
+      "Action": [
+        "kms:ScheduleKeyDeletion",
+        "kms:DisableKeyRotation",
+        "kms:DeleteAlias"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/pp-break-glass-*"
+        }
+      }
+    },
+    {
+      "Sid": "DenyPublicS3",
+      "Effect": "Deny",
+      "Action": [
+        "s3:PutAccountPublicAccessBlock",
+        "s3:DeleteAccountPublicAccessBlock",
+        "s3:PutBucketPublicAccessBlock"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/pp-break-glass-*"
+        }
+      }
+    },
+    {
+      "Sid": "DenyUnencryptedRdsCreation",
+      "Effect": "Deny",
+      "Action": [
+        "rds:CreateDBCluster",
+        "rds:CreateDBInstance"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "rds:StorageEncrypted": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyUnencryptedEbsCreation",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:CreateVolume"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "ec2:Encrypted": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyUnencryptedS3Put",
+      "Effect": "Deny",
+      "Action": "s3:PutObject",
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:x-amz-server-side-encryption": "aws:kms"
+        },
+        "Null": {
+          "s3:x-amz-server-side-encryption": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyClusterDeletionWhileDeletionProtectionIsOn",
+      "Comment": "rds:DeleteDBCluster is denied unless DeletionProtection was already turned off in a SEPARATE, earlier API call. Deleting a production cluster therefore takes two audited actions by two approvals, not one.",
+      "Effect": "Deny",
+      "Action": "rds:DeleteDBCluster",
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "rds:DeletionProtection": "true"
+        }
+      }
+    },
+    {
+      "Sid": "DenyActionsOutsideApprovedRegions",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:*",
+        "organizations:*",
+        "route53:*",
+        "cloudfront:*",
+        "waf:*",
+        "wafv2:GetWebACL",
+        "support:*",
+        "budgets:*",
+        "ce:*",
+        "health:*",
+        "shield:*",
+        "sts:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": [
+            "eu-west-1",
+            "eu-central-1",
+            "us-east-1"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyRootUserExceptDocumentedBreakGlass",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:root"
+        }
+      }
+    },
+    {
+      "Sid": "DenyCrossAccountProductionSnapshotSharingExceptToTheBackupVault",
+      "Comment": "docs/deployment.md 6.1: production data never leaves production, and the one permitted destination is the backup-vault account.",
+      "Effect": "Deny",
+      "Action": [
+        "rds:ModifyDBClusterSnapshotAttribute",
+        "rds:ModifyDBSnapshotAttribute"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "rds:ValueFromAttribute": "PP_BACKUP_VAULT_ACCOUNT_ID"
+        }
+      }
+    },
+    {
+      "Sid": "DenyRemovingThePermissionsBoundaryFromWorkloadRoles",
+      "Effect": "Deny",
+      "Action": [
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:PutRolePermissionsBoundary"
+      ],
+      "Resource": "arn:aws:iam::*:role/pp-*",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/pp-terraform-*"
+        }
+      }
+    },
+    {
+      "Sid": "DenyHumanReadsOfProductionSecrets",
+      "Comment": "security.md 5.1: no human IAM principal has GetSecretValue on /prod/**, and an account admin cannot re-grant it.",
+      "Effect": "Deny",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:*:*:secret:/prod/*",
+      "Condition": {
+        "ArnLike": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::*:role/pp-human-*",
+            "arn:aws:iam::*:role/AWSReservedSSO_*"
+          ]
+        }
+      }
+    }
+  ]
+}

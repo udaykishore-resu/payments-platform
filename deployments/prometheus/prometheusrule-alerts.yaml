@@ -1,0 +1,774 @@
+# The alert catalog (observability.md §3.5).
+#
+# Severity: P1 pages 24x7, P2 pages during business hours and tickets
+# otherwise, P3 tickets only. Every alert carries severity, runbook_url and a
+# summary/description with templated labels — a required CI check fails the
+# build if a runbook link 404s.
+#
+# Alertmanager routes on `severity` and `plane`, and inhibits everything with
+# plane=data while AllGatewaysUnhealthy or a region-failover alert is active,
+# so a single root cause produces one page rather than thirty.
+#
+# NOTABLY ABSENT, ON PURPOSE: CPU, memory and pod-restart alerts. Those are
+# symptoms with no reliable relationship to user pain — they belong on
+# dashboards and in postmortems, and they page only when they cause an SLI to
+# burn. The two exceptions are the ones that predict imminent, unrecoverable
+# failure: disk fill on stateful nodes, and OOMKilled on payment-orchestrator
+# (an OOM mid-gateway-call produces TIMEOUT_UNKNOWN — money in an unknown
+# state).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pp-alert-rules
+  namespace: pp-observability
+  labels:
+    app.kubernetes.io/part-of: payments-platform
+    prometheus: pp
+    role: alert-rules
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  groups:
+    - name: pp.alerts.control-plane
+      interval: 30s
+      rules:
+        - alert: ControlPlaneAvailabilityBurn
+          expr: |
+            pp:control_plane_error:ratio_rate1h > 14.4 * 0.001 and pp:control_plane_error:ratio_rate5m > 14.4 * 0.001
+          for: 5m
+          labels:
+            severity: P2
+            plane: control
+            service: control-plane-api
+            slo: control_plane_availability
+            page: "false"
+          annotations:
+            summary: 'control-plane-api burning its 99.9% availability budget at 14.4x'
+            description: >-
+              The control plane is degraded. The data plane is unaffected by design:
+              it runs fail-static on its last-known-good config snapshot until
+              max_config_staleness (15 min), after which new merchants are rejected.
+              Fix within that window.
+            runbook_url: https://docs.example.com/runbooks/control-plane.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp:control_plane_error:ratio_rate1h > 14.4 * 0.001 and pp:control_plane_error:ratio_rate5m > 14.4 * 0.001
+    - name: pp.alerts.business
+      interval: 30s
+      rules:
+        - alert: PaymentAuthorizationRateDrop
+          expr: |
+            (pp:payment_authorization_rate:baseline7d - pp:payment_authorization_rate:ratio_rate30m) > 0.05
+            and sum by (gateway) (rate(pp_payments_total[30m])) > 0.5
+          for: 10m
+          labels:
+            severity: P1
+            plane: data
+            service: payment-orchestrator
+            slo: authorization_rate
+            page: "true"
+          annotations:
+            summary: 'Authorization rate on {{ $labels.gateway }} is {{ printf "%.1f" (mul $value 100) }}pp below its 7-day baseline'
+            description: >-
+              More than 5 percentage points below baseline for 10 minutes, with a
+              >0.5 payments/s volume guard so a low-volume gateway cannot page on
+              three declines. The baseline is offset 1h so this incident cannot
+              lower its own threshold. This alert is the one that catches money
+              quietly not moving while every technical SLI looks fine.
+            runbook_url: https://docs.example.com/runbooks/gateway-degradation.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              (pp:payment_authorization_rate:baseline7d - pp:payment_authorization_rate:ratio_rate30m) > 0.05
+              and sum by (gateway) (rate(pp_payments_total[30m])) > 0.5
+    - name: pp.alerts.gateway
+      interval: 30s
+      rules:
+        - alert: AllGatewaysUnhealthy
+          expr: |
+            count(pp_circuit_breaker_state{operation="authorize"} == 2)
+            == count(pp_circuit_breaker_state{operation="authorize"})
+          for: 1m
+          labels:
+            severity: P1
+            plane: data
+            service: payment-orchestrator
+            page: "true"
+          annotations:
+            summary: 'Every gateway circuit is OPEN for authorize — no payments can be authorised'
+            description: >-
+              All {{ $value }} configured gateways are UNHEALTHY for the authorize
+              operation. New payments fail closed with 503 NO_ELIGIBLE_GATEWAY and
+              Retry-After. Refunds, voids and webhook ingest continue (degradation
+              ladder rung 8). Alertmanager inhibits every other plane=data alert
+              while this fires, so one root cause produces one page.
+            runbook_url: https://docs.example.com/runbooks/no-eligible-gateway.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              count(pp_circuit_breaker_state{operation="authorize"} == 2)
+              == count(pp_circuit_breaker_state{operation="authorize"})
+        - alert: GatewayCircuitOpen
+          expr: |
+            pp_circuit_breaker_state == 2
+          for: 2m
+          labels:
+            severity: P2
+            plane: data
+            service: payment-orchestrator
+            page: "false"
+          annotations:
+            summary: 'Circuit OPEN for {{ $labels.gateway }}/{{ $labels.operation }}'
+            description: >-
+              Traffic is being shed from this gateway and the routing engine has
+              excluded it. Failover to the next candidate in the routing plan is
+              automatic; this is a ticket unless it is the last healthy gateway.
+              Declines are NOT counted as errors, so an open circuit means transport
+              or 5xx failures, not merchant behaviour.
+            runbook_url: https://docs.example.com/runbooks/gateway-degradation.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_circuit_breaker_state == 2
+        - alert: GatewayErrorRateHigh
+          expr: |
+            pp:gateway_error:ratio_rate5m > 0.25
+          for: 3m
+          labels:
+            severity: P2
+            plane: data
+            service: payment-orchestrator
+            page: "false"
+          annotations:
+            summary: '{{ $labels.gateway }}/{{ $labels.operation }} error ratio {{ printf "%.1f" (mul $value 100) }}%'
+            description: >-
+              Above the 25% threshold that trips the health FSM to UNHEALTHY. Check
+              the error class breakdown on the gateway dashboard: timeout and
+              transport point at the gateway or the network, contract_violation
+              points at us.
+            runbook_url: https://docs.example.com/runbooks/gateway-degradation.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp:gateway_error:ratio_rate5m > 0.25
+        - alert: GatewayLatencyHigh
+          expr: |
+            pp:gateway_latency:p99_5m > 5
+          for: 5m
+          labels:
+            severity: P2
+            plane: data
+            service: payment-orchestrator
+            page: "false"
+          annotations:
+            summary: '{{ $labels.gateway }}/{{ $labels.operation }} p99 is {{ printf "%.1f" $value }}s'
+            description: >-
+              Past the 5s UNHEALTHY threshold and approaching the 8s hard timeout.
+              Every slow call holds a bulkhead slot, so this becomes a capacity
+              problem for the orchestrator before it becomes a latency problem for
+              the merchant.
+            runbook_url: https://docs.example.com/runbooks/gateway-degradation.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp:gateway_latency:p99_5m > 5
+        - alert: NoEligibleGatewayErrors
+          expr: |
+            sum(rate(pp_http_requests_total{status="5xx",route="/v1/payments"}[5m])) > 0
+            and on() count(pp_circuit_breaker_state{operation="authorize"} == 2) > 0
+          for: 2m
+          labels:
+            severity: P1
+            plane: data
+            service: payment-api
+            page: "true"
+          annotations:
+            summary: 'Payments are failing with no eligible gateway'
+            description: >-
+              5xx on /v1/payments while at least one circuit is open. Merchants are
+              being told to retry later. Confirm whether the remaining gateways can
+              absorb the traffic before forcing a route.
+            runbook_url: https://docs.example.com/runbooks/no-eligible-gateway.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              sum(rate(pp_http_requests_total{status="5xx",route="/v1/payments"}[5m])) > 0
+              and on() count(pp_circuit_breaker_state{operation="authorize"} == 2) > 0
+    - name: pp.alerts.money
+      interval: 30s
+      rules:
+        - alert: ReconciliationExceptionsCritical
+          expr: |
+            pp_reconciliation_exceptions{severity="critical"} > 0
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: payment-orchestrator
+            page: "true"
+          annotations:
+            summary: '{{ $value }} critical reconciliation exception(s) open'
+            description: >-
+              Unresolved money ambiguity at critical severity: we do not know
+              whether money moved for these payments. A critical exception blocks a
+              merchant's transition to ACTIVE and must be resolved by a human, not
+              waited out.
+            runbook_url: https://docs.example.com/runbooks/reconciliation.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_reconciliation_exceptions{severity="critical"} > 0
+        - alert: ReconciliationExceptionsRising
+          expr: |
+            pp_reconciliation_exceptions{severity=~"high|medium"} > 25
+          for: 30m
+          labels:
+            severity: P2
+            plane: data
+            service: payment-orchestrator
+            page: "false"
+          annotations:
+            summary: '{{ $value }} unresolved reconciliation exceptions at {{ $labels.severity }}'
+            description: >-
+              Volume rather than severity. Usually one gateway's lookup API is
+              failing, so timeout-unknown attempts cannot be resolved automatically
+              and accumulate.
+            runbook_url: https://docs.example.com/runbooks/reconciliation.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_reconciliation_exceptions{severity=~"high|medium"} > 25
+        - alert: TimeoutUnknownSpike
+          expr: |
+            sum(rate(pp_payments_total{outcome="timeout_unknown"}[10m]))
+            / clamp_min(sum(rate(pp_payments_total{outcome="created"}[10m])), 1e-9) > 0.01
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: payment-orchestrator
+            page: "true"
+          annotations:
+            summary: '{{ printf "%.1f" (mul $value 100) }}% of payments ended in TIMEOUT_UNKNOWN'
+            description: >-
+              Above 1% of created payments. Each one is a payment where we do not
+              know whether money moved: the payment stays PROCESSING, no retry and
+              no failover happen, and resolution comes from a webhook, a gateway
+              lookup by the deterministic key, or the settlement report. Escalate if
+              the resolving path is also failing.
+            runbook_url: https://docs.example.com/runbooks/timeout-unknown.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              sum(rate(pp_payments_total{outcome="timeout_unknown"}[10m]))
+              / clamp_min(sum(rate(pp_payments_total{outcome="created"}[10m])), 1e-9) > 0.01
+    - name: pp.alerts.async
+      interval: 30s
+      rules:
+        - alert: OutboxBacklogGrowing
+          expr: |
+            pp_outbox_backlog > 10000 and deriv(pp_outbox_backlog[10m]) > 0
+          for: 10m
+          labels:
+            severity: P2
+            plane: data
+            service: outbox-relay
+            page: "false"
+          annotations:
+            summary: 'Outbox backlog {{ $value }} rows on {{ $labels.topic }} and rising'
+            description: >-
+              The relay is not keeping up or Kafka is unhealthy. KEDA scales the
+              relay on this exact metric, so a rising backlog with the relay already
+              at maxReplicaCount means the bottleneck is downstream. The payment
+              path is unaffected — that decoupling is why the outbox exists.
+            runbook_url: https://docs.example.com/runbooks/outbox.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_outbox_backlog > 10000 and deriv(pp_outbox_backlog[10m]) > 0
+        - alert: OutboxStalled
+          expr: |
+            pp_outbox_backlog > 0 and rate(pp_outbox_published_total[5m]) == 0
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: outbox-relay
+            page: "true"
+          annotations:
+            summary: 'Outbox has {{ $value }} rows and the relay has published nothing for 5 minutes'
+            description: >-
+              Backlog with zero publish rate is a stalled relay, not a slow one: a
+              stuck advisory lock, a crash-loop, or a Kafka authentication failure.
+              Nothing downstream — projections, ledger, audit, merchant webhooks —
+              is advancing.
+            runbook_url: https://docs.example.com/runbooks/outbox.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_outbox_backlog > 0 and rate(pp_outbox_published_total[5m]) == 0
+        - alert: ConsumerLagHigh
+          expr: |
+            pp_consumer_lag > 50000
+          for: 10m
+          labels:
+            severity: P2
+            plane: data
+            service: event-consumer
+            page: "false"
+          annotations:
+            summary: 'Consumer lag {{ $value }} on {{ $labels.topic }} (group {{ $labels.group }})'
+            description: >-
+              Projections are behind. KEDA scales consumers on lag, capped at the
+              partition count, so lag that persists at max replicas means a slow
+              handler or one hot partition — check for a poison partition before
+              adding capacity that cannot be used.
+            runbook_url: https://docs.example.com/runbooks/consumer-lag.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_consumer_lag > 50000
+        - alert: LedgerConsumerLagCritical
+          expr: |
+            pp_consumer_lag{group="ledger"} > 10000
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: event-consumer
+            page: "true"
+          annotations:
+            summary: 'Ledger consumer lag {{ $value }} — the ledger is behind reality'
+            description: >-
+              A lagging ledger means reported balances do not reflect payments that
+              have already settled. Lower threshold than other consumers because
+              this one has financial-reporting consequences, not just a stale
+              projection.
+            runbook_url: https://docs.example.com/runbooks/consumer-lag.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_consumer_lag{group="ledger"} > 10000
+        - alert: DLQNotEmpty
+          expr: |
+            pp_dlq_depth > 0
+          for: 15m
+          labels:
+            severity: P2
+            plane: data
+            service: event-consumer
+            page: "false"
+          annotations:
+            summary: '{{ $value }} message(s) parked in {{ $labels.queue }}'
+            description: >-
+              Every DLQ message is classified within one business day; this alert
+              exists to make that enforceable. The DLQ is never auto-consumed —
+              every replay is a deliberate, approved human action.
+            runbook_url: https://docs.example.com/runbooks/dlq.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_dlq_depth > 0
+        - alert: DLQGrowingFast
+          expr: |
+            deriv(pp_dlq_depth[10m]) > 1
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: event-consumer
+            page: "true"
+          annotations:
+            summary: '{{ $labels.queue }} is filling at {{ printf "%.1f" $value }} messages/s'
+            description: >-
+              One message is a curiosity; a thousand is an incident. Group by type
+              and error signature before deciding: a fast-filling DLQ is usually one
+              deploy, one schema change or one upstream producer bug.
+            runbook_url: https://docs.example.com/runbooks/dlq.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              deriv(pp_dlq_depth[10m]) > 1
+    - name: pp.alerts.config
+      interval: 30s
+      rules:
+        - alert: ConfigSnapshotStale
+          expr: |
+            pp_config_snapshot_age_seconds > 300
+          for: 2m
+          labels:
+            severity: P2
+            plane: data
+            slo: config_propagation
+            page: "false"
+          annotations:
+            summary: 'Config snapshot on {{ $labels.service }} is {{ printf "%.0f" $value }}s old'
+            description: >-
+              Config propagation SLO is p99 <= 30s. At 900s (max_config_staleness)
+              the data plane fails closed for new merchants. This is the warning
+              with ten minutes of headroom.
+            runbook_url: https://docs.example.com/runbooks/config-staleness.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_config_snapshot_age_seconds > 300
+        - alert: ConfigSnapshotCliff
+          expr: |
+            pp_config_snapshot_age_seconds > 840
+          for: 1m
+          labels:
+            severity: P1
+            plane: data
+            slo: config_propagation
+            page: "true"
+          annotations:
+            summary: 'Config snapshot on {{ $labels.service }} is {{ printf "%.0f" $value }}s old — 60s from the fail-closed cliff'
+            description: >-
+              840s is one minute before the 900s max_config_staleness cliff, at
+              which point new-merchant payments are rejected (degradation ladder
+              rung 10). Existing merchants continue on the last-known-good snapshot.
+              One minute to react.
+            runbook_url: https://docs.example.com/runbooks/config-staleness.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_config_snapshot_age_seconds > 840
+    - name: pp.alerts.webhook
+      interval: 30s
+      rules:
+        - alert: WebhookProcessingLagHigh
+          expr: |
+            pp:webhook_processing_lag:p99_5m > 300
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: webhook-ingress
+            slo: webhook_lag
+            page: "true"
+          annotations:
+            summary: 'Webhook processing p99 is {{ printf "%.0f" $value }}s'
+            description: >-
+              The SLO is 60s; the page threshold is 5x that, because between them
+              lies 'busy', not 'broken'. Gateway webhooks are how asynchronous
+              payment outcomes reach us, so sustained lag turns into reconciliation
+              exceptions.
+            runbook_url: https://docs.example.com/runbooks/webhook-lag.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp:webhook_processing_lag:p99_5m > 300
+        - alert: WebhookIngressSlow
+          expr: |
+            histogram_quantile(0.99, sum by (le) (rate(pp_http_request_duration_seconds_bucket{service="webhook-ingress"}[5m]))) > 0.05
+          for: 5m
+          labels:
+            severity: P2
+            plane: data
+            service: webhook-ingress
+            page: "false"
+          annotations:
+            summary: 'webhook-ingress p99 is {{ printf "%.3f" $value }}s, past its 50ms budget'
+            description: >-
+              webhook-ingress accepts and persists, nothing more. Exceeding 50ms
+              means it is doing work it should not, or the write path is slow.
+              Gateways time out and retry, which multiplies the load.
+            runbook_url: https://docs.example.com/runbooks/webhook-lag.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              histogram_quantile(0.99, sum by (le) (rate(pp_http_request_duration_seconds_bucket{service="webhook-ingress"}[5m]))) > 0.05
+    - name: pp.alerts.client
+      interval: 30s
+      rules:
+        - alert: IdempotencyConflictSpike
+          expr: |
+            sum(rate(pp_idempotency_outcomes_total{outcome="conflict"}[10m])) > 1
+          for: 10m
+          labels:
+            severity: P3
+            plane: data
+            service: payment-api
+            page: "false"
+          annotations:
+            summary: 'Idempotency conflicts at {{ printf "%.2f" $value }}/s'
+            description: >-
+              A conflict is IDEMPOTENCY_KEY_REUSED: the same key with a different
+              request body. That is a client bug, not ours. Identify the tenant and
+              tell them.
+            runbook_url: https://docs.example.com/runbooks/idempotency.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              sum(rate(pp_idempotency_outcomes_total{outcome="conflict"}[10m])) > 1
+        - alert: IdempotencyInProgressStorm
+          expr: |
+            sum(rate(pp_idempotency_outcomes_total{outcome="in_progress"}[5m]))
+            / clamp_min(sum(rate(pp_idempotency_outcomes_total[5m])), 1e-9) > 0.2
+          for: 5m
+          labels:
+            severity: P2
+            plane: data
+            service: payment-api
+            page: "false"
+          annotations:
+            summary: '{{ printf "%.0f" (mul $value 100) }}% of idempotency claims hit an in-progress record'
+            description: >-
+              A retry storm: clients are retrying faster than we are completing.
+              Check whether our own latency caused it before rate-limiting the
+              client — a storm we induced is fixed by fixing us.
+            runbook_url: https://docs.example.com/runbooks/idempotency.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              sum(rate(pp_idempotency_outcomes_total{outcome="in_progress"}[5m]))
+              / clamp_min(sum(rate(pp_idempotency_outcomes_total[5m])), 1e-9) > 0.2
+    - name: pp.alerts.onboarding
+      interval: 30s
+      rules:
+        - alert: WorkflowInstancesFailed
+          expr: |
+            pp_workflow_instances{state="FAILED"} > 0
+          for: 15m
+          labels:
+            severity: P2
+            plane: automation
+            service: workflow-worker
+            page: "false"
+          annotations:
+            summary: '{{ $value }} workflow instance(s) in FAILED for {{ $labels.workflow }}'
+            description: >-
+              A failed onboarding instance has exhausted retries and compensations.
+              Each one is a merchant who is not being onboarded and does not know
+              why.
+            runbook_url: https://docs.example.com/runbooks/onboarding-stuck.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_workflow_instances{state="FAILED"} > 0
+        - alert: WorkflowManualGateAging
+          expr: |
+            pp_workflow_instances{state="AWAITING_SIGNAL"} > 20
+          for: 6h
+          labels:
+            severity: P3
+            plane: automation
+            service: workflow-worker
+            page: "false"
+          annotations:
+            summary: '{{ $value }} onboardings waiting on a manual gate'
+            description: >-
+              Not an engineering problem: the automated portion has a 30-minute SLO
+              and the manual compliance gate has a five-day timeout. This alert
+              exists so the recurring 'onboarding is slow' conversation is about
+              staffing when it is about staffing.
+            runbook_url: https://docs.example.com/runbooks/onboarding-stuck.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp_workflow_instances{state="AWAITING_SIGNAL"} > 20
+        - alert: OnboardingSLOBreach
+          expr: |
+            pp:onboarding_duration:p95_1h > 1800
+          for: 30m
+          labels:
+            severity: P3
+            plane: automation
+            service: workflow-worker
+            slo: onboarding_duration
+            page: "false"
+          annotations:
+            summary: 'Onboarding p95 is {{ printf "%.0f" (div $value 60) }} minutes, past the 30-minute SLO'
+            description: >-
+              Measures only the automated portion: time parked in external KYC and
+              manual gates is a separate series, so the SLO measures what we
+              control.
+            runbook_url: https://docs.example.com/runbooks/onboarding-stuck.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              pp:onboarding_duration:p95_1h > 1800
+    - name: pp.alerts.infra
+      interval: 30s
+      rules:
+        - alert: AuroraReplicaLagHigh
+          expr: |
+            aws_rds_aurora_global_db_replication_lag > 5
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: aurora
+            page: "true"
+          annotations:
+            summary: 'Aurora Global replication lag is {{ printf "%.1f" $value }}s'
+            description: >-
+              The RPO budget is 5s. Above it, a region failover loses more committed
+              data than the DR plan promises. Common causes: a large index build, a
+              bulk backfill, or a write burst.
+            runbook_url: https://docs.example.com/runbooks/dr-replication-lag.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              aws_rds_aurora_global_db_replication_lag > 5
+        - alert: AuroraFailoverDetected
+          expr: |
+            changes(pg_writer_instance_changed_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: P1
+            plane: data
+            service: aurora
+            page: "true"
+          annotations:
+            summary: 'Aurora writer changed — a failover is in progress or has just completed'
+            description: >-
+              Readiness probes shed traffic during the <=60s failover while liveness
+              holds, so pods stay warm and pools stay connected. Expect a burst of
+              503s with Retry-After and recovery within one probe interval. If pods
+              restarted, a liveness probe has grown a downstream dependency and that
+              is the real incident.
+            runbook_url: https://docs.example.com/runbooks/aurora-failover.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              changes(pg_writer_instance_changed_total[10m]) > 0
+        - alert: RedisUnavailable
+          expr: |
+            redis_up == 0
+          for: 1m
+          labels:
+            severity: P2
+            plane: data
+            service: redis
+            page: "false"
+          annotations:
+            summary: 'Redis is unreachable'
+            description: >-
+              Redis is an accelerator, not a source of truth: idempotency falls back
+              to Postgres, which is authoritative. Expect higher latency and higher
+              DB load, not incorrect behaviour. P2 rather than P1 for exactly that
+              reason.
+            runbook_url: https://docs.example.com/runbooks/redis-loss.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              redis_up == 0
+        - alert: KafkaUnderReplicated
+          expr: |
+            kafka_cluster_partition_underreplicated > 0
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: kafka
+            page: "true"
+          annotations:
+            summary: '{{ $value }} under-replicated partition(s) on MSK'
+            description: >-
+              min.insync.replicas is 2 with RF=3, so one more broker loss stops
+              producers entirely and the outbox begins to back up.
+              unclean.leader.election is disabled, which is why this is availability
+              risk rather than data-loss risk.
+            runbook_url: https://docs.example.com/runbooks/kafka.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              kafka_cluster_partition_underreplicated > 0
+        - alert: PaymentOrchestratorOOMKilled
+          expr: |
+            increase(kube_pod_container_status_last_terminated_reason{reason="OOMKilled",container="payment-orchestrator"}[15m]) > 0
+          for: 0m
+          labels:
+            severity: P2
+            plane: data
+            service: payment-orchestrator
+            page: "false"
+          annotations:
+            summary: 'payment-orchestrator OOMKilled on {{ $labels.pod }}'
+            description: >-
+              One of only two resource alerts that page-worthy at all (the other is
+              disk fill on stateful nodes). CPU, memory and restart alerts are
+              otherwise deliberately absent: they are symptoms with no reliable
+              relationship to user pain. This one is here because the orchestrator
+              holds in-flight gateway calls, and an OOM mid-call produces
+              TIMEOUT_UNKNOWN attempts — money in an unknown state.
+            runbook_url: https://docs.example.com/runbooks/orchestrator-memory.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              increase(kube_pod_container_status_last_terminated_reason{reason="OOMKilled",container="payment-orchestrator"}[15m]) > 0
+    - name: pp.alerts.meta
+      interval: 30s
+      rules:
+        - alert: MetricCardinalityBudgetExceeded
+          expr: |
+            count by (__name__, service) ({__name__=~"pp_.+"}) > 10000
+          for: 30m
+          labels:
+            severity: P3
+            plane: observability
+            page: "false"
+          annotations:
+            summary: '{{ $labels.__name__ }} on {{ $labels.service }} has {{ $value }} active series'
+            description: >-
+              Past the 10^4 per-metric per-service budget. The CI lint catches this
+              at declaration time; this is the runtime backstop for a label value
+              the code invents at runtime. Unchecked cardinality is how an
+              observability bill doubles and a query times out during an incident.
+            runbook_url: https://docs.example.com/runbooks/cardinality.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              count by (__name__, service) ({__name__=~"pp_.+"}) > 10000
+        - alert: TraceExportFailing
+          expr: |
+            rate(otelcol_exporter_send_failed_spans[5m]) > 100
+          for: 10m
+          labels:
+            severity: P3
+            plane: observability
+            page: "false"
+          annotations:
+            summary: 'Dropping {{ printf "%.0f" $value }} spans/s at the collector'
+            description: >-
+              Traces are the pillar that answers 'why is this one payment slow'.
+              Losing them degrades diagnosis, not service — hence P3 — but it
+              degrades diagnosis exactly when incidents make diagnosis matter.
+            runbook_url: https://docs.example.com/runbooks/otel.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              rate(otelcol_exporter_send_failed_spans[5m]) > 100
+    - name: pp.alerts.security
+      interval: 30s
+      rules:
+        - alert: AuditChainBroken
+          expr: |
+            increase(pp_audit_chain_verification_failures_total[1h]) > 0
+          for: 0m
+          labels:
+            severity: P1
+            plane: control
+            service: control-plane-api
+            page: "true"
+          annotations:
+            summary: 'Audit hash chain verification failed {{ $value }} time(s) in the last hour'
+            description: >-
+              The audit log is hash-chained precisely so tampering or corruption is
+              detectable. A verification failure is either data corruption or
+              someone editing history; both are Sev-1 and both need the chain frozen
+              and preserved before anything else is touched.
+            runbook_url: https://docs.example.com/runbooks/audit-integrity.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              increase(pp_audit_chain_verification_failures_total[1h]) > 0
+        - alert: TenantMismatchSpike
+          expr: |
+            sum(rate(pp_security_events_total{type="TENANT_MISMATCH"}[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: P1
+            plane: data
+            service: payment-api
+            page: "true"
+          annotations:
+            summary: 'Tenant mismatch events at {{ printf "%.2f" $value }}/s'
+            description: >-
+              A request presented a tenant scope inconsistent with its authenticated
+              identity. Either a client bug or an attempt at cross-tenant access.
+              The tenant guard rejected it — the alert is about intent, not about a
+              breach.
+            runbook_url: https://docs.example.com/runbooks/security-events.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              sum(rate(pp_security_events_total{type="TENANT_MISMATCH"}[5m])) > 0.1
+        - alert: PANDetectorHits
+          expr: |
+            increase(pp_security_events_total{type="SENSITIVE_DATA_IN_REQUEST"}[15m]) > 0
+          for: 0m
+          labels:
+            severity: P2
+            plane: data
+            service: payment-api
+            page: "false"
+          annotations:
+            summary: '{{ $value }} request(s) containing what looks like a PAN'
+            description: >-
+              The L1 detector rejected them, so no card data was stored — this
+              platform never handles PAN. It means a merchant is sending card data
+              to the wrong endpoint, which is their compliance problem and becomes
+              ours the moment we accept it. Contact the tenant.
+            runbook_url: https://docs.example.com/runbooks/pan-detector.md
+            dashboard_url: https://grafana.example.com/d/pp-service-health
+            query: |
+              increase(pp_security_events_total{type="SENSITIVE_DATA_IN_REQUEST"}[15m]) > 0

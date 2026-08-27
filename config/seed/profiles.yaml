@@ -1,0 +1,102 @@
+# config/seed/profiles.yaml — the synthetic dataset profiles `platformctl seed --profile` selects
+# between, and which `scripts/seed.sh` passes through.
+#
+# # Every dataset is generated and none is copied
+#
+# deployment.md §6.1 states the rule; it is worth restating where the data is defined. Anonymising
+# a relational payment dataset is not reliably achievable: merchant names, bank-account fragments,
+# amounts, timestamps and gateway references re-identify in combination, so a "scrubbed" production
+# dump is a breach that has not been noticed yet. There is therefore no import profile and no
+# `--from-dump`.
+#
+# # Determinism
+#
+# A profile plus a scale plus a seed produces byte-identical data. That is what lets an integration
+# test assert on a specific merchant's configuration without first querying for it, and what makes
+# "reproduce it locally" a real instruction rather than an aspiration.
+#
+# Counts below are *base* counts, multiplied by `--scale`.
+
+profiles:
+  minimal:
+    description: >-
+      One tenant, one active merchant, one gateway connection. The smallest dataset a smoke test
+      can run against.
+    tenants: 1
+    merchants_per_tenant: 1
+    payments_per_merchant: 5
+    # Every merchant is ACTIVE: a smoke test asserting the happy path should not have to find the
+    # one merchant that can transact.
+    merchant_states: [ACTIVE]
+    payment_states: [AUTHORIZED, CAPTURED]
+    gateways: [stripe]
+
+  dev:
+    description: >-
+      A working local dataset with every merchant lifecycle state and every payment state
+      represented, so a UI can be built against real shapes rather than against the happy path.
+    tenants: 2
+    merchants_per_tenant: 8
+    payments_per_merchant: 25
+    # The full lifecycle universe from baseline §8. A developer who has only ever seen ACTIVE
+    # merchants writes code that breaks the first time one is SUSPENDED.
+    merchant_states:
+      [CREATED, VALIDATING, KYC_PENDING, KYC_APPROVED, BANK_VALIDATED,
+       GATEWAY_PROVISIONING, CONFIGURING, CERTIFICATION, APPROVED, ACTIVE,
+       SUSPENDED, TERMINATED]
+    # Including the ones that are awkward: PROCESSING is the ambiguous-outcome state, and DISPUTED
+    # and PARTIALLY_REFUNDED are the ones whose arithmetic is easy to get wrong.
+    payment_states:
+      [CREATED, PROCESSING, REQUIRES_ACTION, AUTHORIZED, CAPTURED, SETTLED,
+       PARTIALLY_REFUNDED, REFUNDED, VOIDED, FAILED, DISPUTED]
+    gateways: [stripe, adyen, simulator]
+
+  integration:
+    description: >-
+      The dataset the integration suite asserts against. Deliberately small and fully enumerated:
+      a test that has to search for its fixture is a test that fails for the wrong reason.
+    tenants: 2
+    merchants_per_tenant: 4
+    payments_per_merchant: 10
+    merchant_states: [CREATED, KYC_PENDING, ACTIVE, SUSPENDED]
+    payment_states: [AUTHORIZED, CAPTURED, PROCESSING, REFUNDED, FAILED]
+    gateways: [simulator]
+    # Reconciliation exceptions are seeded explicitly. They are the state the reconciler exists to
+    # resolve, and a suite that never sees one has never tested the path that matters most.
+    reconciliation_exceptions: 3
+
+  e2e:
+    description: >-
+      An end-to-end dataset with certified connections, so the certification and onboarding flows
+      can run against merchants that are genuinely provisioned.
+    tenants: 1
+    merchants_per_tenant: 3
+    payments_per_merchant: 50
+    merchant_states: [ACTIVE, PRODUCTION_READY]
+    payment_states: [AUTHORIZED, CAPTURED, SETTLED, REFUNDED]
+    gateways: [simulator]
+
+  load:
+    description: >-
+      A volume dataset for load testing. Wide rather than deep: many merchants with few payments
+      each, because the contended resources are the per-merchant configuration cache and the
+      per-merchant rate-limit buckets, and a dataset with three merchants exercises neither.
+    tenants: 10
+    merchants_per_tenant: 200
+    payments_per_merchant: 100
+    merchant_states: [ACTIVE]
+    payment_states: [AUTHORIZED, CAPTURED, SETTLED]
+    gateways: [simulator]
+
+defaults:
+  # A fixed seed, not the clock. A seed that changes per run turns "the fixture had merchant
+  # mrc_01J…" into an unanswerable question.
+  seed: 1724680000000000000
+  scale: 25
+  # Every generated merchant starts from these documents.
+  routing_policy: config/seed/routing.yaml
+  risk_policy: config/seed/risk.yaml
+  # Synthetic currencies and countries, chosen to exercise the multi-currency and residency paths
+  # rather than to be realistic.
+  currencies: [EUR, USD, GBP]
+  countries: [DE, FR, GB, US, NL]
