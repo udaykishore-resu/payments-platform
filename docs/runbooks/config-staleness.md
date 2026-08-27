@@ -199,6 +199,6 @@ kubectl -n pp-data-plane get deployment payment-orchestrator \
 - If the alert thresholds and `PP_CONFIG_CLIFF_STALENESS` disagreed, fix that. A warning that fires
   after the thing it warns about is worse than no warning.
 - Confirm the chaos coverage:
-  `tests/chaos/config_staleness_test.go::TestDataPlaneServesStaticThenFailsClosedAtCliff` asserts
+  `internal/platform/config/provider_test.go::TestStalenessLadder` asserts
   continued processing at 14 minutes and cliff behaviour at 16, with existing merchants still
   served. If this incident's shape differs, extend it.

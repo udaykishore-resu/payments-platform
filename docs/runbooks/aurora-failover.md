@@ -180,7 +180,7 @@ reconnect: `./bin/platformctl outbox status`.
 - If a liveness probe was implicated, audit **every** deployment's probes in the same pass. This
   defect is copy-pasted between services more often than it is invented twice.
 - If it is not covered, add the chaos case:
-  `tests/chaos/postgres_failover_test.go::TestPrimaryFailoverNoDoubleCharge` kills the writer
+  `tests/chaos/infra_test.go::TestDatabaseUnavailableMidTransactionFailsClosed` removes the writer
   mid-burst and asserts every payment reaches exactly one terminal state, I3 holds, and idempotent
   replays return the stored result.
 - Ask why the failover happened. An unexplained failover is an unexamined AWS-side fault, and the

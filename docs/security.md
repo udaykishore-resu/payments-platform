@@ -11,10 +11,10 @@ Zero Trust is not "we bought a mesh". It is four claims that must each be enforc
 
 | Claim | Concrete meaning here | Enforcement point | Test |
 |---|---|---|---|
-| **No implicit trust from network position** | Being inside the VPC, the cluster, or the namespace grants zero authority. A pod in `pp-data` may not call `control-plane-api` merely because it can route to it. | NetworkPolicy default-deny (§3.3) + mesh `AuthorizationPolicy` keyed on SPIFFE ID, not IP | `tests/integration/netpolicy_test.go::TestDefaultDenyBlocksUnlistedFlow` |
-| **Every hop is authenticated** | Client→edge: TLS 1.3 + OAuth2/mTLS. Edge→service: mTLS. Service→service: mTLS with SPIFFE identity. Service→AWS: IRSA (OIDC federation, no static keys). Service→Postgres: TLS + IAM auth token. Service→Kafka: SASL_SSL (mTLS principal). | Envoy sidecar `PeerAuthentication: STRICT`; Postgres `hostssl … clientcert=verify-full`; Kafka `ssl.client.auth=required` | `tests/integration/mtls_test.go::TestPlaintextConnectionRefused` |
-| **Every request is authorized** | Authentication answers *who*; a separate mandatory stage answers *may they* (§12 stage 5). Default deny. Tenant isolation is a distinct stage *before* authorization (stage 4) so a valid token for tenant A can never reach tenant B's data even if the policy engine has a bug. | `internal/platform/authz` + `internal/policies` + Postgres RLS | `tests/integration/authz_test.go`, `TestCrossTenantAccessIsImpossible` (§16.2) |
-| **Verification is continuous, not at-connect** | Tokens are short-lived (≤ 15 min access) and re-validated per request — never cached as "session established". mTLS certs are 24 h with 12 h rotation. Health of an identity (revocation list, tenant suspension, merchant suspension) is re-checked per request against a ≤ 30 s-stale cache with priority invalidation on `merchant.suspended.v1`. | Per-request JWT validation; SDS cert rotation; §13.2 priority invalidation | `tests/integration/revocation_test.go::TestSuspendedTenantRejectedWithin30s` |
+| **No implicit trust from network position** | Being inside the VPC, the cluster, or the namespace grants zero authority. A pod in `pp-data` may not call `control-plane-api` merely because it can route to it. | NetworkPolicy default-deny (§3.3) + mesh `AuthorizationPolicy` keyed on SPIFFE ID, not IP | **none.** NetworkPolicies are rendered and structurally validated by `helm/scripts/validate-manifests.py`; no cluster has ever enforced them | <!-- doc-refs: allow-missing -->
+| **Every hop is authenticated** | Client→edge: TLS 1.3 + OAuth2/mTLS. Edge→service: mTLS. Service→service: mTLS with SPIFFE identity. Service→AWS: IRSA (OIDC federation, no static keys). Service→Postgres: TLS + IAM auth token. Service→Kafka: SASL_SSL (mTLS principal). | Envoy sidecar `PeerAuthentication: STRICT`; Postgres `hostssl … clientcert=verify-full`; Kafka `ssl.client.auth=required` | `internal/platform/authn/mtls_test.go::TestPeerAuthenticationRequiresAVerifiedChain` and `::TestParseSPIFFEID` — the identity half. The **refusal of a plaintext connection** is a mesh and server configuration property and is asserted by nothing | <!-- doc-refs: allow-missing -->
+| **Every request is authorized** | Authentication answers *who*; a separate mandatory stage answers *may they* (§12 stage 5). Default deny. Tenant isolation is a distinct stage *before* authorization (stage 4) so a valid token for tenant A can never reach tenant B's data even if the policy engine has a bug. | `internal/platform/authz` + `internal/policies` + Postgres RLS | `internal/platform/authz/authz_test.go::TestDefaultDeny` and `::TestNoAllowEverCrossesATenantBoundary`; `internal/infrastructure/postgres/rls_integration_test.go::TestCrossTenantAccessIsImpossible` (§16.2) |
+| **Verification is continuous, not at-connect** | Tokens are short-lived (≤ 15 min access) and re-validated per request — never cached as "session established". mTLS certs are 24 h with 12 h rotation. Health of an identity (revocation list, tenant suspension, merchant suspension) is re-checked per request against a ≤ 30 s-stale cache with priority invalidation on `merchant.suspended.v1`. | Per-request JWT validation; SDS cert rotation; §13.2 priority invalidation | `internal/platform/authn/jwt_test.go::TestRevocationIsRecheckedPerRequest` (a token is not trusted for its lifetime) and `internal/platform/config/provider_test.go::TestPriorityInvalidationIsImmediate` (the suspension reaches the data plane without waiting out the staleness window) |
 
 ### 1.1 Identity taxonomy
 
@@ -33,13 +33,13 @@ Zero Trust is not "we bought a mesh". It is four claims that must each be enforc
 
 | Deployable (§5) | SPIFFE ID | IAM role | May initiate connections to |
 |---|---|---|---|
-| `payment-api` | `spiffe://pp.internal/ns/pp-data/sa/payment-api` | `pp-payment-api` | `payment-orchestrator`, Redis, Postgres (read replica), Secrets Manager (JWKS cache seed) |
-| `payment-orchestrator` | `…/ns/pp-data/sa/payment-orchestrator` | `pp-payment-orchestrator` | Postgres (writer), Redis, Kafka, NAT→gateway allowlist, Secrets Manager, KMS |
-| `control-plane-api` | `…/ns/pp-control/sa/control-plane-api` | `pp-control-plane-api` | Postgres (writer), Kafka, Secrets Manager, KMS |
+| `payment-api` | `spiffe://pp.internal/ns/pp-data-plane/sa/payment-api` | `pp-payment-api` | `payment-orchestrator`, Redis, Postgres (read replica), Secrets Manager (JWKS cache seed) |
+| `payment-orchestrator` | `…/ns/pp-data-plane/sa/payment-orchestrator` | `pp-payment-orchestrator` | Postgres (writer), Redis, Kafka, NAT→gateway allowlist, Secrets Manager, KMS |
+| `control-plane-api` | `…/ns/pp-control-plane/sa/control-plane-api` | `pp-control-plane-api` | Postgres (writer), Kafka, Secrets Manager, KMS |
 | `workflow-worker` | `…/ns/pp-automation/sa/workflow-worker` | `pp-workflow-worker` | Postgres, Kafka, NAT→gateway+KYC+bank allowlist, Secrets Manager, KMS, S3 |
-| `webhook-ingress` | `…/ns/pp-data/sa/webhook-ingress` | `pp-webhook-ingress` | Postgres (writer, `inbound_webhooks` only), Secrets Manager (webhook secrets) |
-| `outbox-relay` | `…/ns/pp-data/sa/outbox-relay` | `pp-outbox-relay` | Postgres (writer, `outbox_events` only), Kafka (producer) |
-| `event-consumer` | `…/ns/pp-data/sa/event-consumer` | `pp-event-consumer` | Kafka (consumer), Postgres (writer, projections/ledger/audit), S3 |
+| `webhook-ingress` | `…/ns/pp-data-plane/sa/webhook-ingress` | `pp-webhook-ingress` | Postgres (writer, `inbound_webhooks` only), Secrets Manager (webhook secrets) |
+| `outbox-relay` | `…/ns/pp-data-plane/sa/outbox-relay` | `pp-outbox-relay` | Postgres (writer, `outbox_events` only), Kafka (producer) |
+| `event-consumer` | `…/ns/pp-data-plane/sa/event-consumer` | `pp-event-consumer` | Kafka (consumer), Postgres (writer, projections/ledger/audit), S3 |
 
 Anything not listed in the last column is denied by NetworkPolicy *and* by mesh `AuthorizationPolicy` *and* by IAM. Three independent denials; a single misconfiguration does not open a path.
 
@@ -113,7 +113,7 @@ Rules W1–W5 and W9–W11 are evaluated before the rate-based rules so a malfor
 | VPC | One per environment per region. `/16`. No VPC peering between environments — ever | Peering is a lateral-movement path and a route-table foot-gun |
 | Subnet tiers | `public/*` (ALB + NAT only, `/24` × 3 AZ) · `app/*` (EKS nodes, `/20` × 3 AZ) · `data/*` (Aurora, MSK, ElastiCache, `/22` × 3 AZ) | Three tiers, three AZs. `data/*` has **no route to any NAT gateway** |
 | Egress | Data-plane pods egress **only** via a dedicated NAT in `public/*` whose route is paired with a **domain-allowlisted** egress proxy. Everything else is `VPC endpoint` or denied | The single largest exfiltration channel in a payments platform is a compromised dependency making an outbound HTTPS call. Removing general egress removes the channel |
-| Egress allowlist | `api.stripe.com`, `*.adyen.com`, `api-m.paypal.com`, KYC vendor, bank-validation vendor, IdP JWKS. Per-destination, per-service-account. `webhook-ingress` and `event-consumer` have **no** internet egress | Enumerated in `terraform/modules/egress-allowlist`. A new destination is a reviewed PR, not a runtime decision |
+| Egress allowlist | `api.stripe.com`, `*.adyen.com`, `api-m.paypal.com`, KYC vendor, bank-validation vendor, IdP JWKS. Per-destination, per-service-account. `webhook-ingress` and `event-consumer` have **no** internet egress | Enumerated in the `network` and `edge` Terraform modules; there is no separate `terraform/modules/egress-allowlist`. A new destination is a reviewed PR, not a runtime decision | <!-- doc-refs: allow-missing -->
 | Merchant webhook egress | Delivered from a **separate** egress path (`webhook-sender` NAT + SSRF-guarding proxy, §8.2 T-10) that resolves and pins the IP before connect and refuses RFC1918/link-local/metadata targets | Merchant-supplied URLs are attacker-controlled input |
 | VPC endpoints | Interface: Secrets Manager, KMS, STS, ECR (api+dkr), CloudWatch Logs, SSM, Kinesis(Firehose), Kafka(MSK). Gateway: S3, DynamoDB. All with restrictive endpoint policies | AWS-service traffic never touches the internet, and the endpoint policy is a second `aws:PrincipalArn`/`aws:PrincipalTag` check independent of IAM |
 | Security groups | Referenced by SG-ID, never CIDR, for all intra-VPC flows. One SG per role. Aurora SG ingress: only `app-nodes` SG on 5432. MSK SG ingress: only `app-nodes` SG on 9094 | SG-to-SG references survive IP churn; a CIDR rule silently widens as subnets grow |
@@ -251,14 +251,25 @@ spec:
   rules:
     - from:
         - source:
-            principals: ["cluster.local/ns/pp-data/sa/payment-api"]
+            principals: ["cluster.local/ns/pp-data-plane/sa/payment-api"]
       to:
         - operation:
             methods: ["POST"]
             paths: ["/pp.payment.v1.PaymentOrchestrator/*"]
 ```
 
-- **Authn/authz middleware order is fixed** and mirrors §12 stages 3–6: `RequestID → Trace → Authn → TenantGuard → Authz → RateLimit/Bulkhead → Validation(L1)`. The tenant guard sits **between** authn and authz deliberately: authorization decisions are evaluated inside an already-pinned tenant scope, so a policy bug cannot produce a cross-tenant grant.
+- **The middleware order is fixed, and it is asserted rather than reviewed.** `middleware.New` builds exactly fifteen stages, outermost first, and `TestChainOrderMatchesBaselineSection12` pins the list by name so a reordering is a failing test rather than a review comment somebody might not leave:
+
+  ```
+  recover → requestid → tracing → logging → metrics
+  → bodylimit → contenttype → cors → securityheaders
+  → authn → tenant → authz → ratelimit → concurrency → idempotency → handler
+  ```
+
+  The security-relevant adjacencies, each with a failure mode behind it. `bodylimit` is where the raw octets are buffered *and* where the L1 PAN scan runs — above authentication, so a card number is rejected before it can reach a log line, an authenticator or the idempotency fingerprint. `cors` precedes `authn` because a browser preflight carries no credentials by design, and authenticating it returns 401 to a request that was only asking whether it may send the real one. `securityheaders` precedes `authn` so the headers are set on the responses later stages *reject*, not only on the ones that succeed. `tenant` sits **between** authn and authz deliberately: authorization is evaluated inside an already-pinned tenant scope, so a policy bug cannot produce a cross-tenant grant. `ratelimit` is below `tenant` because the limit is per tenant and per merchant. `idempotency` is innermost, so a key rejected by any earlier stage is never consumed — a key burned by a 401 is a key the client must not reuse and cannot tell apart from one that did work.
+- **A missing dependency fails closed, never open.** A nil `Authenticator` rejects every non-anonymous request with 401 and a nil `Authorizer` rejects every request with 403, rather than skipping the stage. The alternative turns a wiring omission in a composition root into a public payments API with no authentication — one that passes every smoke test, because every smoke test succeeds.
+- **Authorization is table-driven, not handler-driven.** The permission is derived from the `(method, route template)` pair, so a new route with no table entry is *denied* and `TestEveryRouteHasAPermission` turns that into a failing test rather than a production 403. A handler that checks its own scope is a handler that can forget, and the forgetting is invisible.
+- **The anonymous allowlist is an explicit set of route templates, not a prefix rule.** The probes and the gateway webhook ingress bypass authentication — the webhook's caller *is* the gateway, which holds no platform credential and instead signs its payload. A prefix rule is one careless route registration away from exposing a resource; an allowlist requires somebody to type the route in.
 - **The internal gRPC surface is not a trust shortcut.** `payment-orchestrator` re-derives the tenant from the propagated identity context and re-applies the isolation guard. "It came from `payment-api`, so it is fine" is precisely the implicit trust Zero Trust forbids.
 
 ### 2.5 Data (L7)
@@ -282,6 +293,17 @@ Covered in full in §5. The single-sentence version: secrets live in AWS Secrets
 ---
 
 ## 3. Authentication
+
+`internal/platform/authn` implements **four** mechanisms, and the middleware knows about none of them: it takes an `Authenticator` interface and the composition root picks, because one process serves more than one scheme — bearer tokens at the edge, mTLS peer identity inside the mesh.
+
+| Mechanism | File | Who presents it | What it yields |
+|---|---|---|---|
+| `jwt` | `jwt.go` | Machine clients (OAuth2 client-credentials) and humans (OIDC) | A `Principal` carrying `tenant_id`, scopes and an optional merchant allowlist |
+| `jwks` | `jwks.go` | — (key resolution for `jwt`) | The verification key, cached with background refresh and a two-key rotation window |
+| `mtls` | `mtls.go` | Another workload inside the mesh | A SPIFFE ID parsed from the certificate's **URI SAN**, not its CN and not a header |
+| `apikey` | `apikey.go` | Machine clients presenting client credentials directly | A `Principal` for an `api_clients` row, after a constant-time compare against material resolved from the secrets provider by reference |
+
+The fifth authenticating party is not in this list because it authenticates in the opposite direction: a **gateway** posting a webhook holds no platform credential and instead signs its payload, which the handler verifies over the raw octets (§5, and `docs/diagrams/11-webhook-flow.md`).
 
 ### 3.1 Machine clients — OAuth2 client-credentials
 
@@ -587,7 +609,7 @@ Properties that make this reviewable:
 | Deny precedence | Explicit denies are evaluated at step 2, before any grant is computed |
 | Conjunctive conditions | ABAC conditions are AND-ed; there is no disjunctive escape |
 | No self-approval | Checked explicitly, and again at the storage layer by a `CHECK (approver_id <> requester_id)` constraint |
-| Totality | No panics, no network calls, no clock reads outside the injected `Clock`. Property-tested with `tests/integration/authz_property_test.go` over generated principals × permissions × resources, asserting that no generated input yields `Allow` across a tenant boundary |
+| Totality | No panics, no network calls, no clock reads outside the injected `Clock`. Asserted exhaustively rather than by generated inputs: `internal/platform/authz/authz_test.go::TestMatrixIsComplete` walks the whole role × permission matrix, `::TestConditionsAreTotalOnEmptyInput` requires every condition to be defined on empty input (an undefined condition is one that fails open), and `::TestNoAllowEverCrossesATenantBoundary` asserts no input yields `Allow` across a tenant boundary |
 | Auditability | Every decision carries the matched rule IDs; denials are logged with the failing condition ID so an operator can answer "why was this denied" without guessing |
 | Fail-closed under dependency failure | If the role-binding cache is stale beyond its budget or the approvals store is unreachable, the result is `Deny`, not `Allow`. Authorization is the one place the platform is deliberately *not* fail-static |
 
@@ -599,10 +621,14 @@ Properties that make this reviewable:
 
 | Aspect | Design |
 |---|---|
+| Port | One `ports.SecretsProvider`, two implementations, one chooser. `secrets.New` resolves `auto` to the file backend in sandbox and AWS in production, and **never** resolves `auto` to the file backend in production; an explicit `file` still has to get past `NewFileProvider`'s own refusal. Nine binaries need a provider, and a backend selected correctly in eight composition roots and wrongly in the ninth is a credential outage in the deployable nobody exercises locally. `ParseBackend` refuses an unknown name rather than defaulting one — `PP_SECRETS_BACKEND=awss` in a production manifest must not silently select a local file |
 | Store | AWS Secrets Manager. KMS CMK per environment; per-tenant CMK for siloed-tier tenants (baseline §16.1) |
+| Client | Written directly against `net/http`, with SigV4 implemented in-package and asserted against AWS's published test vectors. Four Secrets Manager calls (`GetSecretValue`, `CreateSecret`/`PutSecretValue`, `UpdateSecretVersionStage`, `DeleteSecret`) plus one STS `AssumeRoleWithWebIdentity` do not justify the official SDK's transitive module set running inside the process that holds gateway credentials — every one of those modules is a thing to patch on a Friday. The trade is real and stated: retry classification, endpoint resolution and the credential chain are now ours |
+| Error hygiene | Every error returned from the secrets package is constructed from the reference, the HTTP status and the AWS error code — **never** from a response body, because for `GetSecretValue` the response body *is* the secret. Plaintext material exists as a bare string only long enough to be moved into a `Material`, and nowhere else |
+| Rotation overlap | `webhook-ingress` reads the current secret *and* the `AWSPREVIOUS` staging label, so both verify during a gateway's own rotation window. Reading only the current one turns every rotation into an ingress outage for the deliveries in flight |
 | Envelope | Secrets Manager performs KMS envelope encryption; application-level credential *material* is additionally envelope-encrypted with a per-tenant DEK (§2.5) before storage, so a Secrets Manager compromise alone yields ciphertext |
 | Path scheme | `/{env}/{tenant_id}/{merchant_id}/{gateway}/{purpose}` — e.g. `/prod/ten_01J.../mrc_01J.../stripe/api_key` |
-| Reference scheme | The database stores **only** a reference: `secretref://prod/ten_01J.../mrc_01J.../stripe/api_key#v3`. `gateway_credentials_meta` holds the reference, the version, the created/rotates-at timestamps and a SHA-256 fingerprint of the material (for rotation verification without ever reading the material back into a comparison log). No table anywhere holds the material |
+| Reference scheme | The database stores **only** a reference: `secret://prod/ten_01J.../mrc_01J.../stripe/api_key#v3` (the scheme is `secret://` — `secrets.Scheme`, shared by the parser, the domain's `ValidateSecretRef` and the L4 rules, because a configuration that passed validation and then failed resolution because two packages spelled the scheme differently is a defect that only appears in production). `gateway_credentials_meta` holds the reference, the version, the created/rotates-at timestamps and a SHA-256 fingerprint of the material (for rotation verification without ever reading the material back into a comparison log). No table anywhere holds the material |
 | Retrieval | At use time, over the Secrets Manager VPC endpoint, with IRSA credentials. Cached in memory ≤ 5 min, `Secret[T]`-wrapped, zeroed on eviction |
 | IAM scoping | Each deployable's role is scoped by resource path prefix and by KMS grant. Example: `payment-orchestrator` may `GetSecretValue` on `arn:aws:secretsmanager:*:*:secret:/prod/*/*/*/api_key-*` only, and only with `kms:ViaService = secretsmanager.<region>.amazonaws.com` |
 | Tenant scoping in IAM | Siloed tenants get a per-tenant condition (`secretsmanager:ResourceTag/tenant = ten_…` matched against the pod's IRSA session tag) so IAM itself enforces the tenant boundary for the highest-assurance tier |
@@ -614,7 +640,7 @@ Properties that make this reviewable:
 
 | Prohibition | Enforcement |
 |---|---|
-| No secret in an environment variable in plaintext | Admission policy rejects any pod spec whose env var name matches `(?i)(secret\|password\|token\|api_?key\|credential\|private_?key)` unless the value is a `secretKeyRef` to a bootstrap-only secret; CI runs the same check against `deployments/k8s/**` and `helm/**`. Env vars carry *references* (`PP_STRIPE_CREDENTIAL_REF=secretref://…`), never material |
+| No secret in an environment variable in plaintext | Admission policy rejects any pod spec whose env var name matches `(?i)(secret\|password\|token\|api_?key\|credential\|private_?key)` unless the value is a `secretKeyRef` to a bootstrap-only secret; CI runs the same check against `deployments/k8s/**` and `helm/**`. Env vars carry *references* (`PP_STRIPE_CREDENTIAL_REF=secret://…`), never material |
 | No secret in a ConfigMap | Admission policy + CI scan of all `ConfigMap` data for high-entropy strings and known credential prefixes (`sk_live_`, `AKIA`, `-----BEGIN`) |
 | No secret in an image | `docker history` + `trufflehog`/`gitleaks` scan of every built layer in CI; the build fails on a hit. Images are `FROM scratch`/distroless with no shell, so there is nowhere to stash one |
 | No secret in the repository | `gitleaks` pre-commit hook + a CI scan of the full history on every PR; any hit blocks the merge and triggers rotation of the leaked value regardless of whether it was real |
@@ -669,7 +695,7 @@ func (s Secret[T]) Format(f fmt.State, verb rune) { io.WriteString(f, "[REDACTED
 
 ### 6.2 Allowlist serializer
 
-There is no reflective struct logging. `internal/infrastructure/telemetry/logx` exposes typed field constructors, and only registered field names are serialized:
+There is no reflective struct logging. `internal/infrastructure/telemetry/logging.go` exposes typed field constructors, and only registered field names are serialized:
 
 ```go
 logx.Info(ctx, "payment.dispatched",
@@ -701,7 +727,7 @@ Runs in three places: L1 validation (baseline §17.2), the WAF (W2), and the log
 
 ### 6.4 Lint rules
 
-Enforced by a custom `go/analysis` pass in `scripts/lint/` and wired into CI (baseline §27 step 12).
+Intended to be enforced by a custom `go/analysis` pass; **no such pass exists** — there is no `scripts/lint/`. What enforces it today is the `forbidigo` configuration in `.golangci.yml`, `scripts/check-secrets.sh`, and the redaction tests in `internal/platform/secret/`. <!-- doc-refs: allow-missing -->
 
 | Rule | Detects | Reasoning |
 |---|---|---|
@@ -797,7 +823,7 @@ Permitted in logs: entity IDs (opaque per §6 of the baseline), `Money` in minor
 | Registry | Private ECR, immutable tags, image scanning on push, lifecycle policy retaining production digests for 7 years; pull-through cache for upstream images so no production pull depends on Docker Hub | Immutable tags make `image@sha256:` and `image:tag` equivalent claims |
 | Deployment reference | Manifests reference images by **digest only**; `:latest` is rejected at admission | A tag is a mutable pointer; a digest is a fact |
 | Vulnerability gates | `govulncheck` (Go-aware, symbol-reachability-based) on every PR; Trivy on every image. Gate: **any reachable Critical or High blocks the merge**; unreachable High is a 14-day ticket; Medium is a 90-day ticket. Production images are rescanned daily and a new Critical pages within 24 h | Symbol reachability matters: a CVE in a package whose vulnerable function is never called is not a production risk, and treating it as one trains everyone to ignore the gate |
-| Exceptions | A time-boxed, named-owner exception file (`.security/exceptions.yaml`) with an expiry date; CI fails when an exception expires | Undated exceptions become permanent |
+| Exceptions | A time-boxed, named-owner exception file with an expiry date, and a CI step that fails when an exception expires. **Neither exists** — there is no `.security/exceptions.yaml` and nothing expires an exception | Undated exceptions become permanent | <!-- doc-refs: allow-missing -->
 | Secret scanning | `gitleaks` pre-commit and full-history CI scan; GitHub push protection enabled | |
 | SAST | `gosec` + `staticcheck` + the custom passes in §6.4, all blocking | |
 | IaC scanning | `tfsec`/`checkov` on `terraform/`, `kubesec`/`kyverno-cli` on `deployments/` and `helm/`, blocking on High | An open security group is as bad as an injection bug |

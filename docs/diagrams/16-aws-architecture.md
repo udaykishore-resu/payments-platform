@@ -36,7 +36,8 @@ flowchart TB
 
   S3["S3 - certification reports, KYC evidence with Object Lock, audit archive"]
   KMS["KMS - CMK per environment, CMK per tenant on the siloed tier"]
-  SM["Secrets Manager - gateway credentials under env tenant merchant gateway"]
+  SM["Secrets Manager - gateway credentials under env tenant merchant gateway, reached over SigV4 from net/http with no AWS SDK"]
+  STS["STS - AssumeRoleWithWebIdentity for the IRSA exchange"]
   ECR["ECR - signed images, scan on push"]
 
   R53 --> WAF --> ALB
@@ -49,7 +50,9 @@ flowchart TB
   VPCE --> S3
   VPCE --> KMS
   VPCE --> SM
+  VPCE --> STS
   VPCE --> ECR
+  STS -.->|"session credentials, cached until near expiry"| SM
   EKS --> EGW --> NAT
   NAT -->|"static egress IPs, allowlisted by gateways"| EXT["Stripe, Adyen, PayPal, KYC and bank vendors"]
   AUR -.->|"encrypted with the environment CMK"| KMS
@@ -116,6 +119,18 @@ flowchart LR
   the outbox in Aurora is the source of truth and replicates with the database.
 - **KMS multi-region keys** let ciphertext written in region A be decrypted in region B without
   re-encrypting the data, which is a prerequisite for the secondary being usable at all.
+- **Secrets Manager is reached without the AWS SDK.** `internal/infrastructure/secrets` implements
+  the four Secrets Manager calls the platform makes — `GetSecretValue`, `CreateSecret`/`PutSecretValue`,
+  `UpdateSecretVersionStage`, `DeleteSecret` — plus the STS web-identity exchange, directly over
+  `net/http` with an in-package SigV4 signer asserted against AWS's published test vectors. The
+  reason is supply chain: every transitive module of the SDK would be a package running inside the
+  process that holds gateway credentials. The `STSEndpoint` and `Endpoint` knobs exist so both can
+  be pointed at the VPC endpoints above rather than the public regional hostnames.
+- **The same port has a file backend, and it is structurally barred from production.**
+  `secrets.New` in `auto` mode selects `file` in sandbox and `aws` in production, and
+  `NewFileProvider` refuses a production environment even when named explicitly. That is what lets
+  the local stack, the test suites and `gateway-simulator` run with no AWS dependency at all
+  without creating a path by which a production manifest could accidentally do the same.
 - **S3 carries Object Lock for KYC evidence and audit archive** (5-year AML retention, 7-year WORM
   audit), and every bucket is prefixed by `tenant_id` with IAM conditions on the prefix (§16.1,
   §17.3).

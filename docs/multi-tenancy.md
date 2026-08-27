@@ -18,7 +18,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 | **Pooled mechanism** | Shared Aurora cluster, shared schema. `tenant_id UUID NOT NULL` on every tenant-scoped table, first column of every composite index. PostgreSQL Row-Level Security enabled and **forced** on each. Application connects as `pp_app`, a role with neither `BYPASSRLS` nor `SUPERUSER`. Every transaction opens with `SET LOCAL app.tenant_id = $1`. |
 | **Siloed mechanism** | Dedicated schema (tier S1) or dedicated cluster (tier S2). RLS remains enabled — silo is defence in depth on top of pooled isolation, never a replacement for it. |
 | **Failure mode if absent** | A `WHERE tenant_id = ?` forgotten on one query in one repository method returns another tenant's payments. This is a single-line defect with an unbounded blast radius, and code review does not reliably catch it — a repository has dozens of methods and they all look alike. |
-| **Test** | `tests/integration/rls_test.go::TestCrossTenantAccessIsImpossible` — insert rows for tenant A and tenant B, open a transaction with `SET LOCAL app.tenant_id = B`, run an *unqualified* `SELECT * FROM payments`, assert zero rows for A. It deliberately omits the `WHERE` clause so it tests the database, not the query. |
+| **Test** | `internal/infrastructure/postgres/rls_integration_test.go::TestCrossTenantAccessIsImpossible` — insert rows for tenant A and tenant B, open a transaction with `SET LOCAL app.tenant_id = B`, run an *unqualified* `SELECT`, assert zero rows for A. It deliberately omits the `WHERE` clause so it tests the database, not the query. `::TestRLSBlocksADirectUpdate` and `::TestWithCheckRejectsACrossTenantInsert` cover the write side. |
 | **Also tested** | `TestAppRoleLacksBypassRLS` (queries `pg_roles`), `TestEveryTenantScopedTableHasForcedRLS` (enumerates `information_schema` and fails on a table without a policy — this is the test that catches the *next* migration that forgets one). |
 
 ### 1.2 Cache
@@ -28,7 +28,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 | **Pooled mechanism** | Every key is `pp:{tenant_id}:{namespace}:{id}`. The key is constructed by `cache.Key(ctx, ns, id)`, which reads the tenant from `context.Context` and returns an error if there is none — a caller cannot build an unprefixed key. Per-tenant memory quota tracked and enforced; `SCAN`-based namespace eviction for tenant offboarding. |
 | **Siloed mechanism** | Dedicated Redis logical DB (S1) or dedicated cluster (S2). |
 | **Failure mode if absent** | Cache poisoning across tenants: tenant A's merchant configuration served to tenant B because the key was `config:{merchant_id}` and merchant IDs are only unique *within* a tenant (baseline §2). Worse than a database leak because it is intermittent and therefore hard to reproduce. |
-| **Test** | `tests/integration/cache_test.go::TestCacheKeysAreTenantPrefixed` (fuzzes over key construction, asserts the prefix), `TestCacheMissOnCrossTenantKey`, and a lint rule forbidding raw `redis.Get`/`Set` outside `internal/infrastructure/redis`. |
+| **Test** | `internal/infrastructure/redis/cache_test.go::TestBuildKeyIsTenantScoped`, `::TestBuildKeyRejectsAnUntenantedKey`, `::TestEveryComponentRejectsAContextWithoutATenant` and `::TestGetOrLoadDoesNotShareFlightsAcrossTenants` — the last is the subtle one: single-flight collapsing must never merge two tenants' loads. |
 
 ### 1.3 Events
 
@@ -37,7 +37,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 | **Pooled mechanism** | Shared topics (baseline §13.3). `tenantid` is a **required** envelope extension — the codec refuses to encode an event without it. Consumers filter by tenant where they are tenant-scoped. Kafka ACLs bind each service principal to the exact topics it may read or write. |
 | **Siloed mechanism** | Dedicated topics `pp.{tenant}.…` with per-tenant ACLs. |
 | **Failure mode if absent** | A projection consumer writes tenant A's event into tenant B's read model. Because projections are asynchronous, the corruption is discovered long after the causing deploy, and the repair requires replaying from Kafka with a corrected consumer — during which the read model is wrong. |
-| **Test** | `tests/contract/events_test.go::TestEnvelopeRequiresTenantID` (codec rejects), `tests/integration/consumer_test.go::TestConsumerSetsTenantContextFromEnvelope`, `TestConsumerRejectsEventWithMismatchedTenantInPayload`. |
+| **Test** | `internal/events/envelope_test.go::TestValidateRejectsEachMissingRequiredField` (the codec refuses an envelope without a tenant) and `::TestValidateRejectsMalformedIdentifiers`; on the consumer side, `internal/events/consumer_test.go::TestIdempotentHandlerDropsDuplicates` and `::TestDedupRowRollsBackWithTheWork`. A dedicated cross-tenant-envelope rejection test does not exist. | <!-- doc-refs: allow-missing -->
 
 ### 1.4 Configuration
 
@@ -45,7 +45,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 |---|---|
 | **Mechanism** | `configurations` and `configuration_versions` are tenant-scoped rows under RLS, versioned per merchant. Reads on the payment path come from the local snapshot cache with ≤ 30 s bounded staleness (baseline §15), keyed by tenant. |
 | **Failure mode if absent** | Tenant A's routing policy applied to tenant B's payment: money routed to a gateway B has no contract with, which fails at best and settles to the wrong party at worst. |
-| **Test** | `tests/integration/config_test.go::TestConfigSnapshotIsTenantScoped`, plus `TestConfigInvalidationDoesNotCrossTenants`. |
+| **Test** | `internal/platform/config/provider_test.go::TestPriorityInvalidationIsImmediate` and `::TestInvalidationSurvivesARefreshThatDoesNotRestoreTheMerchant`. A test asserting the snapshot is tenant-scoped **does not exist**. | <!-- doc-refs: allow-missing -->
 
 ### 1.5 Credentials
 
@@ -53,7 +53,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 |---|---|
 | **Mechanism** | One secret per `(tenant, merchant, gateway)` at IAM path `/{env}/{tenant}/{merchant}/{gateway}/{purpose}`. IAM policy scoped by path prefix; siloed tenants additionally carry a `secretsmanager:ResourceTag/tenant` condition matched against the IRSA session tag. KMS CMK per environment; per-tenant CMK for siloed. |
 | **Failure mode if absent** | Tenant A's payment dispatched with tenant B's Stripe key: the charge lands in B's account. This is a financial-loss event, not merely a privacy one, and it is not reversible by a code fix. |
-| **Test** | `tests/integration/secrets_test.go::TestCredentialPathIsDerivedFromContextTenant`, `TestCredentialFetchWithMismatchedTenantIsDenied` (asserts the IAM denial, not just the application check), and `tests/integration/gateway_test.go::TestDispatchUsesOwnTenantCredential`. |
+| **Test** | `internal/infrastructure/secrets/reference_test.go::TestReferenceValidateStopsCrossTenantResolution`, `::TestReferenceValidateStopsEnvironmentCrossing` and `::TestSecretIDMirrorsTheIAMPath` — the last is what makes the application check and the IAM condition the same statement. `internal/application/payment/components_test.go::TestCredentialsAreResolvedPerCallAndNeverCached` covers the dispatch side. The **IAM denial itself** is asserted by nothing; no AWS account has ever been used. | <!-- doc-refs: allow-missing -->
 
 ### 1.6 Object storage
 
@@ -61,7 +61,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 |---|---|
 | **Mechanism** | `s3://pp-{env}-artifacts/{tenant_id}/…`. The IRSA role's policy carries `Condition: {"StringLike": {"s3:prefix": ["${aws:PrincipalTag/tenant}/*"]}}` and the object ARN pattern is likewise templated, so IAM — not application code — enforces the prefix. Siloed tenants get a dedicated bucket with a dedicated CMK. |
 | **Failure mode if absent** | KYC documents and certification reports readable across tenants. These are the most sensitive artifacts the platform holds. |
-| **Test** | `tests/integration/s3_test.go::TestCrossTenantObjectReadIsDenied` (asserts `AccessDenied` from AWS, proving the IAM condition, not the SDK wrapper). |
+| **Test** | **none.** The S3 prefix condition is a Terraform policy document that has never been applied, so nothing asserts `AccessDenied` from AWS. `internal/infrastructure/secrets/reference_test.go::TestSecretIDMirrorsTheIAMPath` is the nearest thing: it pins the path shape the condition keys off. | <!-- doc-refs: allow-missing -->
 
 ### 1.7 Logs
 
@@ -69,7 +69,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 |---|---|
 | **Mechanism** | `tenant_id` injected from `context.Context` on every record by the logging middleware (never passed by callers — see `security.md` §6.2). Log query views are filtered by the viewer's tenant claim; a `tenant-admin` querying logs receives a view scoped by a server-side filter they cannot edit. |
 | **Failure mode if absent** | Support tooling leaks one tenant's payment flow to another's administrator. Also a GDPR incident, because merchant principal identifiers are personal data. |
-| **Test** | `tests/integration/logging_test.go::TestEveryRecordCarriesTenantID`, `TestLogViewRejectsCrossTenantQuery`. |
+| **Test** | `internal/infrastructure/telemetry/logging_test.go::TestLoggerBindsContextFields` and `::TestAllowlistDropsUnregisteredKeys` — the tenant is bound from context, and an unregistered field never reaches the record. A cross-tenant log-query test **does not exist**; log-view authorization is not implemented here. | <!-- doc-refs: allow-missing -->
 
 ### 1.8 Metrics
 
@@ -77,7 +77,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 |---|---|
 | **Mechanism** | `tenant_id` is a label **only** on low-cardinality SLO counters (a bounded set: per-tenant availability and rate-limit counters). High-cardinality series carry `tenant_tier` and attach `tenant_id` as an **exemplar**, which is a trace pointer rather than a series dimension. `merchant_id` and `payment_id` are never labels (baseline §22.3). |
 | **Failure mode if absent** | Two failures at once: a cardinality explosion that takes down Prometheus (500 tenants × 48 routes × 5 statuses is already 120 000 series on one metric), and cross-tenant business-volume inference by anyone with dashboard access. |
-| **Test** | `tests/integration/metrics_test.go::TestCardinalityBudget` (asserts ≤ 10⁴ series per metric per service) and the CI metric-registry lint. |
+| **Test** | `internal/infrastructure/telemetry/metrics_test.go::TestCardinalityGuardRejectsForbiddenLabels` and `::TestSeriesOverflowFoldsRatherThanDroppingOrGrowing` — the second is the one that matters operationally: at the ceiling the guard folds into an `other` bucket rather than dropping data or growing without bound. `scripts/check-metrics-cardinality.sh` is the CI half. |
 
 ### 1.9 Compute
 
@@ -85,7 +85,7 @@ Each row of baseline §16.1 with: the mechanism, what breaks if it is absent, an
 |---|---|
 | **Mechanism** | Shared pods with per-tenant concurrency bulkheads and rate limits (§4). Siloed tier S2 gets a dedicated node group selected by taint/toleration and a dedicated namespace. |
 | **Failure mode if absent** | One tenant's traffic burst consumes the shared connection pool and the goroutine budget; every other tenant sees timeouts. This is the most *likely* isolation failure in practice — far more likely than a data leak — and it is an availability breach against the 99.99 % target (§18). |
-| **Test** | `tests/load/noisy_neighbour_test.go::TestBurstFromOneTenantDoesNotBreachAnotherSLO` — tenant A at 20× its limit while tenant B runs at nominal rate; asserts B's p99 stays within SLO and B receives zero `429`s. |
+| **Test** | **none as a load test.** The bulkhead behaviour is asserted in-process by `internal/infrastructure/resilience/ratelimiter_test.go` and `tests/chaos/retry_storm_test.go::TestAdaptiveLimiterShedsRatherThanQueues`; the multi-tenant version — tenant A at 20× its limit while tenant B stays within SLO — needs a deployed target and has never been run. | <!-- doc-refs: allow-missing -->
 
 ---
 
@@ -220,14 +220,14 @@ Defences, layered:
 | Lint | A custom analyzer rejects any SQL string literal matching `(?i)^\s*SET\s+(?!LOCAL)` outside migrations |
 | PgBouncer | `server_reset_query = DISCARD ALL` on the session-pool fallback; `ignore_startup_parameters` limited; `pool_mode = transaction` set explicitly per database rather than inherited |
 | Runtime assertion | In non-production environments, `InTx` asserts after `BEGIN` that `current_setting('app.tenant_id', true)` was empty *before* it set it. A non-empty value means a leaked session GUC and panics the test run |
-| Test | `tests/integration/pgbouncer_test.go::TestSessionGUCDoesNotLeakAcrossPooledTransactions` — runs N interleaved transactions for tenants A and B through PgBouncer with a pool size of 1, asserting each transaction sees only its own rows. With `SET` instead of `SET LOCAL`, this test fails within a handful of iterations, which is exactly why it exists |
+| Test | `internal/infrastructure/postgres/rls_integration_test.go::TestSetLocalDoesNotLeakAcrossTransactions` — asserts the session GUC set inside one transaction is invisible to the next on the same connection, which is the property PgBouncer's transaction pooling depends on. With `SET` instead of `SET LOCAL` it fails immediately, which is exactly why it exists. It runs against Postgres directly; **no test runs through PgBouncer** | <!-- doc-refs: allow-missing -->
 
 **Prepared statements.** Transaction pooling and server-side prepared statements interact badly (a statement prepared on one server connection is not present on another). `pgx` is configured with `QueryExecModeExec` / `statement_cache_capacity=0` behind PgBouncer, and PgBouncer runs `max_prepared_statements` > 0 only where the version supports protocol-level prepared statement tracking. This is a performance concern, not a correctness one, but it is the second thing that surprises people about transaction pooling and belongs next to the first.
 
 ### 2.5 The negative test
 
 ```go
-// tests/integration/rls_test.go
+// internal/infrastructure/postgres/rls_integration_test.go
 func TestCrossTenantAccessIsImpossible(t *testing.T) {
     ctx := context.Background()
     a, b := seedTenant(t, "ten_A"), seedTenant(t, "ten_B")
@@ -541,7 +541,7 @@ Online, reversible, with a bounded write-freeze measured in seconds rather than 
 
 | Phase | Actions | Guards | Events |
 |---|---|---|---|
-| **Provisioning** | Create `tenants` row (`ten_` ULID); assign tier and residency region; create KMS CMK (siloed) or attach the environment CMK; create the OAuth2 client and its first credential; create IAM path scoping and the S3 prefix; register Kafka ACLs (siloed); seed default quotas and policies from `config/tenant-defaults.yaml`; create the audit chain genesis record | `platform-admin` + dual control. Residency region must be a supported region; tier must be one the contract covers | `tenant.provisioned.v1` |
+| **Provisioning** | Create `tenants` row (`ten_` ULID); assign tier and residency region; create KMS CMK (siloed) or attach the environment CMK; create the OAuth2 client and its first credential; create IAM path scoping and the S3 prefix; register Kafka ACLs (siloed); seed default quotas and policies from the seed profiles in `config/seed/`; create the audit chain genesis record | `platform-admin` + dual control. Residency region must be a supported region; tier must be one the contract covers | `tenant.provisioned.v1` |
 | **Configuration bootstrap** | Seed default routing weights, risk policy, retention policy, notification endpoints, feature flags; create the first configuration version (`v1`); run L4 validation | Bootstrap is a normal versioned config write, so it is validated, audited and rollback-able like any other. There is no privileged "seed" path that skips validation | `configuration.published.v1` |
 | **Active** | Normal operation | | |
 | **Suspension** | Tenant-level: new payments rejected `403 TENANT_SUSPENDED`; **refunds, voids and webhook processing continue** (baseline §8, applied at tenant scope); onboarding workflows pause at their next checkpoint rather than being killed; configuration writes rejected; reads continue | Reversible. Reason recorded (non-payment, compliance, risk, contractual, tenant request). Automated suspension is available to the risk/compliance automation, not only to humans | `tenant.suspended.v1` (priority cache invalidation) |
@@ -573,7 +573,7 @@ Physical erasure of every copy of a tenant's rows — across the primary, three 
 | KYC decision + evidence reference | ≥ 5 years (`compliance.md` §5) | Retained under the retention key |
 | Everything else — merchant principal PII, contact details, KYC document contents, support correspondence, logs, projections, cache | — | Unrecoverable at step 3 |
 
-The carve-out is enumerated in `config/retention-policy.yaml`, is itself version-controlled and audited, and is asserted by `tests/integration/erasure_test.go::TestCryptoShredLeavesOnlyCarveOutReadable`. Full legal reasoning in `compliance.md` §4.5.
+The carve-out is enumerated in `internal/domain/compliance/retention.go` and asserted by `internal/domain/compliance/retention_test.go::TestErasureCarveOut` and `::TestErasureRequestCompleteRespectsTheCarveOut`. It is not yet backed by a machine-readable policy file the retention job reads; see `compliance.md` §6. Full legal reasoning in `compliance.md` §4.5.
 
 ---
 

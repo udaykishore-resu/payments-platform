@@ -155,11 +155,19 @@ cover: ## Coverage profile, HTML report, and the per-package gates
 	$(GO) tool cover -html=coverage.out -o coverage.html
 	@$(GO) tool cover -func=coverage.out | tail -1
 	@printf '  report: coverage.html\n'
-	@# The gates of testing.md §1.1 are enforced by scripts/coverage.sh where it exists;
-	@# until then this target reports rather than blocks, and says so rather than
-	@# pretending the gate ran.
-	@if [ -x scripts/coverage.sh ]; then scripts/coverage.sh; \
-	 else printf '\033[33m  note: scripts/coverage.sh not present — gates NOT enforced by this run\033[0m\n'; fi
+	@# scripts/coverage.sh reuses the profile just produced, so the suite runs once. It fails
+	@# on a drop below the per-scope floor and warns on the distance to the testing.md §1.1
+	@# target, then checks that every property in tests/critical_paths.yaml still names a test
+	@# that exists.
+	./scripts/coverage.sh --profile coverage.out
+
+.PHONY: critical-paths
+critical-paths: ## Assert every property in tests/critical_paths.yaml still names a real test
+	./scripts/coverage.sh --only-paths
+
+.PHONY: check-docs
+check-docs: ## Every repo-relative path cited by a document exists
+	./scripts/check-doc-references.sh
 
 ## --- verify ---
 

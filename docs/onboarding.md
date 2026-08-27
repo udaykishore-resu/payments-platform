@@ -35,7 +35,9 @@ flowchart LR
     M1 --> P1
     M4 --> P4
     P2 -.->|REVIEW| O1
-    P8 --> O3 --> P9
+    P8 --> O3
+    O3 -->|approved| P9
+    O3 -->|rejected| OX["merchant → COMPLIANCE_REJECTED<br/>back to CONFIGURING or KYC_PENDING<br/>or forward to TERMINATED"]
     P9 --> M8
 ```
 
@@ -370,6 +372,8 @@ Step 5 fans out per gateway; partial success is the normal case and is modelled 
 
 Abort runs the compensations of completed steps in **strict reverse order** (§11), each idempotent, each audited. Compensation is triggered by an operator abort, by a terminal step failure that the policy marks non-resumable, or by the merchant withdrawing.
 
+The unwind is bounded below by the **retained pivot** at step 3. `await-kyc-decision` declares `CompCancelKYCCase`, and that compensation is real *while the case is still pending* — aborting before the decision genuinely cancels it. Once the decision has landed, the record is retained by law, the engine skips step 3 and everything before it, and an abort therefore never reaches steps 2 or 1. Cancelling the vendor case after a decision would stop the process but could not un-submit the data, which is why the pivot is `PivotRetained` rather than simply "not compensatable".
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -387,9 +391,8 @@ sequenceDiagram
     WF->>GW: 7′ delete webhook registrations
     WF->>SEC: 6′ destroy credential secret versions
     WF->>GW: 5′ de-provision sub-accounts / revoke consent
-    WF->>WF: 4′ (no compensation — bank validation is a read)
-    WF->>WF: 3′,2′ cancel the KYC case at the vendor
-    WF->>WF: 1′ (no compensation — validation is pure)
+    WF->>WF: 4′ (no compensation — bank validation creates nothing, though it IS side-effecting)
+    Note over WF: the unwind STOPS at step 3, the retained pivot. Once the KYC decision has landed it is a regulated record kept five years, so steps 3, 2 and 1 are SKIPPED and the vendor case is NOT cancelled
     WF->>WF: merchant → TERMINATED (guard: zero non-terminal payments)
     WF->>AUD: one audit record per compensation, hash-chained
 ```
@@ -440,8 +443,9 @@ sequenceDiagram
     VAL-->>WF: report OK → merchant.validated.v1
     WF->>KYC: 2 submit-kyc (30 s, 5× exp 1 s→60 s, idempotent on vendor ref)
     KYC-->>WF: case accepted
-    WF->>WF: 3 await-kyc-decision — signal wait, 7 d
+    WF->>WF: 3 await-kyc-decision — signal wait, 7 d, lease RELEASED for the whole wait
     KYC-->>WF: APPROVED → merchant.kyc_approved.v1
+    Note over WF: PIVOT (retained) — nothing before this point is compensatable afterwards
     WF->>BNK: 4 validate-bank-account (30 s, 5× exp)
     BNK-->>WF: ownership verified → merchant.bank_validated.v1
 
@@ -461,12 +465,20 @@ sequenceDiagram
     CERT-->>WF: signed CertificationReport in S3 → merchant.certified.v1
 
     WF->>OP: 11 compliance-review — MANUAL GATE (5 d)
-    OP-->>WF: signal compliance-approve (audited: actor, time, justification)
+    alt Approved
+        OP-->>WF: signal compliance-approve (audited: actor, time, justification)
+    else Rejected
+        OP-->>WF: rejection with a reason code
+        WF->>API: merchant → COMPLIANCE_REJECTED (amendment A-01)
+    end
     WF->>API: 12 activate → L7 guards → ACTIVE → merchant.activated.v1
+    Note over WF,API: PIVOT (irreversible) — real payments can now exist, so the declared compensation is suspend-merchant, marked CompensationForward
     Note over API: priority cache invalidation — live within seconds
 ```
 
-Engine guarantees that make the saga safe (§11): every step's result is checkpointed before the next begins; resuming replays no completed step; an aborted instance runs compensations in strict reverse order; a step that exhausts retries moves the instance to `FAILED` and the payload to the workflow DLQ with the full error chain; a manual gate blocks until an authorized principal signals it, and the signal is itself audited.
+Engine guarantees that make the saga safe (§11): every step's result is checkpointed before the next begins; resuming replays no completed step; an aborted instance runs compensations in strict reverse order, stopping at the retained pivot; a step that exhausts its retries goes `FAILED → DLQ` with the full error chain, and the instance moves to `COMPENSATING` if the step was compensatable or `FAILED` if it was terminal-technical; a manual gate blocks until an authorized principal signals it, releasing its lease for the whole wait, and the signal is itself audited.
+
+**A timeout is not a retry.** A step marked `SideEffecting` that times out goes to `AMBIGUOUS`, not `RETRY_SCHEDULED`, and its next attempt begins with a lookup before it acts. `validate-merchant` timing out is transient because nothing external could have happened; the identical timeout on `submit-kyc` is ambiguous because the vendor may have created the case. Note that `validate-bank-account` declares no compensation but *is* `SideEffecting`, because a penny-drop moves money and a duplicate submission would initiate a second micro-deposit.
 
 ---
 
@@ -502,10 +514,15 @@ stateDiagram-v2
     SANDBOX_VALIDATION --> CONFIGURATION_FAILED
     CERTIFICATION --> APPROVED
     CERTIFICATION --> CERTIFICATION_FAILED
+    CERTIFICATION --> COMPLIANCE_REJECTED
     CERTIFICATION_FAILED --> CERTIFICATION
     CERTIFICATION_FAILED --> CONFIGURING
     CERTIFICATION_FAILED --> TERMINATED
+    COMPLIANCE_REJECTED --> CONFIGURING: fixable configuration
+    COMPLIANCE_REJECTED --> KYC_PENDING: fixable evidence
+    COMPLIANCE_REJECTED --> TERMINATED
     APPROVED --> PRODUCTION_READY
+    APPROVED --> SUSPENDED
     PRODUCTION_READY --> ACTIVE
     PRODUCTION_READY --> SUSPENDED
     ACTIVE --> SUSPENDED
@@ -531,6 +548,19 @@ stateDiagram-v2
         in a non-terminal state.
         Terminal — no un-terminate.
     end note
+    note right of COMPLIANCE_REJECTED
+        Amendment A-01.
+        The compliance gate's only
+        non-approval exit. Carries the
+        reviewer's reason code.
+        APPROVED → SUSPENDED is the
+        same amendment: an adverse
+        finding between approval and
+        activation must be expressible
+        without terminating the merchant.
+    end note
 ```
+
+**Amendment A-01** is what makes step 11 honest. Without `COMPLIANCE_REJECTED` the manual gate had no exit other than approval, so a compliance officer's rejection was unrepresentable — the workflow would have had to lie by recording `CERTIFICATION_FAILED`, blaming the integration for a policy decision, or hang until its five-day timeout. The state is non-terminal by design and routes back to `CONFIGURING` for a fixable configuration (a prohibited MCC/country combination, say), back to `KYC_PENDING` for fixable evidence, or forward to `TERMINATED`.
 
 Every state above has a retry edge except the terminal ones, and that is the design intent: onboarding failures are overwhelmingly *correctable data*, not *rejected merchants*, and a workflow that forces a restart on a mistyped VAT number converts a two-minute fix into a lost customer.

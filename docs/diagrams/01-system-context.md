@@ -39,6 +39,7 @@ flowchart LR
     KYCV["KYC and KYB vendor"]
     BANKV["Bank account validation provider"]
     IDP["Tenant identity provider - OIDC"]
+    SECSTORE["Managed secret store - AWS Secrets Manager and KMS"]
     SIEM["Enterprise SIEM"]
     CVAULT["Card vault - separate AWS account and SAQ-D assessment"]
   end
@@ -52,9 +53,11 @@ flowchart LR
   SRE -->|"platformctl, dashboards, DR drills"| OBSP
 
   TADM -.->|"OIDC authorization code"| IDP
-  MBE -.->|"OAuth2 client credentials"| IDP
+  MBE -.->|"OAuth2 client credentials, or a platform-issued API key"| IDP
   PAPI -.->|"JWKS verification, cached"| IDP
   CAPI -.->|"JWKS verification, cached"| IDP
+  CORE -.->|"resolve credentials and webhook signing secrets by reference"| SECSTORE
+  WHIN -.->|"current plus previous signing secret"| SECSTORE
 
   PAPI --> CORE
   CAPI --> CORE
@@ -101,6 +104,16 @@ flowchart LR
   (§17.1).
 - **SIEM is a one-way export.** The audit plane pushes `audit.recorded.v1`; the SIEM has no
   inbound path into the platform.
+- **The secret store is a hard external dependency of the money path, not a convenience.** No
+  gateway credential and no webhook signing secret is held in a container image, an environment
+  variable or a database column — only a `secret://` reference is, and the material is resolved at
+  the moment of use. In sandbox the same port is served by a file-backed store; in production it
+  is AWS Secrets Manager, reached over SigV4 written in-package rather than through the AWS SDK.
+- **Four ways to authenticate cross this boundary**, and they are not interchangeable: `jwt` with
+  `jwks` key resolution for humans and OAuth2 clients, `apikey` for machine clients, `mtls` with
+  SPIFFE identity for anything already inside the mesh, and a gateway's own payload signature for
+  the webhook edge — where the gateway is the authenticating party and holds no platform
+  credential at all.
 
 ## Related
 

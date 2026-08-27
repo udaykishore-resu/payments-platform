@@ -25,7 +25,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | None initially. If the reconciler cannot resolve within 15 minutes, a reconciliation exception opens and an operator checks the gateway's dashboard |
 | **Merchant sees** | `202`-semantics: `status: "processing"`. Higher latency. **No correctness loss** — this is the entire point of not auto-failing |
 | **Recovery** | Resolution in order of speed: webhook arrives → status lookup succeeds → settlement report. Each moves the payment out of `PROCESSING` |
-| **Test** | `tests/chaos/gateway_timeout_test.go::TestTimeoutLeavesPaymentProcessingAndReconciles` — simulator holds the connection past 8 s, asserts the payment is `PROCESSING`, the attempt is `TIMEOUT_UNKNOWN`, no second dispatch occurred, and the reconciler resolves it when the simulator subsequently reports success |
+| **Test** | `tests/chaos/gateway_test.go::TestGatewayTimeoutLeavesPaymentProcessingAndNeverRetries` — holds the connection past the hard timeout, asserts the payment is `PROCESSING`, the attempt is `TIMEOUT_UNKNOWN`, and that the gateway was called exactly once. `tests/chaos/crash_test.go::TestAnUnknownOutcomeIsResolvedByLookupNotByGuessing` covers the resolution half |
 
 ### F-2 Gateway 5xx / transport error
 
@@ -38,7 +38,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | None |
 | **Merchant sees** | Latency up by the retry budget (≤ ~1.3 s); success rate dips briefly |
 | **Recovery** | Automatic. Circuit breaker takes over if sustained (F-4) |
-| **Test** | `tests/chaos/gateway_5xx_test.go::TestRetryThenFailoverCreatesNewAttempt` — asserts exactly one gateway idempotency key across the retries of attempt 1, a *different* key on attempt 2, and that I3 (one successful attempt per payment) holds |
+| **Test** | `tests/chaos/gateway_test.go::TestSoftDeclineFailsOverAndProducesExactlyOneSuccess` and `internal/application/payment/orchestrator_test.go::TestFailoverNeverProducesTwoSuccessfulAttempts` — assert a *different* gateway key on attempt 2 and that I3 (one successful attempt per payment) holds. `tests/chaos/gateway_test.go::TestGatewayFiveHundredStormDoesNotFailOverOnAnUnknownOutcome` asserts the negative case |
 
 ### F-3 Gateway hard decline
 
@@ -51,7 +51,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | None. If hard-decline *rate* spikes for a merchant, the card-testing playbook opens (`security.md` §9.1, T-1) |
 | **Merchant sees** | A clean decline with a reason code |
 | **Recovery** | n/a — this is a correct outcome |
-| **Test** | `tests/chaos/hard_decline_test.go::TestHardDeclineNeverFailsOver` — asserts exactly one attempt exists and no second gateway was contacted. Retrying a hard decline on another gateway is card-testing behaviour and gets the platform de-registered (baseline §9.1) |
+| **Test** | `internal/application/payment/orchestrator_test.go::TestHardDeclineDoesNotFailOver` — asserts exactly one attempt exists and no second gateway was contacted. `internal/domain/gateway/health_test.go::TestHardDeclinesDoNotOpenTheCircuit` asserts the complement: a declining gateway is working, not broken. Retrying a hard decline on another gateway is card-testing behaviour and gets the platform de-registered (baseline §9.1) |
 
 ### F-4 Gateway sustained errors → circuit open
 
@@ -64,7 +64,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Check the gateway's status page; open a vendor ticket; consider a manual routing pin if the fallback is materially worse |
 | **Merchant sees** | Traffic shifts gateway. Possibly a different authorization rate; possibly different 3DS behaviour |
 | **Recovery** | Automatic via the probe policy |
-| **Test** | `tests/chaos/circuit_breaker_test.go::TestBreakerOpensShiftsAndRecovers` — drives the error rate, asserts the state sequence, that `NO_ELIGIBLE_GATEWAY` is not returned while a fallback is healthy, and that the cool-down doubles correctly |
+| **Test** | `internal/domain/gateway/health_test.go::TestErrorRateThresholds`, `::TestCooldownProbeAndClose` and `::TestCooldownDoublesAndIsCapped` — drive the error rate, assert the state sequence, and assert the cool-down doubles and is capped at 5 minutes |
 
 ### F-5 All gateways unhealthy
 
@@ -77,7 +77,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Page. Verify it is not our egress path (F-13) before blaming the gateways — two gateways failing simultaneously is far more often our network than theirs |
 | **Merchant sees** | Payments rejected with a retryable `503` |
 | **Recovery** | Follows gateway recovery; probes restore health automatically |
-| **Test** | `tests/chaos/no_gateway_test.go::TestAllGatewaysDownFailsClosed` — asserts `503`, `Retry-After` present, and that **no** payment row is left in a non-terminal state (the failure happens before any attempt is dispatched) |
+| **Test** | `internal/application/payment/service_test.go::TestNoEligibleGatewayIsAnAnswerNotJustARefusal` and `internal/domain/routing/engine_test.go::TestNoEligibleGatewayCarriesEveryRejectionReason` — assert the refusal happens **before** any attempt is dispatched and that it carries the per-candidate rejection reason, so an operator can tell an outage from a corridor nobody supports |
 
 ### F-6 Postgres primary loss
 
@@ -90,7 +90,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Confirm failover completed; check replica lag; verify no in-flight payment is stuck (the reconciler handles those) |
 | **Merchant sees** | Up to ~60 s of write rejections with retryable `503`; reads continue with ≤ 1 s staleness |
 | **Recovery** | Automatic. Post-failover, verify the idempotency table and the outbox for records written but uncommitted — there are none by construction, since both share the state transaction |
-| **Test** | `tests/chaos/postgres_failover_test.go::TestPrimaryFailoverNoDoubleCharge` — kills the writer mid-payment-burst, asserts every payment reaches exactly one terminal state, I3 holds for every payment, and idempotent replays of the in-flight requests return the stored result rather than executing twice |
+| **Test** | `tests/chaos/infra_test.go::TestDatabaseUnavailableMidTransactionFailsClosed` — takes the database away mid-transaction and asserts the write fails closed with no partial write. `::TestConnectionPoolExhaustionRejectsRatherThanQueues` covers the saturation case. A real Aurora failover has never been run |
 
 ### F-7 Redis loss
 
@@ -103,7 +103,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Restore Redis; verify the fallback is off before declaring recovery |
 | **Merchant sees** | p99 latency up ~15–30 ms; rate limits slightly coarser (the ×1.2 over-admits to account for uneven load balancing) |
 | **Recovery** | Automatic on breaker close. The cache warms lazily; no stampede because the loader is single-flighted per key |
-| **Test** | `tests/chaos/redis_loss_test.go::TestIdempotencyCorrectWithoutRedis` — kills Redis mid-burst with duplicate idempotency keys, asserts every duplicate replays the identical stored response and no operation executes twice |
+| **Test** | `tests/chaos/infra_test.go::TestRedisLossDegradesLatencyNotCorrectness` — removes Redis mid-burst with duplicate idempotency keys and asserts correctness is unchanged and no operation executes twice |
 
 ### F-8 Kafka loss
 
@@ -116,7 +116,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Restore MSK; scale the relay when it returns; watch for a publish storm and confirm consumers keep up |
 | **Merchant sees** | Nothing on the payment path. Webhooks to merchants and status projections lag |
 | **Recovery** | Automatic drain. Consumers are effectively-once (§13.5), so the drain's duplicates are harmless |
-| **Test** | `tests/chaos/kafka_loss_test.go::TestOutboxRetainsAndDrains` — partitions Kafka for 5 minutes under load, asserts zero event loss, correct ordering per partition key after the drain, and that the ledger balances |
+| **Test** | `tests/chaos/infra_test.go::TestKafkaUnavailableLosesNoEvents` — asserts zero event loss while the broker is away. `tests/integration/outbox_test.go::TestTwoRelayShardsPreservePerAggregateOrder` asserts ordering per partition key after the drain |
 
 ### F-9 Outbox backlog
 
@@ -129,7 +129,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | If scaling does not clear it, the cause is almost always downstream: broker throttling, a partition leader election, or an ISR shrink. Check MSK before adding relay replicas |
 | **Merchant sees** | Webhook and status-projection lag |
 | **Recovery** | Drain |
-| **Test** | `tests/chaos/outbox_backlog_test.go::TestRelayScalesAndDrainsWithoutDuplicateOrdering` |
+| **Test** | `tests/integration/outbox_test.go::TestBacklogMetricReflectsReality` and `::TestAPublishFailureLeavesTheRowClaimable` — assert the backlog metric is truthful and that a failed publish leaves the row claimable rather than lost. KEDA scaling on the backlog is untested |
 
 ### F-10 Consumer poison message
 
@@ -142,7 +142,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | DLQ triage (§8.2) |
 | **Merchant sees** | One entity's projection is stale until replay |
 | **Recovery** | Fix, then replay (§8.3) |
-| **Test** | `tests/chaos/poison_message_test.go::TestPoisonParkedPartitionContinues` — injects an undeserializable message, asserts the partition keeps processing subsequent messages and the poison lands in the DLQ with a complete diagnostic payload |
+| **Test** | `internal/events/consumer_test.go::TestPoisonEnvelopeIsNonRetryable` — asserts an undeserializable envelope is classified non-retryable rather than retried forever, so it reaches the DLQ and the partition keeps moving. `::TestRetryableAndNonRetryableErrorsArePropagated` pins the classification |
 
 ### F-11 Duplicate webhook
 
@@ -155,7 +155,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | None. A sustained high duplicate rate means our acknowledgement is too slow — check the ≤ 50 ms ingest budget |
 | **Merchant sees** | Nothing |
 | **Recovery** | n/a |
-| **Test** | `tests/chaos/webhook_duplicate_test.go::TestDuplicateWebhookIsIdempotent` — same webhook 100× concurrently, asserts exactly one state transition |
+| **Test** | `tests/integration/webhook_test.go::TestDuplicateWebhookIsDroppedByTheUniqueIndex` — asserts exactly one state transition, with the dedup enforced by the unique index rather than by a read-then-write |
 
 ### F-12 Webhook replay attack
 
@@ -168,7 +168,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Investigate per `security.md` §9.1 (T-4) |
 | **Merchant sees** | Nothing |
 | **Recovery** | n/a |
-| **Test** | `tests/chaos/webhook_replay_test.go::TestReplayedWebhookRejected` — replays a valid signed webhook after the window and asserts rejection plus a security event |
+| **Test** | `tests/chaos/clock_skew_test.go::TestClockSkewBeyondTheWebhookToleranceFailsClosed` — asserts a signature outside the tolerance is refused, and `::TestATamperedBodyIsRejectedRegardlessOfTheClock` asserts the clock is not the only thing standing between us and a forged body |
 
 ### F-13 Config corruption / control-plane loss
 
@@ -181,7 +181,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Restore the control plane; if a bad config did reach production, `POST …/configuration/rollback`, which publishes the previous document as a *new* version (never deletes, baseline §23) |
 | **Merchant sees** | Nothing for up to 15 minutes. Then newly-onboarded merchants cannot transact |
 | **Recovery** | Control-plane restoration; snapshot refresh within 30 s |
-| **Test** | `tests/chaos/config_staleness_test.go::TestDataPlaneServesStaticThenFailsClosedAtCliff` — asserts continued processing at 14 minutes and the cliff behaviour at 16, with existing merchants still served |
+| **Test** | `internal/platform/config/provider_test.go::TestStalenessLadder` — asserts each rung of the ladder, and `::TestFailedRefreshIsFailStatic` and `::TestColdProviderRefusesRatherThanLying` assert the two ends: a stale snapshot keeps serving, an empty one refuses |
 
 ### F-14 Pod crash mid-workflow
 
@@ -194,7 +194,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | None |
 | **Merchant sees** | Onboarding delayed by up to ~60 s |
 | **Recovery** | Automatic |
-| **Test** | `tests/chaos/workflow_crash_test.go::TestResumeFromCheckpointNoStepReplay` — SIGKILLs the worker mid-step, asserts the step's side effect occurred exactly once (verified through the activity's idempotency key at the vendor) and that compensation order is preserved on a later abort |
+| **Test** | `tests/chaos/crash_test.go::TestWorkerCrashMidWorkflowResumesWithoutRepeatingASideEffect` and `tests/integration/workflow_resume_test.go::TestWorkerCrashAtEveryOnboardingStepResumesWithoutRepeatingWork` — assert the step's side effect occurred exactly once. `internal/workflows/engine/postgres/compensate_test.go::TestCompensationsRunInStrictReverseOrder` covers the compensation half |
 
 ### F-15 Node loss
 
@@ -207,7 +207,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | None |
 | **Merchant sees** | A brief latency blip; no errors, because draining precedes termination |
 | **Recovery** | Automatic |
-| **Test** | `tests/chaos/node_loss_test.go::TestNodeKillNoRequestLoss` — kills a node under sustained load, asserts zero `5xx` attributable to the kill |
+| **Test** | **none.** Killing a node needs a cluster, and no cluster has ever run this. The behaviour is a design claim resting on the PDBs and the `preStop` drain in `deployment.md` §1.7 <!-- doc-refs: allow-missing --> |
 
 ### F-16 AZ loss
 
@@ -220,7 +220,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Confirm headroom holds; consider shedding P4 traffic (§5) if it does not |
 | **Merchant sees** | Nothing, if headroom holds; otherwise `429` for low-priority operations first |
 | **Recovery** | Automatic when the AZ returns |
-| **Test** | `tests/chaos/az_loss_test.go::TestAZLossWithinHeadroom` — network-partitions one AZ under load, asserts SLO compliance throughout |
+| **Test** | **none.** See F-15: this needs a cluster and an AZ to lose <!-- doc-refs: allow-missing --> |
 
 ### F-17 Region loss
 
@@ -233,7 +233,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Incident commander authorizes promotion after confirming the primary is genuinely gone. This is the one place we accept a human in the loop |
 | **Merchant sees** | Up to 15 minutes of unavailability (RTO), RPO ≤ 5 s |
 | **Recovery** | Promote, repoint, verify, resume. Failback is a planned operation, never automatic |
-| **Test** | `tests/chaos/region_failover_test.go` + the quarterly DR drill via `scripts/dr-drill.sh` — asserts RTO ≤ 15 min and RPO ≤ 5 s measured from the last committed payment |
+| **Test** | **none.** `scripts/dr-drill.sh` exists and has never been executed — it needs credentials for a `dr-verify` account that does not exist. RTO ≤ 15 min and RPO ≤ 5 s are design targets, not measured results <!-- doc-refs: allow-missing --> |
 
 **Why promotion is manual.** Automatic cross-region promotion of a financial primary risks split-brain: if the "lost" region is actually partitioned from the health checkers but still serving, two writers exist and the CP guarantee (baseline A4) is broken. Double-charging costs a chargeback, a fine and trust; fifteen minutes of downtime costs fifteen minutes. The trade is deliberate and is stated in A9.
 
@@ -248,7 +248,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Identify the client; contact them; temporarily reduce their quota if their SDK is misbehaving |
 | **Merchant sees** | `429` on low-priority operations first; refunds and voids continue (reserved capacity, §5) |
 | **Recovery** | Automatic as the budget refills |
-| **Test** | `tests/chaos/retry_storm_test.go::TestRetryBudgetPreventsCollapse` — a client retrying aggressively against an induced failure; asserts throughput stays above the floor, the system does not collapse, and P0 operations are unaffected |
+| **Test** | `tests/chaos/retry_storm_test.go::TestRetryBudgetBoundsARetryStorm`, `::TestAdaptiveLimiterShedsRatherThanQueues` and `::TestARetryStormAgainstTheOrchestratorProducesNoDuplicatePayment` — assert the budget bounds the storm, the limiter sheds rather than queues, and that surviving the storm does not cost a duplicate payment |
 
 ### F-19 Clock skew
 
@@ -261,7 +261,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | Fix NTP; cordon and replace the node |
 | **Merchant sees** | Nothing |
 | **Recovery** | NTP resync |
-| **Test** | `tests/chaos/clock_skew_test.go::TestSkewedNodeDoesNotBreakLeasesOrIDs` — runs a worker with an artificially skewed clock, asserts no duplicate lease acquisition and no ULID regression |
+| **Test** | `tests/chaos/clock_skew_test.go::TestClockSkewBeyondTheWebhookToleranceFailsClosed` and `::TestASecretRotationDoesNotDropWebhooks` — assert the skew tolerance fails closed and that a rotation during skew does not drop a delivery |
 
 ### F-20 Cache stampede
 
@@ -276,7 +276,7 @@ Each entry: blast radius, detection signal and threshold, automatic response, ma
 | **Manual** | None |
 | **Merchant sees** | Nothing |
 | **Recovery** | Automatic |
-| **Test** | `tests/chaos/cache_stampede_test.go::TestSingleFlightUnderExpiry` — 1 000 concurrent requests at the instant of expiry, asserts exactly one database load |
+| **Test** | `internal/infrastructure/redis/cache_test.go::TestGetOrLoadSingleFlights` — concurrent requests at the instant of expiry, asserting exactly one load; `internal/infrastructure/redis/redis_integration_test.go::TestIntegrationGetOrLoadCollapsesAStampede` repeats it against real Redis |
 
 ---
 
@@ -691,19 +691,19 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    S["Payment dispatched<br/>attempt 1, gateway A<br/>key = HMAC(attempt_1)"] --> R{Gateway A response}
+    S["T1: attempt 1 committed, gateway A<br/>key = HMAC(attempt_1 ‖ operation)<br/>connectionId bound before the commit"] --> R{Gateway A outcome}
 
     R -- "2xx success" --> OK["AUTHORIZED / CAPTURED<br/>I3: only one SUCCESS attempt"]
-    R -- "hard decline" --> HD["FAILED, terminal<br/>NO failover"]
-    R -- "5xx / connect error" --> RT{Retry budget<br/>and count < 2?}
-    R -- "timeout, no response" --> TU["attempt = TIMEOUT_UNKNOWN<br/>payment stays PROCESSING<br/>NO retry, NO failover"]
-    R -- "soft decline (retryable set)" --> FO
+    R -- "decline, reason NOT in the soft set of four,<br/>or scheme no-retry advice" --> HD["MarkFailed, terminal<br/>NO failover"]
+    R -- "5xx / connect error / 429 / 401" --> ER["attempt = ERROR<br/>breaker counts it<br/>PermitsFailover true"]
+    R -- "timeout, nil result, or L6 violation" --> TU["attempt = TIMEOUT_UNKNOWN<br/>payment stays PROCESSING<br/>NO retry, NO failover"]
+    R -- "decline, reason in the soft set" --> SD["attempt = DECLINED<br/>breaker deliberately NOT charged<br/>payment NOT marked failed"]
 
-    RT -- yes --> RB["backoff = uniform(0, min(2s, 100ms x 2^n))<br/>SAME attempt, SAME gateway key"] --> S
-    RT -- no --> FO{Routing plan has<br/>another candidate?}
+    ER --> FO
+    SD --> FO{"i &lt; MaxAttempts (2)<br/>and Plan.Next has an untried candidate?"}
 
-    FO -- yes --> A2["attempt 2, gateway B<br/>NEW key = HMAC(attempt_2)<br/>attempt 1 untouched"] --> R
-    FO -- no --> NE["503 NO_ELIGIBLE_GATEWAY<br/>Retry-After<br/>fail closed"]
+    FO -- yes --> A2["T1: attempt 2, gateway B<br/>NEW key = HMAC(attempt_2 ‖ operation)<br/>NEW connectionId · attempt 1 untouched"] --> R
+    FO -- no --> NE["Reload from the writer<br/>in flight → 202-shaped answer<br/>otherwise → the last error"]
 
     TU --> RC["payment.reconciliation_required.v1"]
     RC --> RC1{Webhook arrives?}
@@ -723,6 +723,8 @@ flowchart TD
     end
 ```
 
+**What this diagram no longer shows, and why.** An earlier version drew a same-gateway retry rung — `backoff = uniform(0, min(2s, 100ms·2ⁿ))`, same attempt, same key — between the transport error and the failover. That rung is not implemented. `payment.Config.SameGatewayRetries` declares a budget of 2 for it and **no code reads the field**: neither `Orchestrator.Dispatch` nor the `httpx` client retries a transport failure. Today the first `ERROR` advances straight to the next candidate. The key derivation still makes such a retry *safe* whenever it is added — it is derived from `attempt_id ‖ operation`, so the gateway would dedupe — but the safety is currently a property of the design rather than of an exercised path.
+
 ### 7.3 Degradation ladder
 
 See §4 — the ladder diagram is rendered there alongside the rung table so the trigger and the shed behaviour stay adjacent.
@@ -731,31 +733,30 @@ See §4 — the ladder diagram is rendered there alongside the rung table so the
 
 ## 8. Chaos test index
 
-Every failure mode above has a test. The suite runs nightly against a production-shaped staging environment and on demand before any release touching the resilience layer.
+Most failure modes above have a test, and three do not. The tests are not all in `tests/chaos/`:
+the majority of these properties are asserted where the behaviour lives — in the domain, the
+application layer or the integration suite — and the chaos suite covers the ones that only appear
+when a fault is injected mid-flight. The `chaos`-tagged suite runs nightly and on demand before
+any release touching the resilience layer; everything else in this table runs on every push.
 
 | Test file | Modes covered |
 |---|---|
-| `tests/chaos/gateway_timeout_test.go` | F-1 |
-| `tests/chaos/gateway_5xx_test.go` | F-2 |
-| `tests/chaos/hard_decline_test.go` | F-3 |
-| `tests/chaos/circuit_breaker_test.go` | F-4 |
-| `tests/chaos/no_gateway_test.go` | F-5 |
-| `tests/chaos/postgres_failover_test.go` | F-6 |
-| `tests/chaos/redis_loss_test.go` | F-7 |
-| `tests/chaos/kafka_loss_test.go` | F-8 |
-| `tests/chaos/outbox_backlog_test.go` | F-9 |
-| `tests/chaos/poison_message_test.go` | F-10 |
-| `tests/chaos/webhook_duplicate_test.go` | F-11 |
-| `tests/chaos/webhook_replay_test.go` | F-12 |
-| `tests/chaos/config_staleness_test.go` | F-13 |
-| `tests/chaos/workflow_crash_test.go` | F-14 |
-| `tests/chaos/node_loss_test.go` | F-15 |
-| `tests/chaos/az_loss_test.go` | F-16 |
-| `tests/chaos/region_failover_test.go` + `scripts/dr-drill.sh` | F-17 |
+| `tests/chaos/gateway_test.go` | F-1, F-2 |
+| `internal/application/payment/orchestrator_test.go` | F-2, F-3 |
+| `internal/domain/gateway/health_test.go` | F-3, F-4 |
+| `internal/application/payment/service_test.go`, `internal/domain/routing/engine_test.go` | F-5 |
+| `tests/chaos/infra_test.go` | F-6, F-7, F-8 |
+| `tests/integration/outbox_test.go` | F-8, F-9 |
+| `internal/events/consumer_test.go` | F-10 |
+| `tests/integration/webhook_test.go` | F-11 |
+| `tests/chaos/clock_skew_test.go` | F-12, F-19 |
+| `internal/platform/config/provider_test.go` | F-13 |
+| `tests/chaos/crash_test.go`, `tests/integration/workflow_resume_test.go` | F-14 |
+| *(none — all three need a cluster)* | F-15, F-16, F-17 |
 | `tests/chaos/retry_storm_test.go` | F-18 |
-| `tests/chaos/clock_skew_test.go` | F-19 |
-| `tests/chaos/cache_stampede_test.go` | F-20 |
-| `tests/chaos/degradation_ladder_test.go` | §4 — asserts each rung engages at its trigger and disengages with hysteresis |
-| `tests/chaos/dlq_replay_test.go` | §6.3 — asserts every safety check blocks an unsafe replay |
+| `internal/infrastructure/redis/cache_test.go` | F-20 |
+| `tests/chaos/partition_test.go` | §4 — partition behaviour, and its distinction from an unknown outcome |
+| *(none)* | §4 degradation ladder — every rung is implemented, none is asserted end to end |
+| *(none)* | §6.3 DLQ replay — the safety checks exist; nothing asserts they block an unsafe replay |
 
 The invariant asserted by **every** chaos test, regardless of what it is injecting: **no payment is ever double-charged, and no payment ends in a terminal state that contradicts the gateway's record.** I1–I3 (baseline §9) are checked at the end of each run. Correctness under failure is the only property that matters here; everything else is latency.

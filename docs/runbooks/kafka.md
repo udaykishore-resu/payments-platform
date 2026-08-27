@@ -172,6 +172,6 @@ on the ledger, which is where reordering would show.
 - If `min.insync.replicas` was ever discussed as a lever, write down in the postmortem why it was
   not changed: lowering it trades acknowledged-write durability for availability, on a system whose
   events are money.
-- Confirm the chaos coverage: `tests/chaos/kafka_loss_test.go::TestOutboxRetainsAndDrains`
+- Confirm the chaos coverage: `tests/chaos/infra_test.go::TestKafkaUnavailableLosesNoEvents`
   partitions Kafka for 5 minutes under load and asserts zero event loss, correct per-key ordering
   after the drain, and a balanced ledger. If this incident's shape is not that shape, extend it.

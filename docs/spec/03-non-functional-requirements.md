@@ -57,7 +57,7 @@ year is planned against. Every capacity NFR states which scenario its number bel
 ### NFR-04 — Gateway call isolation
 **Statement.** A slow gateway cannot degrade traffic to a healthy one.
 **Target.** With one gateway artificially delayed to 8 s on 100 % of calls, p99 latency for merchants routed to other gateways increases by ≤ 10 ms.
-**Measured by.** Chaos test `tests/chaos/gateway_slowloris_test.go` with a per-gateway latency assertion.
+**Measured by.** `tests/chaos/gateway_test.go::TestSlowGatewayDegradesLatencyAndTimesOutSafely`, with a per-gateway latency assertion.
 **On violation.** Release blocked; the bulkhead sizing is a defect.
 **Mechanism.** Per-gateway semaphore bulkhead and circuit breaker in `payment-orchestrator`; separate binaries for `payment-api` and `payment-orchestrator` so ingress connections are not consumed by in-flight gateway calls (baseline §5).
 
@@ -301,7 +301,7 @@ year is planned against. Every capacity NFR states which scenario its number bel
 ### NFR-36 — Rate limiting and abuse resistance
 **Statement.** No tenant can consume another tenant's capacity, and no retry storm can take the platform down.
 **Target.** Per-tenant and per-merchant token buckets with configurable rates; a global adaptive concurrency limiter; under a 20× synthetic retry storm from one tenant, other tenants' p99 degrades ≤ 20 ms and the platform stays inside its SLO.
-**Measured by.** Chaos test `tests/chaos/retry_storm_test.go`; `pp_http_requests_total{status="429"}` by tenant.
+**Measured by.** `tests/chaos/retry_storm_test.go::TestAdaptiveLimiterShedsRatherThanQueues`; `pp_http_requests_total{status="429"}` by tenant.
 **On violation.** Release blocked; in production, sustained `429` on one tenant opens a capacity conversation rather than a silent throttle.
 **Mechanism.** Redis token buckets with a local fallback; per-tenant concurrency bulkheads; `Retry-After` and `RateLimit-*` headers so well-behaved clients back off correctly (baseline §19.3); FR-55's fail-fast on concurrent duplicates, which is what stops a retry storm from exhausting the request pool.
 

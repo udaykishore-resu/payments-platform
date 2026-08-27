@@ -3,12 +3,13 @@
 ## What this shows and why it matters
 
 One Aurora PostgreSQL cluster per payment-processing region plus an Aurora Global secondary,
-carrying every bounded context's tables under row-level security. Diagram A is the topology and
-the routing rules for which connection serves which operation; Diagram B is the per-context table
-grouping and the key relationships; Diagram C is the partitioning and RLS boundary. The details
-that carry the most weight are the **partition alignment of `payments` and `payment_attempts`**
-(Amendment A-02) and the fact that the application connects as a **non-`BYPASSRLS` role**, which
-is what turns tenant isolation from a code convention into a database guarantee.
+carrying **43 tables** across every bounded context under row-level security, created by sixteen
+ordered migrations. Diagram A is the topology and the routing rules for which connection serves
+which operation; Diagram B is the per-context table grouping and the key relationships; Diagram C
+is the partitioning and RLS boundary. The details that carry the most weight are the **partition
+alignment of `payments` and `payment_attempts`** (Amendment A-02) and the fact that the
+application connects as a **non-`BYPASSRLS` role**, which is what turns tenant isolation from a
+code convention into a database guarantee.
 
 ## Diagram A — Cluster topology and connection routing
 
@@ -65,6 +66,7 @@ erDiagram
     MERCHANTS ||--o{ GATEWAY_CONNECTIONS : binds
     GATEWAYS ||--o{ GATEWAY_CONNECTIONS : provides
     GATEWAY_CONNECTIONS ||--o{ GATEWAY_CREDENTIALS_META : references
+    GATEWAY_CONNECTIONS ||--o{ PAYMENT_ATTEMPTS : dispatched_over
     GATEWAYS ||--o{ GATEWAY_HEALTH : reports
     MERCHANTS ||--|| CONFIGURATIONS : current
     CONFIGURATIONS ||--o{ CONFIGURATION_VERSIONS : appends
@@ -102,9 +104,18 @@ erDiagram
         string attempt_id PK
         string payment_id FK
         string gateway_id FK
+        string gateway_connection_id FK
         string outcome
         string gateway_idempotency_key
         date partition_month
+    }
+    REFUNDS {
+        string refund_id PK
+        string payment_id FK
+        date partition_month
+        bigint amount
+        string status
+        string gateway_reference
     }
     IDEMPOTENCY_RECORDS {
         string scope_hash PK
@@ -131,13 +142,16 @@ flowchart TB
   CROSS["Query for tenant B under tenant A context returns zero rows at the database level"]
   TEST["TestCrossTenantAccessIsImpossible asserts exactly that"]
 
-  subgraph PART["Range partitioning by partition_month"]
+  subgraph PART["Range partitioning by partition_month - 4 of the 43 tables"]
     PKEY["partition_month derived from the PAYMENT ULID timestamp"]
     PP["payments_2026_08, payments_2026_09, ..."]
     PA["payment_attempts_2026_08, payment_attempts_2026_09, ..."]
+    OTHER["ledger_entries and audit_records partition on their own month"]
+    FK["Composite FK on payment_id and partition_month makes a wrong month unwritable"]
     ALIGN["Every attempt shares its payment partition, even if created weeks later"]
     IDX["Partial unique index on payment_id WHERE outcome equals SUCCESS - invariant I3"]
     PRUNE["Static partition pruning on point lookups, the key is a pure function of an immutable ID"]
+    REG["partition_registry tracks what exists, platformctl creates ahead of time"]
   end
 
   subgraph MIG["Schema change discipline"]
@@ -151,10 +165,14 @@ flowchart TB
   RLSP --> CROSS --> TEST
   PKEY --> PP
   PKEY --> PA
-  PP --> ALIGN
-  PA --> ALIGN
+  PP --> FK
+  PA --> FK
+  FK --> ALIGN
   ALIGN --> IDX
   PKEY --> PRUNE
+  PKEY --> OTHER
+  PP --> REG
+  PA --> REG
   FWD --> EXP --> LOCK
 ```
 
@@ -181,6 +199,20 @@ flowchart TB
   an integration test that asserts cross-tenant reads return zero rows at the database level. The
   application role is deliberately not `BYPASSRLS`; a migration or admin role that is,
   is used only by `platformctl`.
+- **`payment_attempts.gateway_connection_id` is what makes "which credential signed this request"
+  answerable.** The gateway alone is not enough: one merchant can hold several connections to the
+  same gateway — a live one and one being re-provisioned, or two sub-accounts in different
+  corridors — and the credential, the external account reference and the certification state all
+  belong to the *connection*. Migration `0016` adds the column, its `gwc_`-shaped `CHECK`
+  (`NOT VALID`, so it does not take `ACCESS EXCLUSIVE` across every partition) and its
+  documentation; `0007` had declared the column and nothing ever wrote to it. It stays nullable on
+  purpose — an attempt written before the change legitimately has no connection to name, and
+  `NOT NULL` would make those rows a lie.
+- **Only four of the 43 tables are partitioned**: `payments`, `payment_attempts`, `ledger_entries`
+  and `audit_records`. `refunds` carries `partition_month` without being partitioned itself —
+  it needs the column to participate in the composite foreign key back to `payments`, which is
+  what makes an attempt or refund in the wrong month physically unwritable rather than merely
+  discouraged.
 - **`idempotency_records` is drawn without a relationship** because it is keyed by the scope tuple
   `(tenant_id, merchant_id, method, path_template, idempotency_key)` hash, not by a foreign key.
   Postgres is authoritative for it; Redis mirrors completed records purely for latency (§14.3).

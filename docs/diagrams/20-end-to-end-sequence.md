@@ -36,14 +36,15 @@ sequenceDiagram
 
     WF->>VP: L2 validate-merchant
     VP-->>WF: pass, merchant to KYC_PENDING
-    WF->>KV: submit-kyc then await decision up to 7 d
+    WF->>KV: submit-kyc then await decision up to 7 d, lease released for the wait
     KV-->>WF: APPROVED
+    Note over WF: PIVOT, retained - nothing before this point is compensatable afterwards
     WF->>KV: validate-bank-account
     KV-->>WF: ownership confirmed, merchant to BANK_VALIDATED
 
     WF->>GA: provision-gateways, fan out per selected gateway
     GA-->>WF: external account references, merchant to CONFIGURING
-    WF->>SM: store-credentials, only a secretRef travels in the workflow payload
+    WF->>SM: store-credentials through the secrets provider, only a secret reference travels in the workflow payload
     WF->>GA: register-webhooks
     WF->>CP: apply-configuration
     CP->>VP: L4 configuration validation
@@ -56,7 +57,12 @@ sequenceDiagram
     WF->>KB: merchant.certified.v1, merchant to APPROVED
 
     WF->>CO: compliance-review manual gate
-    CO-->>WF: approved, the signal itself is audited
+    alt Approved
+        CO-->>WF: approved, the signal itself is audited
+    else Rejected
+        CO-->>WF: rejection with a reason code
+        WF->>MR: merchant to COMPLIANCE_REJECTED, back to CONFIGURING or KYC_PENDING, or forward to TERMINATED
+    end
     WF->>MR: activate, L7 guard, merchant to PRODUCTION_READY then ACTIVE
     MR->>KB: merchant.activated.v1
     KB-->>OT: audit chain appended, onboarding duration histogram recorded
@@ -81,39 +87,43 @@ sequenceDiagram
     participant CP as Control plane
 
     MB->>PA: POST /v1/payments, token reference only, Idempotency-Key
-    PA->>PA: stages 2 to 7, authn, tenant guard, authz, rate limit, L1 and PAN detector
-    PA->>PA: stage 8 idempotency claim, Postgres authoritative
-    PA->>PA: stage 9 merchant context from the cache, fail static if control is down
+    PA->>PA: bodylimit buffers the raw octets and runs the L1 PAN scan, then cors and securityheaders
+    PA->>PA: authn, tenant from the token only, authz, ratelimit, concurrency
+    PA->>PA: stage 8 idempotency claim, innermost, Postgres authoritative
+    PA->>PA: handler decodes and validates the body, L1 schema
+    PA->>PA: stage 9 merchant context from the cache with its connections, fail static if control is down
     PA->>PA: stage 10 L5 payment validation
     PA->>PO: dispatch
     PO->>RT: stage 11 risk then stage 12 routing
-    RT-->>PO: routing plan rpl_ persisted, ordered and reason annotated
-    PO->>PO: stage 13 create attempt att_1, derive the gateway idempotency key, commit
-    PO->>GA: stage 14 authorize on the primary
+    RT-->>PO: routing plan rpl_ persisted, ranked selections plus every rejection and its reason
+    PO->>PO: T1 - StartAttempt att_1, bind its connectionId, MarkProcessing, COMMIT before dispatch
+    PO->>GA: T2 - authorize on the primary under its own deadline
     GA->>G1: authorize
-    G1-->>GA: 503 repeatedly, breaker opens for this gateway and operation
-    GA->>OT: gateway.health_changed.v1
+    G1-->>GA: 503, transport error - the gateway provably did not act
+    PO->>PO: attempt att_1 recorded ERROR, the breaker counts it, PermitsFailover is true
+    GA->>OT: repeated failures open the breaker, gateway.health_changed.v1
 
-    PO->>PO: advance the plan, create a NEW attempt att_2 with a NEW derived key
+    PO->>PO: Plan.Next excludes att_1's gateway, new attempt att_2 with a NEW connectionId and a NEW derived key
     PO->>GA: authorize on the fallback
     GA->>G2: authorize
     G2-->>GA: approved with amount and currency echo
-    PO->>PO: stage 15 L6 response validation then stage 16 L7 transition plus outbox, one transaction
+    PO->>PO: settle classifies unknown, then error, then contract, then outcome - stage 15 L6 passes
+    PO->>PO: T3 - attempt, payment AUTHORIZED, audit record and outbox row in ONE transaction
     PO->>EC: payment.authorized.v1
-    PA-->>MB: 201 AUTHORIZED, stage 17 snapshot stored
+    PA-->>MB: 201 AUTHORIZED, stage 17 snapshot stored on the idempotency record
 
     MB->>PA: POST /capture later
-    PA->>PO: capture on the same attempt and the same gateway
+    PA->>PO: capture through the gateway that holds the authorization, a NEW attempt row, no routing
     PO->>EC: payment.captured.v1
     EC->>LG: append double-entry ledger rows
 
     G2->>WI: signed settlement webhook
-    WI->>WI: signature, replay window, dedup, then persist in 50 ms
-    WI-->>G2: 200 before any interpretation
-    WI->>EC: webhook.received.v1
-    EC->>PO: apply settlement, L7 guard, CAPTURED to SETTLED
-    PO->>EC: payment.settled.v1
-    EC->>LG: settlement entries, reconciliation run compares our state to the gateway report
+    WI->>WI: verify over the raw octets, claim the dedup key and persist the body in one transaction
+    WI-->>G2: 202 Accepted, before any interpretation
+    WI->>EC: the asynchronous processor picks the stored delivery up
+    EC->>EC: re-verify against the STORED receipt time, then MarkSettled through the aggregate
+    EC->>LG: payment state, settlement entries and the outbox row in one transaction
+    EC->>OT: payment.settled.v1, the reconciliation run compares our state to the gateway report
 
     EC->>OT: RED and business metrics, traces with exemplars, hash-chained audit
     OT->>OT: evaluate SLIs, authorization success rate per gateway and corridor
@@ -134,14 +144,20 @@ sequenceDiagram
   is why the failover in Diagram B is safe: the ACL's decline mapping and L6 echo checking were
   proven against the sandbox before real money was at risk (§11.4).
 - **Diagram B deliberately shows the failover path, not the happy path**, because the happy path is
-  the failover path minus two messages. The critical detail is that the fallback attempt is a
-  **new attempt with a new derived key**, so it is a genuinely new authorization rather than a
-  retry that might double-charge (A10, §14.4).
-- **The 201 goes out at step 22, before settlement exists.** Authorization, capture and settlement
-  are three separate events at three separate timescales; the merchant is told about each as it
-  happens rather than being blocked on the slowest.
-- **`webhook-ingress` returns 200 before interpretation** (step 30). Everything downstream is
-  asynchronous, which is what keeps a slow ledger from turning into a gateway redelivery storm.
+  the failover path minus three messages. The critical detail is that the fallback attempt is a
+  **new attempt with a new derived key and its own `connectionId`**, so it is a genuinely new
+  authorization rather than a retry that might double-charge (A10, §14.4).
+- **The branch taken is `ERROR`, and that is why failover is permitted.** A 503 from the primary is
+  a transport failure — the gateway provably did not act — so `att.PermitsFailover()` is true.
+  Had the primary *declined*, failover would have depended on the normalized reason being one of
+  the four soft ones; had it timed out, the attempt would be `TIMEOUT_UNKNOWN` and the loop would
+  have stopped there with the payment still `PROCESSING`.
+- **The 201 goes out before settlement exists.** Authorization, capture and settlement are three
+  separate events at three separate timescales; the merchant is told about each as it happens
+  rather than being blocked on the slowest.
+- **`webhook-ingress` returns `202` before interpretation.** Everything downstream is asynchronous
+  and runs in a separate `Processor` that re-verifies the stored payload against its stored receipt
+  time — which is what keeps a slow ledger from turning into a gateway redelivery storm.
 - **The last four steps are the closed loop and the reason "Observability" is a plane.** Observed
   gateway behaviour becomes `gateway.health_changed.v1`, which changes the candidate set and the
   scoring weights for the *next* payment, and is recorded by the control plane for operator

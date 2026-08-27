@@ -15,9 +15,10 @@ invoked on the payment hot path.
 ```mermaid
 flowchart LR
   REQ["Inbound POST /v1/payments"]
-  L1["L1 API and schema - edge middleware, pure"]
-  PAN["PAN detector - 13 to 19 digits, Luhn valid after stripping separators"]
-  IDEM["Idempotency claim - stage 8"]
+  PAN["L1 PAN detector - runs inside bodylimit, over the raw octets, above authentication"]
+  AUTH["authn, tenant, authz, ratelimit, concurrency"]
+  IDEM["Idempotency claim - stage 8, innermost middleware"]
+  L1["L1 API and schema - in the handler, pure"]
   CTX["Merchant context load from cached config"]
   L5["L5 payment validation - limits, currency, method, risk policy"]
   RISK["Risk engine"]
@@ -33,11 +34,11 @@ flowchart LR
   E6["502 GATEWAY_CONTRACT_VIOLATION"]
   E7["409 INVALID_STATE_TRANSITION"]
 
-  REQ --> L1
-  L1 --> PAN
-  L1 -->|"schema violation"| E1
+  REQ --> PAN
   PAN -->|"hit"| E2
-  PAN -->|"clean"| IDEM --> CTX --> L5
+  PAN -->|"clean"| AUTH --> IDEM --> L1
+  L1 -->|"schema violation"| E1
+  L1 --> CTX --> L5
   L5 -->|"violation"| E5
   L5 --> RISK --> ROUTE --> DISP --> L6
   L6 -->|"violation"| E6
@@ -55,7 +56,7 @@ flowchart TB
   L2F["422 plus onboarding case annotation, merchant to VALIDATION_FAILED"]
   KYC["Steps 2 and 3 - KYC vendor, impure, vendor is the decision maker"]
   BANKV["Step 4 - bank account validation port"]
-  PROV["Step 5 - provision gateways"]
+  PROV["Step 5 - provision gateways, then 6 store-credentials and 7 register-webhooks"]
   L3["L3 gateway validation - credential probe, capability descriptor match, webhook reachability"]
   L3F["422 or mark gateway_connection unhealthy"]
   CFGW["Step 8 - configuration write through the control plane"]
@@ -65,6 +66,8 @@ flowchart TB
   CERT["Step 10 certification matrix per gateway, method and currency"]
   L5S["L5 and L6 exercised for real inside the certification suite"]
   GATE["Step 11 compliance-review manual gate"]
+  REJ["COMPLIANCE_REJECTED - amendment A-01, carries the reviewer reason code"]
+  BACK["Back to CONFIGURING or KYC_PENDING, or forward to TERMINATED"]
   ACT["Step 12 activate - L7 guards the transition to ACTIVE"]
 
   SUB --> L2
@@ -73,7 +76,9 @@ flowchart TB
   L3 -->|"fail"| L3F
   L3 -->|"pass"| CFGW --> L4
   L4 -->|"fail"| L4F
-  L4 -->|"pass"| SBOX --> CERT --> L5S --> GATE --> ACT
+  L4 -->|"pass"| SBOX --> CERT --> L5S --> GATE
+  GATE -->|"approved"| ACT
+  GATE -->|"rejected"| REJ --> BACK
 ```
 
 ## Legend and notes
@@ -82,11 +87,17 @@ flowchart TB
   `L5.AMOUNT_WITHIN_MERCHANT_LIMIT`; `TestEveryRuleIsDocumented` fails the build if a rule ID has
   no entry in `docs/validation-plane.md` (§21). That is what makes an error response actionable
   rather than merely accurate.
-- **L1 carries the PAN detector, and that placement is load-bearing.** It runs at stage 7 of the
-  pipeline — before idempotency, before any logging of the body, before persistence — so a
-  request containing PAN-like data is rejected at `400 SENSITIVE_DATA_IN_REQUEST` with the
-  offending value never written to a log. This is one of the enforcement controls that keeps the
-  platform at SAQ-A/A-EP rather than SAQ-D (§17.2).
+- **L1 carries the PAN detector, and its placement is load-bearing — and stronger than §12 asks
+  for.** `ScanForPAN` runs inside `httpapi.ReadBody`, which the `bodylimit` middleware calls: the
+  sixth of fifteen chain stages, *above* authentication, authorization, rate limiting and the
+  idempotency claim. A request containing PAN-like data is therefore rejected
+  `400 SENSITIVE_DATA_IN_REQUEST` before any of them, with the offending value never written to a
+  log and never reaching the idempotency fingerprint. This is one of the enforcement controls that
+  keeps the platform at SAQ-A/A-EP rather than SAQ-D (§17.2).
+- **The *schema* half of L1 runs in the handler, below the idempotency claim.** §12 puts the whole
+  of L1 at stage 7 and idempotency at stage 8; the implementation splits them, so a syntactically
+  invalid body does consume its key (settled as `FailTerminal`, so the 400 is what a duplicate
+  replays). The diagram shows the implemented order, not the specified one.
 - **L3 is the only impure level.** It makes network calls (credential probes, webhook
   reachability, capability checks), so it runs in onboarding, during credential rotation, and on
   a scheduled probe — never inside a payment request. A failing L3 marks the

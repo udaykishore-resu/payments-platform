@@ -125,8 +125,8 @@ sequenceDiagram
     C1->>K: migrate to .v2, declare v2 support in the registry
     C2->>K: migrate to .v2, declare v2 support
     Note over P: T2 — registry shows 0 consumers on .v1 for 14 days
-    P->>K: stop publishing .v1; type marked DEPRECATED
-    Note over K: T3 — .v1 retention expires; type removed from the catalog
+    P->>K: stop publishing .v1, type marked DEPRECATED
+    Note over K: T3 — .v1 retention expires, type removed from the registry
 ```
 
 | Phase | Gate to leave it |
@@ -134,7 +134,7 @@ sequenceDiagram
 | **T0 — register** | `.v2` JSON Schema merged; CI compatibility check green; `.v2` documented in §4 of this file. |
 | **T1 — dual publish** | Producer emits both from the **same transaction and the same outbox batch**, so a consumer can never see one without the other. Both carry the same `correlationid`; the `.v2` carries the `.v1`'s `id` as `causationid`. |
 | **T2 — consumer migration** | Each consumer declares its supported versions in the schema registry on startup. The producer may not proceed until the registry reports **zero** consumer groups on `.v1` for **14 consecutive days** (longer than any consumer's maximum outage plus its replay window). |
-| **T3 — retire** | `.v1` production stops; the type is marked `DEPRECATED` in `api/events/catalog.yaml` with a `sunset` date. Retention expiry removes the last `.v1` records from the topic. |
+| **T3 — retire** | `.v1` production stops; the type is marked `DEPRECATED` in the Go event registry (`internal/events/registry.go`) with a `sunset` date. There is no `api/events/catalog.yaml`; the registry and the JSON Schemas in `api/events/` are the two artifacts, reconciled by `scripts/check-events.sh`. <!-- doc-refs: allow-missing --> Retention expiry removes the last `.v1` records from the topic. |
 
 Dual-publishing costs storage and doubles the outbox row count for the affected type. That is the
 price of never coordinating a lockstep deploy across nine deployables owned by five teams.
@@ -146,7 +146,7 @@ price of never coordinating a lockstep deploy across nine deployables owned by f
 | **Format** | JSON Schema 2020-12, one file per event type, in `api/events/<type>.json`. Not Avro: our payloads are read by humans in incidents, our topics are also archived to S3 as JSON, and the schema-evolution rules we need (§3.1) are policy rules that a registry's `BACKWARD` mode does not express (it would happily allow a semantic change). |
 | **Registry** | The git repository is the source of truth; a Confluent-compatible registry is populated from it by CI, so the registry can never disagree with the code. Runtime lookups are by `dataschema` URI, cached. |
 | **Producer check** | `TestEveryPublishedEventValidatesAgainstItsSchema` — every event a producer can emit is generated in a table test and validated. A producer that can emit an invalid event fails the build. |
-| **Compatibility check** | `scripts/check-event-compat.sh` diffs each schema against the version on `main`. Fails on: removed field, optional→required, type change, enum removal, enum addition where `x-unknown-behaviour` ≠ `ignore`, `partitionkey` change, `dataschema` URI reuse with different content. Passing requires either a purely additive diff or a new `.v<n+1>` file. |
+| **Compatibility check** | `tests/contract/compat_test.go::TestPublishedSchemasAreBackwardCompatible` diffs each schema against the version on `main`, and `::TestCompatibilityCheckerDetectsEachBreakingChange` tests the checker itself against a corpus of deliberate breaks. There is no `scripts/check-event-compat.sh`. <!-- doc-refs: allow-missing --> Fails on: removed field, optional→required, type change, enum removal, enum addition where `x-unknown-behaviour` ≠ `ignore`, `partitionkey` change, `dataschema` URI reuse with different content. Passing requires either a purely additive diff or a new `.v<n+1>` file. |
 | **Consumer check** | Every consumer ships a golden-fixture contract test per type it consumes, plus the unknown-field-injection test from V6. |
 | **Catalog check** | `TestCatalogMatchesSchemas` — the baseline §13.2 catalog, the schema directory and §4 of this document must list exactly the same types. An event that exists in code but not in the catalog fails the build. |
 

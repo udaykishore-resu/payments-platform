@@ -90,9 +90,9 @@ tail). Verify with the existing check:
 ```bash
 ./scripts/check-metrics-cardinality.sh
 ```
-*Note: `docs/observability.md` §3.3 refers to this check as `scripts/metrics-lint.sh`; the script in
-this repository is `scripts/check-metrics-cardinality.sh`. Same job, different name — the document
-is what is out of date.*
+*Note: `docs/observability.md` §3.3 refers to this check as `scripts/metrics-lint.sh`, which does not exist. <!-- doc-refs: allow-missing -->
+The script in this repository is `scripts/check-metrics-cardinality.sh`. Same job, different name —
+the document is what is out of date.*
 
 **M2 — roll back the deploy** that introduced it:
 ```bash

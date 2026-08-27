@@ -154,7 +154,7 @@ reconciliation run for the affected merchants. Replay without verification is ho
 - File one issue per distinct cause, not per message.
 - A recurring cause is a missing test. Add it where it belongs: a consumer unit test for a handler
   bug, an event contract test for a shape (`make test-contract`, `./scripts/check-events.sh`), a
-  chaos test for a dependency (`tests/chaos/poison_message_test.go` is the existing one).
+  test for a dependency (`internal/events/consumer_test.go::TestPoisonEnvelopeIsNonRetryable` is the existing one).
 - Feed the weekly review with counts by class. A rising *poison* fraction means schema discipline
   is slipping; a rising *transient* fraction means the retry ladder is too short for a real
   dependency's outage profile.

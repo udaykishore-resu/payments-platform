@@ -128,7 +128,7 @@ Binding consequences, each mechanically checkable:
 - **Deploy independence:** over any rolling 90-day window, ≥ 80 % of control-plane deploys must
   ship without an accompanying data-plane deploy. Measured from the release pipeline. If planes
   always deploy together, the boundary is decorative and this ADR is wrong.
-- **Blast-radius isolation:** `tests/chaos/control_plane_loss_test.go` terminates the control
+- **Blast-radius isolation:** **not tested end to end.** The property — terminating the control
   plane entirely and asserts payment success rate stays within SLO for the full
   `max_config_staleness` window (15 min, §15).
 - **Latency budget:** the §12 pipeline stages sum to ≤ 75 ms of platform time at p99, measured

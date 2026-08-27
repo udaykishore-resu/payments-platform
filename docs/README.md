@@ -74,7 +74,7 @@ Operations.
 | [`disaster-recovery.md`](disaster-recovery.md) | RPO/RTO per data store, the multi-region topology and why money movement is active/passive, the failover and failback procedures **with real commands**, restore-drill evidence, and the proof that a region failover cannot create a duplicate payment | SRE, incident commanders, auditors |
 | [`deployment.md`](deployment.md) | How the nine deployables run: Kubernetes topology and workload configuration, the AWS substrate, GitOps and progressive delivery, the CI/CD gates, zero-downtime migrations, and environment policy | Cloud architects, platform engineers, release managers |
 | [`testing.md`](testing.md) | The test pyramid as applied here, what each level asserts, the named failure-scenario tests, the critical-path registry concept, and the exact commands for local and CI runs | Everyone writing tests; QA leads |
-| `runbooks/` | **Currently empty.** Roughly twenty runbook filenames are referenced as the response to specific alerts in [`observability.md`](observability.md) §alerting and to security incidents in [`security.md`](security.md). None has been written. This is the largest operational gap in the repository — see the README's status section. | — |
+| [`runbooks/README.md`](runbooks/README.md) | **35 runbooks** behind an index, one per distinct `runbook_url` referenced from the alert rules in `deployments/` and from [`security.md`](security.md). Each carries the alert that fires it, the first-five-minutes triage, the decision tree, and what to check afterwards. `scripts/check-runbook-links.sh` asserts every reference resolves, that every alert with `page: "true"` has one, and that no runbook is orphaned | **On-call, at 3 a.m.** |
 
 ---
 

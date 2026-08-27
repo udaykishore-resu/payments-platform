@@ -5,7 +5,8 @@
 Every asynchronous edge in the platform runs through one mechanism: a transactional outbox drained
 by a single relay into Kafka topics named `pp.<context>.<aggregate>.v1`. Diagram A shows that
 publish path and the topic set; Diagram B shows the consumption path with its retry and DLQ
-topology. The reason this is a single, boring, uniform mechanism is that the alternative — services
+topology, and distinguishes the one consumer group `event-consumer` ships today from the ones
+baseline §13.2 lists as consumers. The reason this is a single, boring, uniform mechanism is that the alternative — services
 publishing to Kafka directly alongside their database writes — is the dual-write failure mode, and
 in a payment system a lost `payment.captured.v1` means a payment that is captured at the gateway
 and invisible in the ledger.
@@ -16,7 +17,8 @@ and invisible in the ledger.
 flowchart LR
   subgraph TX["One database transaction"]
     ST["State row - payment, merchant, configuration, connection"]
-    EV["payment_events append, aggregate version increments"]
+    EV["payment_event_log append, aggregate version increments"]
+    AU["audit_records row - hash chained, written by the same UoW"]
     OX["outbox_events row - full CloudEvents envelope"]
   end
 
@@ -35,6 +37,7 @@ flowchart LR
 
   ST --> OX
   EV --> OX
+  AU --> OX
   OX --> POLL
   POLL --> RLY
   RLY --> T1
@@ -57,15 +60,18 @@ flowchart TB
   T5["pp.webhooks.inbound.v1"]
   T6["pp.audit.v1"]
 
-  subgraph CG["Consumer groups - each dedupes on consumer_group plus event_id"]
-    CLED["Ledger projector BC-8"]
+  subgraph CGB["Built - the projection event-consumer ships today"]
+    CWHK["Webhook processor - webhook.received.v1 runs webhook.Processor, which applies the transition and posts the ledger inside one transaction"]
+    CACK["Every other type on the subscribed topics is acknowledged with a DEBUG line, never failed"]
+  end
+
+  subgraph CGS["Specified in baseline 13.2, not yet a consumer group"]
     CREC["Reconciler"]
     CNOT["Notification dispatcher"]
     CANA["Analytics projections"]
     CCAC["Data plane config cache invalidator"]
     CRTE["Routing feedback"]
     CAUD["Audit sink and SIEM export"]
-    CWHK["Webhook processor"]
   end
 
   DEDUP["INSERT consumer_group and event_id ON CONFLICT DO NOTHING"]
@@ -78,19 +84,18 @@ flowchart TB
   ALERT["pp_dlq_depth and pp_consumer_lag alerts"]
   OPSR["Operator replays or discards via platformctl"]
 
-  T3 --> CLED
-  T3 --> CREC
-  T3 --> CNOT
-  T3 --> CANA
-  T3 --> CRTE
-  T1 --> CCAC
-  T1 --> CNOT
-  T2 --> CCAC
-  T4 --> CRTE
   T5 --> CWHK
-  T6 --> CAUD
+  T3 -.-> CREC
+  T3 -.-> CNOT
+  T3 -.-> CANA
+  T3 -.-> CRTE
+  T1 -.-> CCAC
+  T1 -.-> CNOT
+  T2 -.-> CCAC
+  T4 -.-> CRTE
+  T6 -.-> CAUD
+  T3 --> CACK
 
-  CLED --> DEDUP
   CWHK --> DEDUP
   DEDUP --> ZERO
   DEDUP --> HANDLE --> INV
@@ -128,6 +133,20 @@ flowchart TB
   other events.
 - **`pp.audit.v1` has 400-day retention and then flows to S3** with Object Lock for the 7-year
   WORM requirement (§17.3).
+- **An event type a group does not project is acknowledged, not failed.** Returning an error for
+  an unhandled type blocks the partition for every *other* type on it, turning "somebody published
+  a new event" into an outage of an unrelated projection. `event-consumer` logs it at DEBUG and
+  moves on, which makes the unhandled traffic visible instead of fatal.
+- **The event catalogue is registered in code, and the registry is the contract.**
+  `internal/events/registry.go` binds each of the 25 types to its topic and partition-key field —
+  `merchant_id`, `payment_id`, `gateway_id`, `gateway_ref`, `tenant_id` — so a type published
+  without a registry entry fails at the publisher rather than landing on the wrong partition.
+- **The dotted consumer edges are specified, not built.** `event-consumer` currently registers one
+  handler. The ledger is posted by the webhook `Processor` inside the transaction that applies the
+  webhook, not by a separate projector; the reconciler is a library type in
+  `internal/application/payment` rather than a running consumer group. The dotted edges are drawn
+  because §13.2 names those consumers and the topics are keyed for them, and they are dotted
+  because nothing subscribes yet.
 
 ## Related
 

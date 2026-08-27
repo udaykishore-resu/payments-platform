@@ -172,7 +172,7 @@ The result: a merchant can express "EUR card payments go to Adyen first" declara
 
 | Level | Host binary | Invocation point | Subject built by |
 |---|---|---|---|
-| L1 | `payment-api`, `control-plane-api`, `webhook-ingress` | middleware, §12 stage 7 (plus stages 3–6 as phase A) | HTTP decoder |
+| L1 | `payment-api`, `control-plane-api`, `webhook-ingress` | phase A in the middleware chain (§12 stages 3–6); the PAN scan inside `bodylimit`, above authentication; the schema decode in the handler, below the stage-8 claim | HTTP decoder |
 | L2 | `workflow-worker`, `control-plane-api` | onboarding step 1 `validate-merchant`; every merchant write | Merchant Registry repo + vendor ACL results |
 | L3 | `workflow-worker`, `platformctl`, health prober | onboarding steps 5–7, credential rotation, 5-min scheduled probe | Gateway adapter SPI |
 | L4 | `control-plane-api` | `PUT /v1/merchants/{id}/configuration` | draft document + capability descriptors + tenant policy |
@@ -190,7 +190,7 @@ Rule IDs are permanent. A rule may be retired (`status: RETIRED` in the registry
 
 ### 3.1 L1 — API / schema, authentication, rate limiting
 
-Subject: `L1Request{Raw []byte, Headers, Route, Principal, TenantClaim}`. Set mode: ShortCircuit for A1–A13, CollectAll for A14–A33. Failure → `400 VALIDATION_FAILED` unless the code column says otherwise. All L1 rules run inside the 3 ms budget of §12 stage 7 (plus stages 3–6).
+Subject: `L1Request{Raw []byte, Headers, Route, Principal, TenantClaim}`. Set mode: ShortCircuit for A1–A13, CollectAll for A14–A33. Failure → `400 VALIDATION_FAILED` unless the code column says otherwise. All L1 rules run inside the 3 ms budget of §12 stage 7 (plus stages 3–6). `Raw` is the exact buffered octets: `bodylimit` reads the body once and puts those bytes on the context, because three consumers need the *same* bytes and two of them run before the handler — the idempotency fingerprint, the PAN detector, and the webhook verifier whose HMAC a re-encoding silently invalidates.
 
 | Rule ID | Subject | Precondition | Check | Sev | Code | Remediation shown to caller | Pure |
 |---|---|---|---|---|---|---|---|
@@ -507,7 +507,7 @@ Twenty-nine impure rules, none of them on the payment hot path — L1's four are
 
 ### 4.1 Table-driven, one case set per rule ID
 
-Every rule has its own test file, `internal/validation/rules/l5/amount_within_merchant_limit_test.go`, with a fixed shape:
+Each level's rules are tested together in one file per level — `internal/validation/rules/l5payment/rules_test.go` for L5 — with a fixed per-rule shape:
 
 ```go
 func TestL5_AMOUNT_WITHIN_MERCHANT_LIMIT(t *testing.T) {
@@ -580,15 +580,17 @@ Supporting machinery:
 ```mermaid
 flowchart TD
     subgraph Edge["payment-api — §12 stages 1-9"]
-        A["Request in<br/>TLS, WAF, edge limit"] --> B["L1 phase A · ShortCircuit<br/>auth · tenancy · authz · rate limit"]
-        B -->|fail| BX["401 / 403 / 429"]
-        B --> C["L1 phase B · CollectAll<br/>schema · types · bounds · PAN detector"]
-        C -->|fail| CX["400 VALIDATION_FAILED<br/>or 400 SENSITIVE_DATA_IN_REQUEST"]
-        C --> D["Idempotency claim · §14"]
+        A["Request in<br/>TLS, WAF, edge limit"] --> A2["bodylimit · buffer the raw octets<br/>then ScanForPAN over them"]
+        A2 -->|PAN-shaped, Luhn-valid| A2X["400 SENSITIVE_DATA_IN_REQUEST<br/>value never logged"]
+        A2 --> B["L1 phase A · ShortCircuit<br/>auth · tenancy · authz · rate limit · shedding"]
+        B -->|fail| BX["401 / 403 / 429 / 503"]
+        B --> D["Idempotency claim · §14"]
         D -->|in flight| DX["409 IDEMPOTENT_REQUEST_IN_PROGRESS"]
         D -->|fingerprint differs| DY["422 IDEMPOTENCY_KEY_REUSED"]
         D -->|replay| DZ["200 replay · Idempotent-Replay: true"]
-        D --> E["Merchant + config snapshot<br/>cached, staleness ≤ 30 s"]
+        D --> C["L1 phase B · CollectAll · IN THE HANDLER<br/>schema · types · bounds"]
+        C -->|fail| CX["400 VALIDATION_FAILED<br/>settled as FailTerminal, so the key IS consumed"]
+        C --> E["Merchant + config snapshot<br/>cached, staleness ≤ 30 s"]
     end
 
     subgraph Hot["payment-orchestrator — §12 stages 10-17"]
@@ -626,7 +628,15 @@ flowchart TD
     W -.->|resolves| KY
 ```
 
-Two properties the diagram is meant to make obvious. First, **L4 is what makes L5 cheap**: everything expensive about a merchant's configuration — cross-checking it against capability descriptors, proving every enabled combination is routable, compiling the predicate table — happens once at publish time in the control plane, so the hot path only intersects bitsets. Second, **nothing on the hot path is impure**: the only arrows leaving the hot path are the dotted ones, and they are asynchronous inputs (config publication, health gossip, webhook resolution), never synchronous dependencies.
+One thing the diagram deliberately does *not* smooth over: **L1 is split in the implementation,
+and the halves land on opposite sides of the idempotency claim.** `ScanForPAN` runs inside the
+`bodylimit` middleware — above authentication, let alone above the claim — which is stronger than
+§12 asks for and is what keeps a PAN out of the logs, out of the authenticator and out of the
+idempotency fingerprint. The schema decode runs in the handler, *below* the claim, so a
+syntactically invalid body consumes its key and the 400 is what a duplicate replays. §12's table
+says stage 7 precedes stage 8; for the schema half, the code does the reverse.
+
+Two further properties the diagram is meant to make obvious. First, **L4 is what makes L5 cheap**: everything expensive about a merchant's configuration — cross-checking it against capability descriptors, proving every enabled combination is routable, compiling the predicate table — happens once at publish time in the control plane, so the hot path only intersects bitsets. Second, **nothing on the hot path is impure**: the only arrows leaving the hot path are the dotted ones, and they are asynchronous inputs (config publication, health gossip, webhook resolution), never synchronous dependencies.
 
 ---
 

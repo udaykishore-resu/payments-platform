@@ -201,5 +201,5 @@ SELECT account_id, sum(amount) FROM pp.ledger_entries GROUP BY account_id HAVING
   (`docs/security.md` §5.3). That is a separate ticket and a more important one.
 - Any row with `publish_attempts` in the hundreds is a poison-row defect: add the case to the
   event contract suite so the shape fails in CI (`make test-contract`).
-- Confirm the chaos coverage: `tests/chaos/kafka_loss_test.go::TestOutboxRetainsAndDrains` and
-  `tests/chaos/outbox_backlog_test.go::TestRelayScalesAndDrainsWithoutDuplicateOrdering`.
+- Confirm the coverage: `tests/chaos/infra_test.go::TestKafkaUnavailableLosesNoEvents` and
+  `tests/integration/outbox_test.go::TestBacklogMetricReflectsReality`.

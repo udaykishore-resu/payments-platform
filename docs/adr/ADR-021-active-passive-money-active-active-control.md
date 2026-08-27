@@ -128,7 +128,7 @@ active/active. Aurora Global secondary promotion is deliberately manual.**
 
 ## Validation
 
-- **Quarterly DR drill** (`scripts/dr-drill.sh` plus `tests/chaos/region_failover_test.go`):
+- **Quarterly DR drill** (`scripts/dr-drill.sh`, which has never been executed; there is no region-failover test):
   asserts **RTO ≤ 15 min** and **RPO ≤ 5 s**, measured from the last committed payment. This is
   the primary validation and its outcome is recorded against this ADR.
 - **Split-brain assertion:** during the drill, attempt writes against the demoted primary and

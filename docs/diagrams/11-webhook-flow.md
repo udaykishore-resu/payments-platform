@@ -7,75 +7,112 @@ completions, asynchronous payment methods, settlements, disputes and — most im
 `TIMEOUT_UNKNOWN` attempts that nothing else can resolve. They are also public-internet traffic
 from an unauthenticated-until-verified source, arriving in unpredictable spikes and with
 duplicates guaranteed by every gateway's at-least-once delivery. The design answer is a strict
-split: `webhook-ingress` has a ≤ 50 ms budget and does **accept-and-persist only**; all
-interpretation is asynchronous.
+split, and it is a split in the code as well as in the prose: `internal/application/webhook`
+holds an `Ingester` with a ≤ 50 ms budget that does **verify, deduplicate, persist, respond** and
+nothing else, and a separate `Processor` that re-verifies and applies. Diagram A is the first;
+Diagram B is the second. No path in either runs the other's work inline.
 
-## Diagram A — Ingestion sequence
+## Diagram A — The accept path, `webhook.Ingester.Ingest`
+
+Everything below runs inside the ≤ 50 ms budget, and nothing else does.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant GW as Gateway
     participant WAF as WAF and ALB
-    participant WI as webhook-ingress
-    participant SM as Secrets Manager
+    participant MW as Middleware chain
+    participant WI as webhook-ingress handler
+    participant SP as Secrets provider
+    participant AD as Gateway adapter verifier
     participant DB as Aurora writer
-    participant OR as outbox-relay
-    participant KF as pp.webhooks.inbound.v1
-    participant EC as event-consumer
-    participant PO as payment-orchestrator
-    participant DQ as Retry and DLQ topics
 
-    GW->>WAF: POST /v1/webhooks/gateway with signature header
-    WAF->>WI: forward
-    WI->>SM: fetch webhook signing secret, cached
-    WI->>WI: verify signature per the gateway signature scheme
-    alt Signature invalid
-        WI-->>GW: 401 WEBHOOK_SIGNATURE_INVALID, security event raised
+    GW->>WAF: POST /v1/webhooks/gateway with the gateway signature header
+    WAF->>MW: forward
+    MW->>MW: bodylimit buffers the exact received octets, cap 1 MiB for this route
+    Note over MW: the route is on the anonymous allowlist - the caller is a gateway holding a signature and no platform credential
+    MW->>WI: handler
+    WI->>SP: SigningSecrets for this gateway
+    SP-->>WI: current plus AWSPREVIOUS, so a mid-rotation delivery still verifies
+    Note over SP,WI: a secret we cannot read is 502 DEPENDENCY_FAILURE, not 401 - the two page different people
+    WI->>AD: Verify raw bytes, headers, secrets, now
+    Note over AD: constant time, over the octets, BEFORE any parser touches attacker controlled input
+    alt Signature invalid or timestamp outside the 5 min window
+        AD-->>WI: error
+        WI-->>GW: 401 WEBHOOK_SIGNATURE_INVALID, deliberately uninformative so the endpoint is not a signing oracle
     end
-    WI->>WI: replay check, timestamp skew within 5 min and nonce unused
-    alt Skew exceeded or nonce reused
-        WI-->>GW: 401 WEBHOOK_REPLAY_DETECTED, security event raised
+    alt No gateway event id
+        WI-->>GW: 400 WEBHOOK_UNKNOWN_EVENT_TYPE - without a dedup key every retry becomes a second application
     end
-    WI->>DB: dedup insert on webhook_dedup, gateway_ref unique
-    alt Duplicate delivery
-        DB-->>WI: 0 rows affected
-        WI-->>GW: 200 OK, dropped silently, counter incremented
+    WI->>DB: one transaction - claim webhook_dedup on gateway_id and gateway_event_id, then insert inbound_webhooks with tenant NULL
+    alt The claim conflicted
+        DB-->>WI: already seen
+        WI-->>GW: 200 OK with duplicate true - a retry is at-least-once delivery working, not an error
     end
-    WI->>DB: persist raw envelope to inbound_webhooks plus outbox row, one transaction
-    WI-->>GW: 200 OK within the 50 ms budget
-    Note over WI,GW: acknowledged before any interpretation, so a slow consumer never causes gateway retries
-
-    DB->>OR: outbox row
-    OR->>KF: webhook.received.v1 keyed by gateway_ref
-    KF->>EC: consume
-    EC->>EC: dedup insert on consumer_group plus event_id
-    EC->>EC: ACL translates the gateway payload into a domain intent
-    EC->>PO: apply intent
-    PO->>PO: L6 payload validation then L7 state transition guard
-    alt Transition legal
-        PO->>DB: new payment state plus outbox row, one transaction
-        DB->>KF: payment.authorized.v1 or captured or settled or disputed
-    else Transition illegal or out of order
-        PO-->>EC: 409 INVALID_STATE_TRANSITION
-        EC->>EC: classify, late or duplicate signal is dropped, genuine conflict is retried
-    end
-    EC->>DQ: retries exhausted, park on the dlq with the full error chain
+    DB-->>WI: stored, status RECEIVED
+    WI->>WI: best effort enqueue AFTER the commit - a queue entry for a row that does not exist is a poison message
+    WI-->>GW: 202 Accepted
+    Note over WI,GW: acknowledged before any interpretation, so a slow processor never recruits the gateway into amplifying it
 ```
 
-## Diagram B — Ordering, lateness and the reconciliation tie-in
+## Diagram B — The process path, `webhook.Processor.Process`
+
+Asynchronous, allowed to be slow, and never allowed to guess.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PK as Pickup - queue hint or the claim-unprocessed sweep
+    participant PR as Webhook processor
+    participant SP as Secrets provider
+    participant AD as Gateway adapter verifier
+    participant AG as Payment aggregate
+    participant LG as Ledger poster
+    participant DB as Aurora writer
+    participant RX as reconciliation_exceptions
+
+    PK->>PR: webhook id
+    PR->>DB: load the stored delivery
+    alt Already processed
+        DB-->>PR: processed_at set
+        PR-->>PK: ALREADY_PROCESSED, off the failure dashboard where it would drown real ones
+    end
+    PR->>SP: SigningSecrets
+    PR->>AD: re-Verify the stored payload against the STORED receipt time
+    Note over AD: not now - re-verifying against the current clock would reject every webhook older than the replay window, which is every webhook the retry tier exists for
+    alt The stored row no longer verifies
+        AD-->>PR: error
+        PR->>DB: MarkFailed with next_retry_at, exponential from 1 s capped at 5 min
+    end
+    PR->>AG: map the normalized kind onto the aggregate method
+    alt Kind is not modelled
+        PR-->>PK: IGNORED - a vendor feature launch is not an incident on our side
+    else No payment reference, or no such payment
+        PR->>RX: open a CRITICAL exception - money moved for something we had no record of
+        PR->>DB: MarkProcessed PARKED
+    else Transition illegal, or the state did not move
+        AG-->>PR: INVALID_STATE_TRANSITION
+        PR-->>PK: NO_OP - out of order or already applied is the normal case, not a fault
+    else Transition legal
+        PR->>DB: one transaction - payment state, ledger entries, outbox row, MarkProcessed APPLIED
+        LG->>DB: double-entry rows, idempotent on the gateway's own event id
+        DB->>PK: payment.authorized.v1 or captured or settled or refunded or disputed
+    end
+```
+
+## Diagram C — Ordering, lateness and the reconciliation tie-in
 
 ```mermaid
 flowchart TB
-  IN["Inbound webhook persisted"]
-  KEY["Kafka key is gateway_ref, not payment_id"]
-  REKEY["Consumer resolves gateway_ref to payment_id via the attempt row"]
-  ORD["Per-payment ordering is re-established by the aggregate version, not by the topic"]
-  VER["Compare event aggregateversion to the stored payment version"]
-  OLD["Stale or already-applied signal"]
-  DROP["Drop, increment a counter, no state change"]
-  NEW["Newer signal"]
-  APPLY["Apply through the FSM"]
+  IN["Inbound webhook persisted, tenant NULL until the payload resolves"]
+  KEY["The topic key is gateway_ref, not payment_id, so the topic gives no per-payment order"]
+  REKEY["The processor resolves the payload to a payment id, then GetForUpdate"]
+  ORD["Ordering is re-established by the aggregate, not by the topic"]
+  VER["Offer the transition to the FSM"]
+  OLD["Refused, or the state did not move"]
+  DROP["NO_OP, counted, no state change"]
+  NEW["Accepted"]
+  APPLY["Apply, post the ledger entries and mark processed in one transaction"]
   UNK["Attempt was TIMEOUT_UNKNOWN"]
   RESOLVE["Webhook resolves the unknown, payment leaves PROCESSING"]
   NOWH["No webhook within the SLA"]
@@ -95,25 +132,44 @@ flowchart TB
 
 ## Legend and notes
 
-- **Four independent defences run before persistence**, in this order and for this reason:
-  signature (is this really the gateway?), replay window (is this a captured-and-replayed
-  request?), dedup (have we already seen this exact delivery?), then persist. Reordering them
-  would let an attacker's replayed body consume a dedup slot or reach storage.
-- **The 200 is returned before interpretation.** Gateways retry aggressively on non-2xx; a
-  webhook endpoint that does work inline turns a slow database into an exponentially growing
-  redelivery storm. Accept-and-persist keeps the p99 inside 50 ms regardless of downstream health
-  (§5).
-- **Duplicates are dropped silently and counted, not errored.** Every gateway delivers
-  at-least-once. A duplicate is normal operation, not an incident (§24).
-- **The topic key is `gateway_ref`, so the topic does not give per-payment ordering.** Ordering is
-  re-established at apply time by comparing the event's `aggregateversion` against the stored
-  payment version, and by the FSM itself refusing illegal transitions. No consumer may assume a
-  global order (§13.3).
-- **A late webhook is not an error.** `SETTLED → PROCESSING` is explicitly invalid (§9), so a
-  webhook that arrives after a later signal already advanced the payment is dropped by L7 rather
-  than corrupting state. The classification step in the `else` branch distinguishes "harmlessly
-  late" from "genuine conflict worth retrying".
-- **This is resolution path (a) for `TIMEOUT_UNKNOWN`.** Diagram B shows the full ladder — webhook,
+- **The order of the accept path is the security property.** Verify *before* parsing — the HMAC is
+  checked over the raw octets by the adapter, in constant time, before a decoder touches
+  attacker-controlled input. Deduplicate *at the storage layer* — the unique index on
+  `(gateway_id, gateway_event_id)` **is** the check, because an in-memory one would not survive a
+  pod restart and would not work across replicas. Enqueue *after* the commit.
+- **The dedup claim and the body write are one transaction, claim first.** The order makes a
+  gateway's retry cheap (one small insert rather than a megabyte of body rewritten); the
+  transaction is what stops a crash between them from leaving a claim with no delivery — which
+  would make the platform answer 200 forever to an event it never actually stored.
+- **The row is written with a NULL tenant, through a store that refuses a tenanted one.** Every
+  other write in the persistence layer refuses to run without a tenant in context, and that
+  refusal is the isolation guarantee. A delivery's tenant is genuinely unknown at accept time, so
+  `WebhookIngestStore` writes under the one RLS policy that admits NULL, and refuses any record
+  that *does* name a tenant — that write belongs to the tenanted repository, where RLS's
+  `WITH CHECK` can prove it.
+- **`202` for a new delivery, `200` for one we already hold.** A gateway that receives an error
+  retries; a duplicate is not an error, it is at-least-once delivery working, and answering it
+  with 4xx makes the gateway retry a message we have already stored, forever. Adyen additionally
+  requires the literal body `[accepted]`, which the ack writer supplies.
+- **Enqueueing is best-effort and the queue is not the guarantee.** The durable record is the
+  database row; the queue is a latency optimisation over the `ClaimUnprocessed` sweep. A queue
+  failure must not fail the accept, because the gateway would then retry a webhook we already have
+  and the retry would deduplicate against it — wasted work at both ends.
+- **The processor re-verifies rather than trusting the row.** The accept path checked the
+  signature but did not carry that forward as a fact anything else can rely on; the row is read
+  minutes or hours later, possibly by a different process. Re-verification costs one HMAC and is
+  done against the **stored receipt time**, because verifying against the current clock would
+  reject every delivery older than the replay window.
+- **A late or duplicate webhook is a `NO_OP`, not an error.** `SETTLED → PROCESSING` is explicitly
+  invalid (§9), so a webhook that arrives after a later signal already advanced the payment is
+  refused by the aggregate and recorded as a no-op. Treating it as a failure would put a healthy
+  platform's most common event on the failure dashboard.
+- **A webhook for a payment we have no record of opens a `CRITICAL` reconciliation exception.**
+  It is the most alarming thing the processor can see — money moved for something the platform did
+  not think existed — and it is deliberately recorded as `PARKED`-and-processed rather than
+  retried forever, so the exception survives its own transaction and the sweep does not re-park it
+  on every pass.
+- **This is resolution path (a) for `TIMEOUT_UNKNOWN`.** Diagram C shows the full ladder — webhook,
   then reconciler polling with the deterministic gateway idempotency key, then settlement report,
   then a human-visible reconciliation exception (§12.3).
 - **Effectively-once, not exactly-once.** The consumer inserts `(consumer_group, event_id)` into

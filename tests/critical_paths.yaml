@@ -1,0 +1,312 @@
+# tests/critical_paths.yaml — the money-safety properties, and the test that proves each one.
+#
+# WHY THIS FILE EXISTS
+#   Coverage measures which lines executed. It says nothing about whether anything was
+#   asserted, and a coverage gate creates pressure to write exactly the kind of test that
+#   executes everything and asserts nothing. The gates in docs/testing.md §1.1 are therefore a
+#   floor against neglect; THIS file is the actual quality gate — a named, individually
+#   required list of properties, each traced to a baseline section, each pointing at a test
+#   that fails when the property is broken.
+#
+#   The artifact it produces is the one that makes an audit conversation short: a list of the
+#   properties that must hold for money not to move twice, and, for each, the test.
+#
+# WHAT CHECKS IT
+#   scripts/coverage.sh (the `critical-paths` stage of scripts/verify.sh) asserts that every
+#   `tests:` entry resolves — the file exists and declares a top-level `func <Name>(`. A
+#   renamed or deleted test therefore fails the build with the critical-path ID that lost its
+#   evidence, instead of silently leaving a property unasserted.
+#
+#   What it does NOT check is that the test still asserts the property. That needs mutation
+#   probing (deliberately breaking the property and requiring the named tests to fail), which
+#   is not implemented in this repository; see docs/testing.md §1.2.
+#
+# FIELDS
+#   id           CP-nn, stable. Never reused after deletion.
+#   property     One sentence, in the form of the thing that must be true.
+#   baseline     The normative section in docs/spec/00-design-baseline.md.
+#   tests        [ "<repo-relative path>::<TestName>", … ] — at least one, all must resolve.
+#   needs        Optional build tag or service dependency, so a reader knows which of these
+#               run in the default `go test ./...` and which need `make test-integration`.
+
+version: 1
+
+paths:
+  # --- money cannot move twice --------------------------------------------------------------
+  - id: CP-01
+    property: "A second successful attempt for one payment is refused by the database, with the domain bypassed"
+    baseline: "§9 I3"
+    needs: integration
+    tests:
+      - "internal/infrastructure/postgres/invariants_integration_test.go::TestI3RejectsSecondSuccessfulAttempt"
+      - "tests/integration/invariants_test.go::TestI3HoldsWhenTwoAttemptsSucceedConcurrently"
+
+  - id: CP-02
+    property: "A timed-out gateway call never fails the payment and is never retried automatically"
+    baseline: "§12.3, §1.3 A7, ADR-013"
+    needs: chaos
+    tests:
+      - "tests/chaos/gateway_test.go::TestGatewayTimeoutLeavesPaymentProcessingAndNeverRetries"
+      - "internal/domain/payment/payment_test.go::TestMarkFailedRespectsTheTransitionTable"
+      - "internal/domain/payment/state_test.go::TestAttemptOutcomeFailoverAndReconciliation"
+
+  - id: CP-03
+    property: "An unknown outcome is resolved by an authoritative lookup, never by assumption"
+    baseline: "§12.3, §1.3 A7"
+    needs: chaos
+    tests:
+      - "tests/chaos/crash_test.go::TestAnUnknownOutcomeIsResolvedByLookupNotByGuessing"
+      - "tests/chaos/gateway_test.go::TestGatewayFiveHundredStormDoesNotFailOverOnAnUnknownOutcome"
+
+  - id: CP-04
+    property: "sum(refunds) can never exceed captured_amount, in the aggregate and at the database"
+    baseline: "§9 I1"
+    tests:
+      - "internal/domain/payment/refund_test.go::TestRefundTransitionGuards"
+      - "internal/infrastructure/postgres/invariants_integration_test.go::TestI1RejectsRefundExceedingCapture"
+      - "tests/integration/invariants_test.go::TestConcurrentPartialRefundsCannotExceedTheCapturedAmount"
+
+  - id: CP-05
+    property: "Cumulative captures can never exceed the authorized amount"
+    baseline: "§9 I2"
+    tests:
+      - "internal/infrastructure/postgres/invariants_integration_test.go::TestI2RejectsCaptureExceedingAuthorization"
+
+  - id: CP-06
+    property: "A hard decline never fails over to another gateway"
+    baseline: "§9.1"
+    tests:
+      - "internal/application/payment/orchestrator_test.go::TestHardDeclineDoesNotFailOver"
+      - "internal/domain/payment/state_test.go::TestDeclineReasonPermitsFailover"
+      - "internal/domain/payment/state_test.go::TestUnrecognisedDeclineReasonDoesNotPermitFailover"
+
+  - id: CP-07
+    property: "Failover creates a new attempt with a new gateway key and never produces two successes"
+    baseline: "§9.1, §14.4"
+    tests:
+      - "internal/application/payment/orchestrator_test.go::TestFailoverNeverProducesTwoSuccessfulAttempts"
+      - "tests/chaos/gateway_test.go::TestSoftDeclineFailsOverAndProducesExactlyOneSuccess"
+
+  - id: CP-08
+    property: "Two concurrent creates with one idempotency key yield exactly one payment; the loser never blocks"
+    baseline: "§14, §1.3 A6"
+    needs: integration
+    tests:
+      - "tests/integration/idempotency_test.go::TestConcurrentIdenticalCreatesYieldExactlyOnePayment"
+      - "tests/integration/idempotency_test.go::TestExpiredLeaseIsReclaimedExactlyOnce"
+
+  - id: CP-09
+    property: "A replayed request returns the byte-identical stored response; the same key with a different body is refused"
+    baseline: "§14.2, §14.3"
+    needs: integration
+    tests:
+      - "tests/integration/idempotency_test.go::TestReplayReturnsTheByteIdenticalStoredResponse"
+      - "tests/integration/idempotency_test.go::TestSameKeyWithADifferentBodyIsReportedAsReuse"
+      - "tests/integration/idempotency_test.go::TestAnExpiredLeaseCannotBeReclaimedWithADifferentBody"
+
+  - id: CP-10
+    property: "A duplicate webhook produces exactly one state transition"
+    baseline: "§13.5"
+    needs: integration
+    tests:
+      - "tests/integration/webhook_test.go::TestDuplicateWebhookIsDroppedByTheUniqueIndex"
+      - "tests/integration/webhook_test.go::TestAnOutOfOrderWebhookIsANoOp"
+
+  - id: CP-11
+    property: "A webhook that failed signature verification can never reach a processing state"
+    baseline: "§13.5, §17"
+    needs: integration
+    tests:
+      - "tests/integration/webhook_test.go::TestAWebhookThatFailedVerificationCannotReachAProcessingState"
+      - "tests/chaos/clock_skew_test.go::TestATamperedBodyIsRejectedRegardlessOfTheClock"
+
+  - id: CP-12
+    property: "A crash between gateway dispatch and commit never produces a second dispatch"
+    baseline: "§12, §24"
+    needs: chaos
+    tests:
+      - "tests/chaos/crash_test.go::TestPodCrashBetweenDispatchAndCommitNeverDispatchesTwice"
+
+  - id: CP-13
+    property: "A retry storm against the orchestrator produces no duplicate payment"
+    baseline: "§24"
+    needs: chaos
+    tests:
+      - "tests/chaos/retry_storm_test.go::TestARetryStormAgainstTheOrchestratorProducesNoDuplicatePayment"
+      - "tests/chaos/retry_storm_test.go::TestRetryBudgetBoundsARetryStorm"
+
+  # --- state cannot become impossible ------------------------------------------------------
+  - id: CP-14
+    property: "The payment FSM accepts exactly the 35 documented edges over all 196 pairs"
+    baseline: "§9"
+    tests:
+      - "internal/domain/payment/state_test.go::TestPaymentMachineAcceptsExactlyTheDeclaredEdges"
+      - "internal/domain/payment/state_test.go::TestPaymentMachineRefusesTheTransitionsTheBaselineNames"
+
+  - id: CP-15
+    property: "The merchant FSM accepts exactly the 42 documented edges over all 441 pairs, amendment A-01 included"
+    baseline: "§8, amendment A-01"
+    tests:
+      - "internal/domain/merchant/state_test.go::TestMerchantMachineAcceptsExactlyTheDeclaredEdges"
+      - "internal/domain/merchant/state_test.go::TestAmendmentA01ComplianceRejection"
+      - "internal/domain/merchant/state_test.go::TestMerchantForbiddenTransitionsWorthNaming"
+
+  - id: CP-16
+    property: "The attempt FSM accepts exactly the 9 documented edges; TIMEOUT_UNKNOWN is not terminal"
+    baseline: "§9.1"
+    tests:
+      - "internal/domain/payment/state_test.go::TestAttemptMachineAcceptsExactlyTheDeclaredEdges"
+
+  - id: CP-17
+    property: "The database's transition tables are identical to the domain's, so the two layers cannot disagree"
+    baseline: "§9, §8"
+    tests:
+      - "internal/infrastructure/postgres/migrations_test.go::TestTransitionTablesMatchDomain"
+      - "internal/infrastructure/postgres/invariants_integration_test.go::TestDatabaseRefusesAnIllegalStateTransition"
+
+  - id: CP-18
+    property: "A suspended merchant refuses new payments but still permits refunds"
+    baseline: "§8"
+    tests:
+      - "internal/domain/merchant/state_test.go::TestCanAcceptPaymentsIsNarrowerThanCanIssueRefunds"
+
+  - id: CP-19
+    property: "Payment identity, amount, currency, merchant and tenant are immutable after creation"
+    baseline: "§9 I4"
+    needs: integration
+    tests:
+      - "internal/infrastructure/postgres/invariants_integration_test.go::TestI4ImmutableFieldsRejectedAtDatabase"
+
+  - id: CP-20
+    property: "Ledger and audit rows are append-only, and payment rows cannot be deleted"
+    baseline: "§23"
+    needs: integration
+    tests:
+      - "internal/infrastructure/postgres/invariants_integration_test.go::TestLedgerAndAuditAreAppendOnly"
+      - "internal/infrastructure/postgres/invariants_integration_test.go::TestPaymentTablesRejectDelete"
+
+  - id: CP-21
+    property: "A worker crash at any onboarding step resumes without repeating a completed side effect"
+    baseline: "§11"
+    needs: integration
+    tests:
+      - "tests/integration/workflow_resume_test.go::TestWorkerCrashAtEveryOnboardingStepResumesWithoutRepeatingWork"
+      - "tests/chaos/crash_test.go::TestWorkerCrashMidWorkflowResumesWithoutRepeatingASideEffect"
+
+  - id: CP-22
+    property: "Starting an onboarding twice for one merchant is refused by the database, not by a read-then-write"
+    baseline: "§11"
+    needs: integration
+    tests:
+      - "tests/integration/workflow_resume_test.go::TestStartingOnboardingTwiceIsRefusedByTheDatabase"
+
+  - id: CP-23
+    property: "The outbox preserves per-aggregate order across relay shards and never loses a row on a publish failure"
+    baseline: "§13.4"
+    needs: integration
+    tests:
+      - "tests/integration/outbox_test.go::TestTwoRelayShardsPreservePerAggregateOrder"
+      - "tests/integration/outbox_test.go::TestAPublishFailureLeavesTheRowClaimable"
+
+  # --- a tenant cannot see another tenant's data --------------------------------------------
+  - id: CP-24
+    property: "A cross-tenant read or write is refused by the database with the application guard removed"
+    baseline: "§16.2"
+    needs: integration
+    tests:
+      - "internal/infrastructure/postgres/rls_integration_test.go::TestCrossTenantAccessIsImpossible"
+      - "internal/infrastructure/postgres/rls_integration_test.go::TestRLSBlocksADirectUpdate"
+      - "tests/integration/tenant_isolation_test.go::TestCrossTenantReadsAndWritesAreRefusedByTheDatabase"
+
+  - id: CP-25
+    property: "A statement with no tenant in the session sees nothing, and never returns rows"
+    baseline: "§16.2"
+    needs: integration
+    tests:
+      - "internal/infrastructure/postgres/rls_integration_test.go::TestQueryWithoutTenantContextReturnsNoRows"
+      - "tests/integration/tenant_isolation_test.go::TestAStatementWithNoTenantInTheSessionSeesNothing"
+
+  - id: CP-26
+    property: "Every tenant-scoped table has FORCE ROW LEVEL SECURITY, partitions included, and the app role lacks BYPASSRLS"
+    baseline: "§16.1"
+    needs: integration
+    tests:
+      - "internal/infrastructure/postgres/rls_integration_test.go::TestEveryTenantScopedTableHasForcedRLSInCatalog"
+      - "internal/infrastructure/postgres/rls_integration_test.go::TestAppRoleLacksBypassRLS"
+      - "internal/infrastructure/postgres/rls_integration_test.go::TestPartitionsCarryRLSAndTheI3Index"
+      - "tests/integration/tenant_isolation_test.go::TestEveryTenantScopedTableIsCoveredByAnIsolationCase"
+
+  - id: CP-27
+    property: "A tenant context set inside a transaction does not leak to the next one on the same connection"
+    baseline: "§16.2"
+    needs: integration
+    tests:
+      - "internal/infrastructure/postgres/rls_integration_test.go::TestSetLocalDoesNotLeakAcrossTransactions"
+
+  # --- PAN and credentials never enter the platform -----------------------------------------
+  - id: CP-28
+    property: "A bare card number is detected in every scheme and in nested fields, and the rejected value is never logged"
+    baseline: "§17.2"
+    tests:
+      - "internal/platform/secret/pan_test.go::TestContainsPANDetectsEveryScheme"
+      - "internal/platform/secret/pan_test.go::TestPANDetectorNeverLogsTheValue"
+      - "internal/platform/secret/pan_test.go::TestScanStructFindsNestedFields"
+
+  - id: CP-29
+    property: "The PAN tripwire rejects a bare card number at the database, with the application bypassed"
+    baseline: "§17.2"
+    needs: integration
+    tests:
+      - "internal/infrastructure/postgres/invariants_integration_test.go::TestPANTripwireRejectsABareCardNumber"
+
+  - id: CP-30
+    property: "No secret-provider path leaks credential material into an error or a log line"
+    baseline: "§17.1"
+    tests:
+      - "internal/infrastructure/secrets/redaction_test.go::TestNoProviderPathLeaksMaterialIntoAnError"
+      - "internal/infrastructure/secrets/redaction_test.go::TestFileProviderPathsDoNotLeakMaterial"
+
+  # --- degradation is bounded ---------------------------------------------------------------
+  - id: CP-31
+    property: "Losing Redis degrades latency and never correctness; zero duplicate payments"
+    baseline: "§14.3, §24"
+    needs: chaos
+    tests:
+      - "tests/chaos/infra_test.go::TestRedisLossDegradesLatencyNotCorrectness"
+
+  - id: CP-32
+    property: "Losing Kafka loses no events; the outbox drains fully on recovery"
+    baseline: "§13.4, §24"
+    needs: chaos
+    tests:
+      - "tests/chaos/infra_test.go::TestKafkaUnavailableLosesNoEvents"
+
+  - id: CP-33
+    property: "Losing the database mid-transaction fails closed with no partial write"
+    baseline: "§1.3 A4, §24"
+    needs: chaos
+    tests:
+      - "tests/chaos/infra_test.go::TestDatabaseUnavailableMidTransactionFailsClosed"
+
+  - id: CP-34
+    property: "A network partition fails closed, produces no split brain, and is not reported as an unknown outcome"
+    baseline: "§1.3 A4, §24"
+    needs: chaos
+    tests:
+      - "tests/chaos/partition_test.go::TestPartitionFailsClosedAndHealsWithoutSplitBrain"
+      - "tests/chaos/partition_test.go::TestAPartitionIsNotReportedAsAnUnknownOutcome"
+
+  - id: CP-35
+    property: "Clock skew beyond the webhook tolerance fails closed, and a secret rotation does not drop webhooks"
+    baseline: "§13.5, §24"
+    needs: chaos
+    tests:
+      - "tests/chaos/clock_skew_test.go::TestClockSkewBeyondTheWebhookToleranceFailsClosed"
+      - "tests/chaos/clock_skew_test.go::TestASecretRotationDoesNotDropWebhooks"
+
+  - id: CP-36
+    property: "A hard decline does not open the gateway circuit — a declining gateway is working, not broken"
+    baseline: "§10"
+    tests:
+      - "internal/domain/gateway/health_test.go::TestHardDeclinesDoNotOpenTheCircuit"
+      - "internal/domain/gateway/health_test.go::TestCooldownDoublesAndIsCapped"

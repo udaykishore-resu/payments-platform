@@ -170,7 +170,7 @@ promises, and it is worth checking rather than assuming.
   is the number that decides whether the fallback is sized for a longer outage.
 - If TLS configuration was the cause, the chart is the fix. A `kubectl set env` that is not in Git
   disappears at the next sync.
-- Confirm the chaos coverage: `tests/chaos/redis_loss_test.go::TestIdempotencyCorrectWithoutRedis`
+- Confirm the chaos coverage: `tests/chaos/infra_test.go::TestRedisLossDegradesLatencyNotCorrectness`
   kills Redis mid-burst with duplicate keys and asserts every duplicate replays the identical
   stored response and no operation executes twice. That test is the evidence behind this runbook's
   central claim; keep it passing.

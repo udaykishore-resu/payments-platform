@@ -101,7 +101,7 @@ flowchart LR
   RKAFKA["Outbox retains rows and backs off, zero data loss, pp_outbox_backlog alerts"]
   RREG["Diagram B sequence, RTO 15 min, RPO 5 s budgeted"]
 
-  DRILL["Quarterly DR drill via platformctl - measured, not assumed"]
+  DRILL["platformctl dr-drill - region-failover, writer-failover or restore, measured not assumed"]
 
   AZ --> RAZ
   NODE --> RNODE
@@ -137,9 +137,16 @@ flowchart LR
 - **The control plane needs no failover**, because it is already active in both regions and its
   reads are served locally from the compacted configuration topic. Only its *writes* follow the
   Aurora primary.
-- **RPO and RTO are drill-measured numbers, not aspirations.** `platformctl` runs the DR drill and
-  records actual figures against the §18 targets; a drill that misses the target is a defect with
-  an owner, not a note (§18, §27).
+- **RPO and RTO are drill-measured numbers, not aspirations.** `platformctl dr-drill` takes one of
+  three scenarios — `region-failover`, `writer-failover`, `restore` — and records actual figures
+  against the §18 targets; a drill that misses the target is a defect with an owner, not a note
+  (§18, §27).
+- **Step 13's two halves have different maturity.** Replaying unpublished outbox rows is
+  `outbox-relay` doing its ordinary job against the promoted writer, and needs no new machinery.
+  Resolving ambiguous attempts against the gateways is `internal/application/payment.Reconciler`,
+  which is implemented and tested but is not yet constructed by any binary — so today that half of
+  the gap-closing is an operator following the runbook rather than a process doing it. The step is
+  drawn because the sequence is not correct without it.
 
 ## Related
 

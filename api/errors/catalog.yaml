@@ -1,22 +1,41 @@
 # Platform error catalogue — the single source of truth for every error this platform
 # can return, on either transport.
 #
-# This file is CONSUMED BY GENERATORS. Do not reformat it by hand into something a
-# parser cannot read, and do not add a code here without also adding its documentation
-# anchor:
+# NOTHING IS GENERATED FROM THIS FILE, AND NOTHING GENERATES IT.
 #
-#   go generate ./pkg/apierror   -> pkg/apierror/codes_gen.go   (constants + lookup table)
-#   make docs-errors             -> docs/errors/*.md            (one page per code)
-#   make openapi-error-examples  -> validates every `code` used in api/openapi against this file
+# The error model exists as TWO hand-maintained artifacts, kept in agreement by ONE CI check:
 #
-# CI checks, all failing the build:
-#   * every `code` is unique and matches ^[A-Z][A-Z0-9_]{2,63}$
-#   * every `category` exists in `categories`
-#   * `http_status`, `grpc_code` and `retryable` agree with the code's category unless an
-#     explicit `overrides_category: <reason>` is given — divergence needs a stated reason
-#   * every code referenced anywhere in api/openapi, api/proto or internal/ exists here
-#   * every code here has a docs anchor that resolves
-#   * no code is removed without a `deprecated_in` and a `sunset` date
+#   1. this catalogue                    — the published contract: title, remediation, docs
+#                                          anchor, raising services, validation level, since/
+#                                          deprecation metadata;
+#   2. `registry` in pkg/apierror        — the linked Go code: the `Code` constants and the
+#                                          category, HTTP status, gRPC code and retryability
+#                                          the platform will actually put on a response;
+#   3. scripts/check-error-catalog.sh    — the check that compares them, run as the
+#                                          `error-catalog` stage of scripts/verify.sh and as a
+#                                          job in .github/workflows/ci.yml.
+#
+# Adding a code therefore means editing this file AND pkg/apierror, in the same commit. The
+# check fails the build if you edit one and not the other; there is no `go generate` step that
+# will do the second edit for you. `go_const` below is the join key it uses.
+#
+# The comparison runs against the LINKED registry (`go run ./scripts/specdump errors`) rather
+# than a parse of the source, so what is compared is what the binary will actually return.
+#
+# What scripts/check-error-catalog.sh enforces, all failing the build:
+#   * C1  the same SET of codes — nothing published that the platform cannot raise, and
+#         nothing raisable that is not published
+#   * C2  the same `category` for every code
+#   * C3  the same retryability, after applying the category defaults a code inherits unless
+#         it overrides them
+#   * C4  the same `http_status` and `grpc_code` wherever this file states one explicitly
+#   * C5  every `go_const` names a constant that exists in pkg/apierror
+#   * C6  every `code` is unique and matches ^[A-Z][A-Z0-9_]{2,63}$
+#
+# What is NOT checked by anything, and is therefore a review responsibility:
+#   * that `docs_anchor` resolves — there is no published docs site in this repository
+#   * that every code used in api/openapi or api/proto exists here
+#   * that a removed code carried a `deprecated_in` and a `sunset` date
 #
 # Compatibility: a code is a public contract. Adding one is additive. Changing a code's
 # `retryable`, `http_status` or `grpc_code` is BREAKING — client SDKs and the workflow
@@ -24,11 +43,13 @@
 # do not own. Change the meaning by introducing a new code and deprecating the old one.
 
 version: 1
-schema: https://schemas.example.com/errors/catalog.v1.json
-generated_artifacts:
+
+# The Go package this catalogue is reconciled against, and the URI prefixes that appear in
+# `type` and `docsUrl` on a problem+json response. Both prefixes are example.com placeholders:
+# no docs site is published from this repository.
+reconciled_with:
   go_package: github.com/udaykishore-resu/payments-platform/pkg/apierror
-  go_file: pkg/apierror/codes_gen.go
-  docs_dir: docs/errors
+  check: scripts/check-error-catalog.sh
   type_uri_prefix: https://errors.example.com/
   docs_url_prefix: https://docs.example.com/errors/
 

@@ -72,8 +72,8 @@ This is a ticket. There is no five-minute clock. Do this within the business day
 
 **M1 — declare the freeze.** Announce the tier in the engineering channel with the current
 remaining percentage and the exit criterion. The gate is enforced as a required check on the pull
-request. *Note: `docs/observability.md` §4.4 names `scripts/slo-gate.sh` as the enforcing script;
-that script is not present in this repository, so today the freeze is enforced by the reviewing
+request. *Note: `docs/observability.md` §4.4 names `scripts/slo-gate.sh` as the enforcing script. <!-- doc-refs: allow-missing -->
+It does not exist, so today the freeze is enforced by the reviewing
 team rather than mechanically. Treat writing it as a follow-up item, not as a reason to skip the
 freeze.* Expected effect: feature pull requests stop merging; fixes continue.
 
@@ -123,4 +123,4 @@ Do not silence it to make the dashboard green — the alert *is* the freeze.
 - Check that the policy actually held: count pull requests merged during the freeze and how many
   carried a recorded exemption. A freeze nobody honoured is worse than none, because it is
   reported as a control.
-- Write `scripts/slo-gate.sh` so the next freeze is enforced by CI rather than by memory.
+- Write `scripts/slo-gate.sh` so the next freeze is enforced by CI rather than by memory. <!-- doc-refs: allow-missing -->

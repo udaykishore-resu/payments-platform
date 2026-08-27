@@ -231,7 +231,7 @@ terminal state through the normal path — resolved by webhook, by lookup, or by
 - If the cause was our OOM, the fix is the memory profile, and the durable fix is the limit being
   derived from measured heap rather than copied from another service.
 - Confirm the chaos coverage still holds:
-  `tests/chaos/gateway_timeout_test.go::TestTimeoutLeavesPaymentProcessingAndReconciles`. If this
+  `tests/chaos/gateway_test.go::TestGatewayTimeoutLeavesPaymentProcessingAndNeverRetries`. If this
   incident had a shape that test does not produce, add it.
 - If anyone was tempted by a manual write, that temptation is a documentation gap. Make this
   runbook's forbidden-actions table the thing they find first.

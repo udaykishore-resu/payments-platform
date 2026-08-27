@@ -316,7 +316,7 @@ non-terminal state carrying the reviewer's reason code, with routes back to `CON
 
 ## 7. How to write a migration
 
-Migrations are `migrations/NNNN_slug.up.sql` with a mandatory matching `NNNN_slug.down.sql`,
+Migrations are `migrations/<nnnn>_<slug>.up.sql` with a mandatory matching `<nnnn>_<slug>.down.sql`,
 numbered contiguously from 0001. `scripts/check-migrations.sh` (stage 12 of `make verify`) enforces
 seven properties:
 

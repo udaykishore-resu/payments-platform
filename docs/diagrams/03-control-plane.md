@@ -44,9 +44,9 @@ flowchart TB
     FF["feature_flags"]
   end
 
-  AUTHN["Stage 3 authentication - OIDC or mTLS"]
-  GUARD["Stage 4 tenant isolation guard"]
-  AUTHZ["Stage 5 RBAC plus ABAC"]
+  AUTHN["authn - jwt via jwks, mtls SPIFFE peer identity, or apikey"]
+  GUARD["tenant - isolation guard, tenant from the token and the merchant scope allowlist"]
+  AUTHZ["authz - RBAC plus ABAC, permission from the method and route template, plus dual control"]
   L4["L4 configuration validation"]
   AUD["BC-9 audit record - actor plus diff"]
   OBX["outbox_events"]
@@ -123,6 +123,14 @@ flowchart LR
 - **`gateway_health` flows into the gateway registry, not out of it.** Health is computed in the
   data and observability planes and consumed here for recording and operator visibility; the
   control plane is not the source of truth for health (§10).
+- **`config.Service` is the whole of the desired-state surface**, and it is deliberately small:
+  `GetActive`, `GetVersion`, `ListVersions`, `Publish` and `Rollback`. There is no update-in-place
+  method, because there is no update-in-place operation — `Rollback` republishes a prior document
+  through the same `Publish` path, so it is validated, versioned, audited and announced exactly
+  like any other change.
+- **Merchant lifecycle commands are `Suspend`, `Reinstate` and `Terminate`**, each routed through
+  one `transition` helper that takes the L7 guard, writes the audit record and the outbox row in
+  the same transaction. There is no code path that moves a merchant's state without all three.
 - **Desired vs actual.** The control plane owns desired state only. Actual state — the gateway
   sub-account that really exists, the webhook that is really registered — is owned by the gateway
   integration side of BC-4, and the reconciliation loop is what closes the gap. Provisioning

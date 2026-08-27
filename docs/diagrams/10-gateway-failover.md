@@ -4,56 +4,79 @@
 
 Failover is the most dangerous mechanism in a payment orchestrator, because a careless
 implementation turns a transient error into a double charge or turns the platform into a card
-testing service. This diagram shows the three branches that matter and, critically, the two where
+testing service. This diagram shows the branches that matter and, critically, the ones where
 failover **must not** happen: a hard decline (retrying a stolen card on another gateway is card
-testing behaviour and gets the platform de-registered from the schemes) and a `TIMEOUT_UNKNOWN`
-(we do not know whether money moved, so retrying anywhere is a coin flip on a double charge).
+testing behaviour and gets the platform de-registered from the schemes), a `TIMEOUT_UNKNOWN`
+(we do not know whether money moved, so retrying anywhere is a coin flip on a double charge), and
+an L6 contract violation (a response we cannot trust leaves the outcome *unknown*, not failed).
+Diagram A is `Orchestrator.Dispatch` and `Orchestrator.settle` as written, in their real order.
 
-## Diagram A — Failover decision
+## Diagram A — The dispatch loop
+
+`Orchestrator.Dispatch` walks the persisted routing plan at most `MaxAttempts` times (default 2).
+Each pass either returns a terminal result or advances; `Plan.Next(tried)` never returns a
+gateway this payment has already touched.
 
 ```mermaid
 flowchart TB
-  A1["Attempt 1 dispatched to routing plan position 1"]
-  RESP["Gateway response or transport outcome"]
+  LOOP["Dispatch loop - i less than MaxAttempts, default 2"]
+  NEXTC["Plan.Next excluding gateways already tried"]
+  NOCAND["No further eligible candidate"]
+  PRE["Pre-dispatch - breaker Allow, bulkhead Acquire, Gateways.Resolve credentials"]
+  PREF["Pre-dispatch failure - GATEWAY_CIRCUIT_OPEN, bulkhead full, credentials unresolvable"]
+  T1["T1 - StartAttempt, bindConnection, MarkProcessing, COMMIT"]
+  T2["T2 - client Authorize under its own GatewayTimeout"]
+  SET["settle - classify in this order and no other"]
 
-  OK["SUCCESS - authorized or captured"]
-  ERRT["ERROR - our side or transport failed before the gateway could act"]
-  DEC["DECLINED - the gateway definitively said no"]
-  TMO["TIMEOUT_UNKNOWN - no response within the 8 s hard timeout"]
+  C1["1 unknown - ErrOutcomeUnknown or a timeout with no result"]
+  C2["2 transport error - the gateway provably did not act"]
+  C3["3 nil result and nil error - a broken adapter"]
+  C4["4 L6 contract violation - the response failed validation"]
+  C5["5 the business outcome"]
 
-  SOFT["Decline reason is in the retryable decline set - issuer unavailable, soft do-not-honour, network error"]
-  HARD["Hard decline - stolen card, invalid account, pickup card, do-not-honour hard code"]
+  UNK["attempt TIMEOUT_UNKNOWN, RequireReconciliation, payment stays PROCESSING"]
+  RECQ["payment.reconciliation_required.v1, alerting"]
+  ERRA["attempt ERROR, breaker counts it"]
+  DECA["attempt DECLINED, breaker deliberately does NOT count it"]
+  OKA["attempt SUCCESS - AUTHORIZED or CAPTURED"]
+  PARK["RequiresAction or Pending - attempt stays open, payment parks"]
 
-  SAMEG["Retry at most 2 times with jitter on the SAME attempt and SAME gateway"]
-  BRK["Circuit breaker records the failure, may open for this gateway and operation"]
-  NEXT["Advance to routing plan position 2"]
-  NEWATT["Create a NEW attempt - new attempt_id, new derived gateway idempotency key"]
-  NOCAND["No further eligible position"]
+  PF["PermitsFailover - network advice, then outcome, then normalized decline reason, most restrictive wins"]
+  SOFT["Soft decline set - ISSUER_UNAVAILABLE, TRY_AGAIN_LATER, PROCESSING_ERROR, DO_NOT_HONOR"]
+  HARD["Anything else, UNKNOWN included - hard, allowlist not blocklist"]
+  MARKF["MarkFailed - payment FAILED, reason preserved"]
+  ADV["Advance the loop - a NEW attempt with a NEW derived gateway key"]
+  EXH["Loop exhausted - reload the payment from the writer"]
+  INFL["Still in flight - 202-shaped answer, the merchant polls, never retries"]
+  LASTE["Not in flight - return the last error"]
+  DONE["Invariant I3 - at most one attempt per payment in a successful terminal state"]
 
-  TERMF["Payment to FAILED, terminal, reason code preserved"]
-  NEVER["NO FAILOVER - card testing risk, scheme de-registration risk"]
-  STAY["Payment stays PROCESSING, attempt marked TIMEOUT_UNKNOWN"]
-  RECQ["payment.reconciliation_required.v1 to the reconciler, alerting"]
-  ERR503["503 NO_ELIGIBLE_GATEWAY"]
-
-  A1 --> RESP
-  RESP --> OK
-  RESP --> ERRT
-  RESP --> DEC
-  RESP --> TMO
-
-  ERRT --> SAMEG
-  SAMEG -->|"still failing"| BRK --> NEXT
-  DEC --> SOFT
-  DEC --> HARD
-  SOFT --> NEXT
-  HARD --> NEVER --> TERMF
-  TMO --> STAY --> RECQ
-
-  NEXT --> NEWATT --> A2["Attempt 2 dispatched"]
-  NEXT --> NOCAND --> ERR503
-  OK --> DONE["Invariant I3 - at most one attempt per payment in a successful terminal state"]
+  LOOP --> NEXTC
+  NEXTC -->|"none left"| NOCAND --> EXH
+  NEXTC --> PRE
+  PRE -->|"refused, gateway untouched"| PREF --> ADV
+  PRE --> T1 --> T2 --> SET
+  SET --> C1 --> UNK
+  SET --> C2 --> ERRA
+  SET --> C3 --> UNK
+  SET --> C4 --> UNK
+  SET --> C5
+  C5 --> OKA --> DONE
+  C5 --> PARK
+  C5 --> DECA
+  UNK --> RECQ
+  ERRA --> PF
+  DECA --> PF
+  PF --> SOFT --> ADV
+  PF --> HARD --> MARKF
+  ADV --> LOOP
+  EXH --> INFL
+  EXH --> LASTE
 ```
+
+Terminal branches — `TIMEOUT_UNKNOWN`, `RequiresAction`, `Pending`, success and a non-failoverable
+decline — leave the loop immediately. Only a pre-dispatch refusal, an `ERROR`, or a soft decline
+re-enter it.
 
 ## Diagram B — Circuit opens and traffic shifts
 
@@ -80,8 +103,9 @@ sequenceDiagram
     OB-->>RT: consume health change
     OB-->>CP: control plane records health for operator visibility
 
+    Note over PO,BR: with the circuit OPEN the next payment is refused before StartAttempt, so no attempt row is created at all
     PO->>RT: routing plan for att_1 already exists, advance to position 2
-    PO->>PO: create NEW attempt att_2 with a NEW derived idempotency key
+    PO->>PO: create NEW attempt att_2, bind its connectionId, derive a NEW gateway key, commit before dispatch
     PO->>AD: authorize att_2
     AD-->>PO: approved
     PO->>OB: payment.attempted.v1 then payment.authorized.v1
@@ -97,14 +121,30 @@ sequenceDiagram
 
 ## Legend and notes
 
-- **A retry is not a failover.** A transport `ERROR` is retried at most twice with jitter on the
-  *same* attempt against the *same* gateway, reusing the same derived idempotency key so the
-  gateway dedupes. Only when that budget is exhausted does the orchestrator advance the routing
-  plan and create a **new attempt** (§24, §14.4).
+- **Failover consults the *attempt*, not the loop counter.** `att.PermitsFailover()` folds three
+  rules together and takes the most restrictive answer: a scheme-level "do not retry" advice
+  vetoes everything; `ERROR` permits failover; `DECLINED` defers to the normalized decline reason;
+  `SUCCESS`, `PENDING`, `DISPATCHED` and `TIMEOUT_UNKNOWN` all forbid it.
+- **The soft-decline set is an allowlist of four.** `ISSUER_UNAVAILABLE`, `TRY_AGAIN_LATER`,
+  `PROCESSING_ERROR`, `DO_NOT_HONOR`. Everything else is hard — including `UNKNOWN`, which is
+  what an adapter maps a reason code it has not been taught about to. Defaulting an unknown reason
+  to "retry" is how a platform ends up card testing on an attacker's behalf.
+- **A decline does not count against the circuit breaker.** `record(false, false)` on the decline
+  branch is deliberate: a merchant with a high-decline customer cohort would otherwise open the
+  breaker on a perfectly healthy gateway and take that gateway out for every other merchant
+  sharing it. An `ERROR`, a timeout and an L6 violation all *do* count.
+- **A pre-dispatch refusal never creates an attempt row.** A circuit that is open, a full bulkhead
+  or an unresolvable credential all fail before `StartAttempt`, so the gateway was provably not
+  touched and moving to the next candidate is free of double-charge risk.
 - **A new attempt means a new key means a genuinely new authorization.** That is the whole point
-  of deriving the gateway key from `attempt_id` rather than from the client's key: a same-gateway
-  retry is safe, and a cross-gateway failover is correctly treated as a distinct authorization,
-  with the previous one separately voided or reconciled (A10).
+  of deriving the gateway key from `attempt_id` and the operation rather than from the client's
+  key: a transport-level retry to the same gateway would reuse the key and dedupe there, and a
+  cross-gateway failover is correctly treated as a distinct authorization, with the previous one
+  separately voided or reconciled (A10).
+- **An exhausted loop is not automatically an error.** `Dispatch` reloads the payment from the
+  writer — the in-memory aggregate can be behind after a conflict retry inside a transaction —
+  and if the reloaded state is still in flight it returns a 202-shaped result rather than a
+  failure. The merchant must poll or wait for the webhook, and must not retry.
 - **Hard decline is terminal and never failed over.** This is a business rule with regulatory
   teeth, not a performance tuning choice. The ACL maps each gateway's proprietary reason codes to
   a normalized set and the retryable-decline membership is a property of that normalized code —

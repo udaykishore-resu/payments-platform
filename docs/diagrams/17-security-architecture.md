@@ -2,13 +2,15 @@
 
 ## What this shows and why it matters
 
-Trust zones, the identity flows that cross them (OIDC, OAuth2, mTLS, IRSA), the PCI DSS scope
-boundary, and secret and key management. The single most consequential design decision on this
-page is the one drawn as a hard line in Diagram B: **PAN never enters the platform**, which is what
-keeps eight of the nine deployables out of the cardholder data environment and the assessment at
-SAQ-A/A-EP rather than SAQ-D. Everything else here is defence in depth around identity — tenant
-identity comes only from the token, workload identity comes only from SPIFFE and IRSA, and no
-credential material is ever held in application memory longer than a call.
+Trust zones, the four authentication mechanisms that cross them (`jwt`/`jwks`, `mtls`, `apikey`,
+plus gateway signatures inbound), the PCI DSS scope boundary, the secrets provider, and key
+management. The single most consequential design decision on this page is the one drawn as a hard
+line in Diagram B: **PAN never enters the platform**, which is what keeps eight of the nine
+deployables out of the cardholder data environment and the assessment at SAQ-A/A-EP rather than
+SAQ-D. Everything else here is defence in depth around identity — tenant identity comes only from
+the token, workload identity comes only from SPIFFE and IRSA, and no credential material is ever
+held in application memory longer than a call. Diagram C is where each control actually sits in
+the request chain.
 
 ## Diagram A — Trust zones and identity flows
 
@@ -38,8 +40,11 @@ flowchart TB
     RDS["Redis - in-transit encryption"]
   end
 
-  subgraph Z4["Zone 4 - secrets and keys"]
-    SM["Secrets Manager"]
+  subgraph Z4["Zone 4 - secrets and keys, behind one ports.SecretsProvider"]
+    PROV["secrets.New picks by environment - file in sandbox, AWS in production, and never file in production"]
+    SMF["File backend - local stack, tests and the gateway simulator"]
+    SMA["AWS backend - Secrets Manager over a hand-rolled SigV4, zero SDK dependencies"]
+    STS["STS AssumeRoleWithWebIdentity - the IRSA credential exchange"]
     KMS["KMS CMK per environment, per tenant on the siloed tier"]
   end
 
@@ -50,20 +55,25 @@ flowchart TB
 
   CLIENT -->|"OAuth2 client credentials or authorization code"| OIDC
   OIDC -->|"access token with tenant claim and scopes"| CLIENT
-  CLIENT -->|"Bearer token over TLS 1.3"| WAF --> PAPI
-  PAPI -.->|"JWKS verification, cached, background refresh, 2-key window"| OIDC
-  GWCB -->|"HMAC or asymmetric signature, not a bearer token"| WHIG
+  CLIENT -->|"jwt - Bearer token over TLS 1.3"| WAF --> PAPI
+  CLIENT -->|"apikey - client id and secret, compared in constant time against a stored reference"| WAF
+  PAPI -.->|"jwks - cached, background refresh, 2-key rotation window"| OIDC
+  GWCB -->|"HMAC or asymmetric signature over the raw octets, not a bearer token"| WHIG
 
-  PAPI ==>|"mTLS, SPIFFE peer identity"| PORC
-  CPAPI ==>|"mTLS"| WFW
+  PAPI ==>|"mtls - SPIFFE URI SAN, not a CN and not a header"| PORC
+  CPAPI ==>|"mtls"| WFW
   PORC --> AUR
   PORC --> RDS
   PORC --> MSKB
   WFW --> AUR
 
-  PORC -.->|"IRSA assumed role, secret path scoped by prefix condition"| SM
-  SM -.->|"envelope decrypt"| KMS
-  WFW -.->|"IRSA"| SM
+  PORC -.->|"resolve a secret reference at the moment of use"| PROV
+  WFW -.->|"resolve a secret reference"| PROV
+  WHIG -.->|"current plus previous signing secret"| PROV
+  PROV --> SMF
+  PROV --> SMA
+  SMA -.->|"IRSA web identity token exchanged for session credentials"| STS
+  SMA -.->|"envelope decrypt, secret path scoped by an IAM prefix condition"| KMS
   PORC ==>|"outbound TLS 1.3 via the egress gateway, static source IPs"| GWX
   WFW ==>|"outbound TLS 1.3"| KYCX
 ```
@@ -90,6 +100,9 @@ flowchart TB
   end
 
   subgraph KEYS["Key and credential management"]
+    REF["Reference grammar - secret scheme, environment, tenant, merchant, gateway, purpose, version"]
+    MAT["Material - plaintext exists as a bare string only long enough to be wrapped, and never leaves the secrets package"]
+    ERRS["Every error is built from the reference, the HTTP status and the AWS error code - never from a response body, which for GetSecretValue IS the secret"]
     KROT["KMS annual automatic rotation"]
     GROT["Gateway API credentials rotated within 90 days, automated workflow with dual-run overlap"]
     JROT["JWT signing keys rotated every 30 days, 2-key JWKS window"]
@@ -106,10 +119,33 @@ flowchart TB
   API -.->|"token reference only, tenant capability"| VAULT
   SECT --> ENV --> KMS2["KMS CMK"]
   KMS2 --> KROT
+  REF --> MAT --> ERRS
+  MAT --> SECT
   SECT --> GROT
   SECT --> JROT
   IRSA --> SECT
   KMS2 --> SHRED
+```
+
+## Diagram C — Where each control sits in the request chain
+
+The security stages of `middleware.New`, in the order they actually run. Their placement relative
+to one another is the design; see [06 — Data plane](06-data-plane.md) for the full fifteen.
+
+```mermaid
+flowchart LR
+  BL["bodylimit - buffer the raw octets under the ceiling, then the L1 PAN scan"]
+  CT["contenttype"]
+  CO["cors - the preflight answer must precede authentication, a browser preflight carries no credentials by design"]
+  SH["securityheaders - set on rejected responses too, which is why it is above authentication and not in the handler"]
+  AN["authn - jwt via jwks, mtls SPIFFE peer identity, or apikey; a nil authenticator rejects everything"]
+  TN["tenant - from the verified principal only, plus the merchant scope guard on any route with a merchantId"]
+  AZ["authz - permission derived from the method and route template, so a route with no table entry is DENIED"]
+  RL["ratelimit - per tenant and per merchant, which is why it is below tenant resolution"]
+  CC["concurrency - adaptive limit plus shedding by priority class"]
+  ID["idempotency - innermost, so a request any earlier stage rejected never consumes a key"]
+
+  BL --> CT --> CO --> SH --> AN --> TN --> AZ --> RL --> CC --> ID
 ```
 
 ## Legend and notes
@@ -129,6 +165,34 @@ flowchart TB
 - **IRSA gives one IAM role per deployable, with secret paths scoped by a prefix condition**
   (`/{env}/{tenant}/{merchant}/{gateway}`). `payment-orchestrator` cannot read
   `workflow-worker`'s KYC vendor credentials even though both run in the same cluster (§17.2).
+- **Four authentication mechanisms, not one.** `jwt` (bearer, OAuth2/OIDC) and `jwks` (cached key
+  resolution with a background refresh and a two-key rotation window) at the public edge; `mtls`
+  for service-to-service, keyed on the certificate's SPIFFE **URI SAN** rather than its CN,
+  because a CN is a string an operator typed while a URI SAN is a statement the cluster CA stands
+  behind and is bound to the private key that just completed the handshake; and `apikey` for
+  machine clients, whose secret is compared in constant time against material resolved from the
+  secrets provider by reference. The composition root picks which a binary uses; the middleware
+  takes an `Authenticator` interface and knows about none of them.
+- **The secrets provider is one port with two implementations, and the choice is made in one
+  place.** `secrets.New` resolves `auto` to `file` in sandbox and `aws` in production; it will
+  never resolve `auto` to the file backend in production, and an explicit `file` still has to get
+  past `NewFileProvider`'s own refusal. Nine binaries need a provider, and a backend selected
+  correctly in eight composition roots and wrongly in the ninth is a credential outage in the
+  deployable nobody exercises locally.
+- **The AWS backend is written directly against `net/http`, with SigV4 implemented in-package.**
+  Four Secrets Manager calls and one STS call do not justify the official SDK's transitive module
+  set running inside the process that holds gateway credentials; SigV4 is a two-hundred-line HMAC
+  construction with published test vectors, and asserting against those buys the same assurance
+  at a dependency count of zero. The trade is stated plainly: retry classification, endpoint
+  resolution and the credential chain are now ours to own.
+- **Plaintext credential material never leaves the secrets package.** It exists as a bare string
+  only long enough to be moved into a `Material`, and every error returned from that package is
+  built from the reference, the HTTP status and the AWS error code — never from a response body,
+  which for `GetSecretValue` *is* the secret.
+- **A secret the ingress cannot read is `502 DEPENDENCY_FAILURE`, not `401`.** Refusing the
+  webhook is correct either way, but the two page different people, and conflating an
+  infrastructure failure with an authentication failure sends the wrong team to the wrong
+  dashboard during an outage.
 - **Three independent controls stop credential and PAN leakage into logs**, and they are
   structural rather than procedural: an allowlist-based structured logger (unregistered fields are
   simply not serialized), a linter ban on `%+v` / `%#v` over request types, and a `Secret[T]`

@@ -26,13 +26,16 @@ flowchart TB
         GS["stripe"]
         GA["adyen"]
         GP["paypal"]
+        GX["simulator<br/>non-production"]
+        GH["httpx · registry · spi<br/>shared client, factory set, port"]
     end
 
     subgraph Stores
-        PG[("Aurora PostgreSQL<br/>regional writer · RLS<br/>payments · attempts · idempotency<br/>outbox · ledger")]
+        PG[("Aurora PostgreSQL<br/>regional writer · RLS<br/>payments · attempts · refunds · idempotency<br/>inbound_webhooks raw bodies · outbox · ledger")]
         RD[("Redis cluster<br/>config snapshot · velocity counters<br/>idempotency mirror · token buckets")]
         KF[["Kafka<br/>pp.payments.payment.v1 · 48 parts"]]
-        S3[("S3<br/>raw webhook bodies · settlement files<br/>certification reports")]
+        SEC[("Secrets provider<br/>AWS Secrets Manager in production<br/>file backed in sandbox")]
+        S3[("S3<br/>settlement files · certification reports")]
     end
 
     subgraph Async
@@ -49,17 +52,19 @@ flowchart TB
     ORC --> VAL
     ORC --> RSK
     ORC --> RTE
-    ORC --> GS & GA & GP
+    ORC --> GH
+    GH --> GS & GA & GP & GX
     ORC --> PG
     ORC --> RD
+    ORC -.->|resolve credentials by reference| SEC
     API --> PG
     API --> RD
     WHI --> PG
-    WHI --> S3
+    WHI -.->|current + previous signing secret| SEC
     PG --> REL --> KF --> CON
     CON --> PG
     REC --> PG
-    REC --> GS & GA & GP
+    REC --> GH
     CTL -.->|configuration.published.v1<br/>merchant.suspended.v1| KF
     KF -.->|cache invalidation ≤ 30 s| RD
     GS & GA & GP -.->|health samples| RTE
@@ -219,16 +224,28 @@ Capability descriptors are versioned artifacts loaded at process start and refre
 
 Applied in this order; each removal is recorded with a reason on the plan. A hard filter is never traded off against score — no weight can resurrect a filtered candidate.
 
+This table is the order `routing.hardFilter` applies, and the reason codes are
+`routing.AllRejectionReasons` verbatim. The order determines *which* reason is recorded when a
+candidate fails several, and the choice is deliberate: the most fundamental reason wins, because
+"this gateway is not certified for you" is actionable and permanent while "its circuit is open" is
+noise about a gateway that was never eligible.
+
 | # | Filter | Removes when | Reason code |
 |---|---|---|---|
-| 1 | **Compliance / sanctions** | Issuer or customer country is on the platform or tenant mandatory-block list | `COMPLIANCE_BLOCKED` |
-| 2 | **Data residency** | The gateway processes or stores in a region outside the tenant's residency policy (§17.3) | `RESIDENCY_VIOLATION` |
-| 3 | **Merchant configuration** | Gateway not referenced by the merchant's routing policy for this predicate; or excluded by an explicit merchant pin | `NOT_IN_MERCHANT_POLICY` |
-| 4 | **Certification** | Connection is not `CERTIFIED` for this `(method, currency)` (§11.4) | `NOT_CERTIFIED` |
-| 5 | **Circuit state** | `(gateway, operation)` health is `UNHEALTHY` (circuit `OPEN`) per §10 | `CIRCUIT_OPEN` |
-| 6 | **Capability of the specific operation** | Descriptor lacks partial capture / 3DS / MIT / the exemption the payment needs | `CAPABILITY_MISSING` |
-| 7 | **Amount bounds** | Amount outside the gateway's min/max for this method+currency | `AMOUNT_OUT_OF_RANGE` |
-| 8 | **Already-attempted** (failover only) | The gateway already has an attempt on this payment whose outcome was not "safe to reuse" | `ALREADY_ATTEMPTED` |
+| 1 | **Pin short-circuit** | Strategy is `PINNED` and this is not the pin. Short-circuits everything below — we may not have refreshed a non-pinned gateway's descriptor in weeks, so no further detail about it is meaningful | `PINNED_ELSEWHERE` |
+| 2 | **Tenant entitlement** | The tenant's gateway allowlist does not include this gateway | `TENANT_NOT_ENTITLED` |
+| 3 | **Data residency** | The gateway processes or stores in a region outside the tenant's residency policy (§17.3) | `RESIDENCY_VIOLATION` |
+| 4 | **Merchant configuration** | The merchant has no configured connection to this gateway at all | `MERCHANT_NOT_CONFIGURED` |
+| 5 | **Certification** | No `CERTIFIED` connection for this `(method, currency)` (§11.4) | `NOT_CERTIFIED` |
+| 6 | **Circuit state** | The breaker is `OPEN` for this `(gateway, operation)` per §10 | `CIRCUIT_OPEN` |
+| 7 | **Connection health** | Connection health does not permit live traffic | `UNHEALTHY` |
+| 8 | **Currency** | The gateway does not settle this currency on this connection | `CURRENCY_UNSUPPORTED` |
+| 9 | **Payment method** | The gateway does not offer this method on this connection | `METHOD_UNSUPPORTED` |
+| 10 | **Payer country** | The gateway is not licensed for the payer's country | `COUNTRY_UNSUPPORTED` |
+| 11 | **Operation capability** | The descriptor lacks the capability this operation requires | `CAPABILITY_MISMATCH` |
+| 12 | **3DS** | The payment requires SCA and this gateway cannot perform it for this corridor. *Only consulted when the payment actually needs authentication* — rejecting unconditionally would shrink the candidate set for the ~90 % of traffic that is exempt | `THREE_DS_UNSUPPORTED` |
+| 13 | **Amount bounds** | Amount outside the gateway's floor/ceiling for this method+currency. A zero ceiling means "no ceiling", an explicit sentinel rather than a large number | `AMOUNT_OUT_OF_BOUNDS` |
+| 14 | **Anti-affinity** (failover only) | This payment already has an attempt on this gateway. Applied last because it is the only filter that depends on the payment's history rather than on the gateway; a first attempt never trips it | `ALREADY_ATTEMPTED` |
 
 Empty after filtering → `503 NO_ELIGIBLE_GATEWAY` with `Retry-After`, and the plan is still persisted with every removal reason. That persisted empty plan is how "why did this merchant get a 503 at 14:02" gets answered.
 
@@ -241,19 +258,20 @@ flowchart TD
     D --> F["Candidate generation<br/>CERTIFIED connections whose descriptor<br/>supports method × currency × country × operation"]
     E --> F
 
-    F --> G["Hard filters, in order<br/>1 compliance · 2 residency · 3 merchant policy<br/>4 certification · 5 circuit state · 6 capability<br/>7 amount bounds · 8 already-attempted"]
+    F --> F0["Sort by gateway ID first<br/>byte-identical plans regardless of map order"]
+    F0 --> G["Hard filters, in order<br/>1 pin · 2 tenant entitlement · 3 residency · 4 merchant config<br/>5 certification · 6 circuit · 7 health · 8 currency · 9 method<br/>10 country · 11 capability · 12 3DS · 13 amount · 14 anti-affinity"]
     G --> H{"Any survivors?"}
     H -->|"no"| I["503 NO_ELIGIBLE_GATEWAY<br/>plan persisted with every exclusion reason<br/>FAIL CLOSED"]
-    H -->|"yes"| J["Score each survivor<br/>0.4·H + 0.3·S + 0.2·C + 0.1·L"]
+    H -->|"yes"| J["Score EVERY survivor<br/>0.4·H + 0.3·S + 0.2·C + 0.1·L<br/>even under a strategy that ignores the score"]
 
-    J --> J1["H health<br/>HEALTHY 1.0 · DEGRADED 0.4 · PROBING 0.15"]
-    J --> J2["S success<br/>Bayesian-smoothed, alpha=50<br/>banded to 0.85–0.98"]
-    J --> J3["C cost<br/>effective minor units for THIS amount<br/>min-max normalized"]
-    J --> J4["L latency<br/>1 − p95/3000 ms"]
-    J1 & J2 & J3 & J4 --> K["Rank descending"]
+    J --> J1["H health<br/>HEALTHY 1.0 · DEGRADED 0.4 · PROBING 0.15<br/>NaN clamps to 0"]
+    J --> J2["S success<br/>Bayesian-smoothed, alpha=50<br/>fixed band 0.85–0.98"]
+    J --> J3["C cost<br/>effective minor units for THIS amount<br/>min-max; equal costs all score 1.0, never NaN"]
+    J --> J4["L latency<br/>1 − p99/3000 ms, fixed ceiling"]
+    J1 & J2 & J3 & J4 --> K["Apply the strategy<br/>PRIORITY_WITH_FALLBACK · WEIGHTED_SCORE<br/>LEAST_COST · PINNED"]
 
     K --> L{"Top two within 0.02?"}
-    L -->|"yes"| M["Tie-break in order<br/>1 sticky affinity · 2 merchant primary<br/>3 lower cost · 4 hash(payment_id ‖ gateway_id)"]
+    L -->|"yes"| M["Tie-break in order<br/>1 merchant-declared primary<br/>2 higher score within tolerance<br/>3 deterministic gateway-ID ordering"]
     L -->|"no"| N["Top candidate wins"]
     M --> N
     N --> O["Persist routing_plan rpl_…<br/>weights · factor inputs · scores<br/>exclusions · config + descriptor versions"]
@@ -277,7 +295,7 @@ Weights come from `config.routing.weights` (§23), validated by `L4.ROUTING_WEIG
 | `H(g)` **health** | `HEALTHY → 1.0`, `DEGRADED → 0.4`, `PROBING → 0.15` (§10). `UNHEALTHY` cannot appear — hard filter 5. | Health dominates because a gateway that is failing costs 100 % of the transactions it touches, while a 40 bps cost difference costs 0.4 %. |
 | `S(g)` **success rate** | `ŝ = (successes + α·prior) / (n + α)` with `α = 50` and `prior` = the merchant's 30-day authorization baseline, over a 30-min EWMA window keyed by `(gateway, method, currency, issuer_country)`. Normalized against a **fixed band**: `S = clamp((ŝ − 0.85) / (0.98 − 0.85), 0, 1)`. | Bayesian smoothing stops a gateway with 6 samples and 6 successes from outranking one with 4 000 samples at 94 %. A fixed band, rather than min-max across candidates, keeps the score stable when candidates are close — min-max amplifies noise into flapping. |
 | `C(g)` **cost** | Effective cost in minor units for *this* amount: `bps·amount/10 000 + fixed + scheme surcharges`. Normalized `C = 1 − (c − c_min)/(c_max − c_min)`; if `c_max = c_min`, all get 1.0. | Computed per payment, not per gateway, because a 30 ¢ fixed fee dominates a $3 payment and is noise on a $300 one. |
-| `L(g)` **latency** | `L = 1 − clamp(p95_authorize_ms / 3000, 0, 1)` over a 5-minute sliding window per `(gateway, operation)`. | Latency is weighted lowest deliberately: within the 8 s budget, a slower gateway that approves is worth more than a fast one that declines. |
+| `L(g)` **latency** | `L = 1 − clamp(p99_authorize_ms / 3000, 0, 1)` over a sliding window per `(gateway, operation)`. A **fixed** ceiling, not min-max: with min-max, a set whose fastest gateway is 600 ms and slowest 640 ms would score them 1.0 and 0.0 and hand 0.1 of score to a difference nobody can perceive. A fixed ceiling also cannot divide by zero. | Latency is weighted lowest deliberately: within the 8 s budget, a slower gateway that approves is worth more than a fast one that declines. |
 
 **Worked example.** Merchant `mrc_01JB…`, card sale, **USD 84.50** (`amount = 8450`), customer country US. Three certified connections survive the hard filters. Weights are the defaults. Merchant 30-day baseline `prior = 0.930`.
 
@@ -315,72 +333,69 @@ The instructive part is Adyen: it has the best success rate *and* the lowest cos
 
 ### 4.4 Tie-breaking
 
-Two candidates whose scores differ by ≤ **0.02** are treated as tied (below that, the difference is inside the noise of a 30-minute success-rate window). Ties break deterministically, in order:
+Two candidates whose scores differ by ≤ **`ScoreTieTolerance` = 0.02** are treated as tied (below that, the difference is inside the noise of a 30-minute success-rate window). `breakTopTie` breaks the *top* tie deterministically, in order, and records which rung decided on `plan.TieBreak`:
 
-1. **Sticky affinity** — if this payment already has an attempt on one of the tied gateways with a *safe-to-reuse* outcome, prefer it (§4.5).
-2. **Merchant-declared primary** — `routing.primary`, or the `then.primary` of the matched rule.
-3. **Lower effective cost** for this amount.
-4. **Deterministic spread** — `argmin over tied of  H(payment_id ‖ gateway_id) mod 2^32`. A hash rather than a random choice, so the same payment routes the same way on a retry, on a replay from the outbox, and in a test.
+1. **Merchant-declared primary** — `routing.primary`, or the `then.primary` of the matched rule. If neither of the tied pair is the primary, this rung does not fire.
+2. **Higher score within the tolerance** — recorded as `"higher score within the tie tolerance"`. Reachable only via the exact-tie ladder in `orderByStrategy`, which has already applied the cost comparison; recording it here keeps the audit trail honest about which rung actually decided.
+3. **Deterministic gateway-ID ordering** — on an exact score tie, the lower gateway ID wins. Deterministic rather than random, so the same payment routes the same way on a replay from the outbox and in a test.
 
-Deterministic tie-breaking is not cosmetic: it is what makes "re-run this payment's routing decision from the persisted subject and get the same plan" true, which is what makes disputes about routing decidable.
+There is no sticky-affinity rung and no hash-based spread: affinity is expressed by the anti-affinity *filter* and by the forced-routing rules in §4.5, not by a tie-break bonus. Deterministic tie-breaking is not cosmetic — it is what makes "re-run this payment's routing decision from the persisted subject and get the same plan" true, which is what makes disputes about routing decidable.
 
 ### 4.5 Sticky affinity for retries
 
 | Situation | Affinity |
 |---|---|
-| Transport retry within one attempt (≤ 2, §24) | **Forced** — same gateway, same `gateway_idempotency_key`. This is what makes the retry safe: the gateway dedupes. |
-| Capture / refund / void of an existing payment | **Forced** — the operation must go to the gateway that holds the authorization. Routing is not consulted; the connection is read from the successful attempt. |
+| Transport retry within one attempt | **Forced** by construction — the attempt's `gateway_idempotency_key` is derived from `attempt_id ‖ operation`, so any retry of the same attempt against the same gateway dedupes there. `Config.SameGatewayRetries` declares a budget of 2 for this, but **no code reads it**: `Orchestrator.Dispatch` has no same-gateway retry loop, and neither does the `httpx` client. Today a transport error advances straight to the next candidate. |
+| Capture / refund / void of an existing payment | **Forced** — the operation goes to the gateway that holds the authorization, read from `pay.SuccessfulAttempt()`. Routing is not consulted, and `followUp` opens a *new* attempt row on that same gateway rather than reusing the authorization's. |
 | 3DS resume after `REQUIRES_ACTION` | **Forced** — the challenge session belongs to that gateway. |
-| Failover after a soft decline or `ERROR` | **Anti-affinity** — the already-attempted gateway is removed by hard filter 8, unless the failure class is `RATE_LIMITED` and `Retry-After` has elapsed. |
+| Failover after a soft decline or `ERROR` | **Anti-affinity** — the already-attempted gateway is removed by hard filter 14 (`ALREADY_ATTEMPTED`), and `Plan.Next(tried)` excludes it independently. There is no rate-limit exemption to this in the code. |
 | Retry of a customer-initiated payment the client resubmits with a **new** idempotency key | **Weak affinity for 30 min** — a `+0.05` score bonus to the gateway that most recently approved for this `(merchant, card fingerprint)`. Improves issuer approval rates by keeping the transaction on a familiar acquirer BIN, and is a bonus rather than a rule so it can never override health. |
 
 ### 4.6 Failover decision table
 
-Failover means: mark the current attempt terminal, create a **new** attempt with a **new** gateway idempotency key (§14.4, A10), and dispatch to the next candidate. Budget: at most **2** failovers per payment and a total wall-clock budget of 12 s, after which the payment fails or stays `PROCESSING` per its classification.
+Failover means: mark the current attempt terminal, create a **new** attempt with a **new** gateway idempotency key and its own `connectionId` (§14.4, A10), and dispatch to the next candidate. The budget is `Config.MaxAttempts`, default **2** — that is two *attempts* in total, not two failovers on top of the first. Two is not arbitrary: the timeout cascade proves that three gateway calls cannot fit inside the orchestrator's budget, so a third would be started only to be abandoned.
+
+The decision is not made by the loop. `Orchestrator.settle` classifies the outcome onto the attempt, and the loop then asks `att.PermitsFailover()`, which folds three rules together and takes the most restrictive answer: a scheme-level "do not retry" advice vetoes everything; `ERROR` permits; `DECLINED` defers to the normalized reason; `SUCCESS`, `PENDING`, `DISPATCHED` and `TIMEOUT_UNKNOWN` all forbid.
 
 | Attempt outcome | Detail | Fail over? | Why |
 |---|---|---|---|
-| `ERROR` — connection refused, DNS, TLS handshake | Provably nothing sent | **Yes, immediately** | Zero risk of a double authorization. |
-| `ERROR` — gateway 5xx | Gateway acknowledged receipt but errored | **Yes**, after ≤ 2 same-gateway retries | 5xx after a completed request is ambiguous in principle, but every major gateway's idempotency layer makes the same-gateway retry safe, and a persistent 5xx means the gateway is out. |
-| `ERROR` — gateway 429 | Rate limited | **Yes**, after honouring `Retry-After` if it fits the budget | Not a payment failure. |
-| `ERROR` — gateway 4xx malformed request | Our defect | **No** | Another gateway would reject the same malformed intent differently, masking the bug. `FAILED` + page. |
-| `ERROR` — gateway 401/403 | Credentials broken | **Yes** | The merchant's connection is broken, not the payment. Also marks the connection for an L3 probe. |
-| `DECLINED` — **soft**: issuer unavailable (`91`), do-not-honour with a soft sub-code, processing error (`96`), reenter (`19`) | Issuer transient | **Yes** | §9.1: this is the retryable decline set. Typically recovers 8–14 % of these. |
-| `DECLINED` — **soft**: insufficient funds (`51`) | Issuer definitive about *this* moment | **No** | Another acquirer asks the same issuer and gets the same answer. Retrying wastes an interchange fee and looks like abuse. |
-| `DECLINED` — **hard**: stolen/lost card (`43`/`41`), pickup (`04`), invalid account (`14`), restricted card (`62`), no such issuer (`15`) | Issuer definitive | **Never** | §9.1: this is card-testing behaviour and gets the platform de-registered by the schemes. |
-| `DECLINED` — reason unmapped | Unknown | **Never** | `L6.DECLINE_REASON_IS_MAPPABLE` degrades unmapped reasons to hard. Fail closed. |
-| `DECLINED` — 3DS authentication failed | Customer failed the challenge | **No** | The customer, not the gateway, is the failure. |
-| `TIMEOUT_UNKNOWN` | Money may have moved | **Never** (§A7, §12.3) | The single most common cause of double charges in real platforms. Reconcile instead. |
-| L6 contract violation on echo/correlation | Money may have moved | **Never** | Same reasoning; open a reconciliation exception. |
-| `SUCCESS` with `REQUIRES_ACTION` | Awaiting the customer | **No** | Not a failure. |
-| Circuit `OPEN` before dispatch | Never attempted | **Yes** — it is not a failover, the candidate was filtered at stage 12 | — |
+| Pre-dispatch refusal — circuit `OPEN`, bulkhead full, credential unresolvable | No attempt row is created at all | **Yes** | The gateway was provably not touched, so trying the next candidate is free of double-charge risk. This is not a failover in the FSM sense — nothing happened to fail over *from*. |
+| `ERROR` — connection refused, DNS, TLS handshake, 5xx, 429, 401/403 | The gateway provably did not act | **Yes** | Zero risk of a double authorization. The orchestrator does not distinguish these classes: any non-timeout transport error is `att.Fail(code, …)` and `OutcomeError` permits failover unconditionally. |
+| `DECLINED` — **soft**: `ISSUER_UNAVAILABLE`, `TRY_AGAIN_LATER`, `PROCESSING_ERROR`, `DO_NOT_HONOR` | Issuer transient | **Yes** | `softDeclines` is exactly these four. Typically recovers 8–14 % of them. |
+| `DECLINED` — anything else: `INSUFFICIENT_FUNDS`, `CARD_EXPIRED`, `INCORRECT_NUMBER`, `INCORRECT_CVC`, `STOLEN_CARD`, `LOST_CARD`, `FRAUDULENT`, `RESTRICTED_CARD`, `INVALID_ACCOUNT`, `CURRENCY_NOT_SUPPORTED`, `AUTHENTICATION_REQUIRED`, `BLOCKED_BY_GATEWAY_RISK` | Issuer definitive, or the instruction itself is bad | **Never** | Card-testing behaviour, and it gets the platform de-registered by the schemes. |
+| `DECLINED` — reason unmapped | Unknown | **Never** | An adapter maps an untaught reason code to `UNKNOWN`, and the soft set is an **allowlist**, so `UNKNOWN` is hard. Defaulting an unknown reason to "retry" is how a platform ends up card testing on an attacker's behalf. |
+| `DECLINED` with scheme `NetworkAdviceNoRetry` | The network said do not retry | **Never** | The advice vetoes even a soft reason. |
+| `TIMEOUT_UNKNOWN` | Money may have moved | **Never** (A7, §12.3) | The single most common cause of double charges in real platforms. `RequireReconciliation` is opened and the loop stops. |
+| L6 contract violation | We cannot trust the response, so we do not know | **Never** | Recorded as `TIMEOUT_UNKNOWN`, not `ERROR`. It also counts against the gateway's breaker, because it is the gateway's fault. |
+| Adapter returned neither a result nor an error | Broken adapter | **Never** | Treated as unknown. The contract suite asserts this cannot happen; if it ever does, the safe reading is "we do not know". |
+| `REQUIRES_ACTION` or `PENDING` | Not finished | **No** | The attempt stays open and the payment parks. Recording either as a success would let a later failover be blocked by an attempt that never authorized anything. |
+| `SUCCESS` | Authorized or captured | **No** | Invariant I3 forbids a second successful attempt anyway. |
 
 ```mermaid
 flowchart TD
-    S["Attempt outcome"] --> C1{"Could the gateway<br/>have acted?"}
-    C1 -->|"Unknown<br/>TIMEOUT_UNKNOWN or L6 echo failure"| R1["Payment stays PROCESSING<br/>attempt TIMEOUT_UNKNOWN<br/>enqueue reconciliation<br/>NEVER fail over"]
-    C1 -->|"No — pre-send failure"| C2{"Budget left?<br/>≤2 failovers, ≤12 s"}
-    C1 -->|"Yes — gateway responded"| C3{"Response class"}
+    S["Attempt outcome, classified by settle in this order"] --> C1{"Could the gateway<br/>have acted?"}
+    C1 -->|"Unknown — timeout, L6 violation,<br/>nil result, unrecognised status"| R1["attempt TIMEOUT_UNKNOWN<br/>RequireReconciliation<br/>payment stays PROCESSING<br/>NEVER fail over"]
+    C1 -->|"No — transport error"| E1["attempt ERROR<br/>breaker counts it<br/>PermitsFailover = true"]
+    C1 -->|"Yes — gateway responded"| C3{"Business outcome"}
 
-    C3 -->|"5xx / 429 / 401 / 403"| C2
-    C3 -->|"4xx malformed"| R2["FAILED + page<br/>our defect, no failover"]
-    C3 -->|"DECLINED"| C4{"Decline class<br/>from L6 mapping"}
-    C3 -->|"SUCCESS"| R3["Apply L7 transition"]
+    C3 -->|"DECLINED"| C4{"Normalized reason<br/>in the soft set of four?<br/>and no network no-retry advice"}
+    C3 -->|"REQUIRES_ACTION / PENDING"| R3["Attempt stays open<br/>payment parks<br/>terminal for this loop"]
+    C3 -->|"AUTHORIZED / CAPTURED"| R8["Apply L7 transition<br/>breaker records success"]
 
-    C4 -->|"HARD or unmapped"| R4["FAILED<br/>terminal, no failover<br/>GATEWAY_DECLINED"]
-    C4 -->|"SOFT and in the<br/>retryable-decline set"| C2
-    C4 -->|"SOFT but issuer-definitive<br/>e.g. insufficient funds"| R4
+    C4 -->|"No"| R4["MarkFailed<br/>terminal, GATEWAY_DECLINED<br/>breaker deliberately NOT charged"]
+    C4 -->|"Yes"| C2
+    E1 --> C2{"i &lt; MaxAttempts<br/>and failover enabled?"}
 
-    C2 -->|"No"| R5["FAILED<br/>ROUTING_BUDGET_EXHAUSTED"]
-    C2 -->|"Yes"| C5{"Next candidate<br/>after anti-affinity filter?"}
-    C5 -->|"None"| R6["FAILED<br/>NO_ELIGIBLE_GATEWAY"]
-    C5 -->|"Yes"| R7["Close old attempt<br/>NEW attempt row<br/>NEW gateway idempotency key<br/>dispatch"]
+    C2 -->|"No"| R5["Reload from the writer<br/>in flight → 202-shaped answer<br/>otherwise → the last error"]
+    C2 -->|"Yes"| C5{"Plan.Next excluding<br/>gateways already tried"}
+    C5 -->|"None"| R5
+    C5 -->|"Yes"| R7["NEW attempt row<br/>NEW connectionId<br/>NEW gateway idempotency key<br/>T1 commit, then dispatch"]
     R7 --> S
 ```
 
 ### 4.7 Auditability of routing decisions
 
-Every plan is persisted before dispatch as a `routing_plans` row (`rpl_…`), referenced by the payment and by each attempt:
+Every plan is designed to be persisted before dispatch as a `routing_plans` row (`rpl_…`), referenced by the payment and by each attempt:
 
 ```json
 {
@@ -393,7 +408,7 @@ Every plan is persisted before dispatch as a `routing_plans` row (`rpl_…`), re
   "considered": [
     { "gateway": "stripe", "score": 0.8018, "rank": 1,
       "factors": { "H": 1.0, "S": 0.707, "C": 0.552, "L": 0.793 },
-      "inputs": { "healthState": "HEALTHY", "smoothedSuccess": 0.9419, "costMinor": 275, "p95Ms": 620 } },
+      "inputs": { "healthState": "HEALTHY", "smoothedSuccess": 0.9419, "costMinor": 275, "p99Ms": 620 } },
     { "gateway": "adyen", "score": 0.6511, "rank": 2, "…": "…" },
     { "gateway": "paypal", "score": 0.6347, "rank": 3, "…": "…" }
   ],
@@ -406,7 +421,9 @@ Every plan is persisted before dispatch as a `routing_plans` row (`rpl_…`), re
 }
 ```
 
-Four properties make this an audit artifact rather than a log line:
+**Implementation status.** `routing.Plan` carries all of the above in memory — selections with ranks and reasons, the full rejection list with reason and detail, the weights, the matched rule and the tie-break rung — and `payments.routing_plan_id` is persisted on every payment. What is **not** yet wired is the write of the `routing_plans` row itself: `routing.Decide` builds the plan, `Orchestrator.Dispatch` walks it, and only the identifier survives the request. The table, its `rpl_` check constraint and its shape are in migration `0007`; the repository method is the missing piece. Until it exists, a routing decision is auditable to the level of "plan `rpl_…` was used", not to the level of what that plan contained.
+
+Four properties are what will make this an audit artifact rather than a log line:
 
 - **Inputs, not just outputs.** The raw factor inputs are stored, so the score is recomputable. `platformctl routing explain rpl_…` re-runs the scoring function offline and asserts it reproduces the stored score — a mismatch is a defect in either the code or the record.
 - **Versions are pinned.** `configVersion`, `policyChecksum` and per-gateway `descriptorVersions` mean a decision made six months ago can be replayed against exactly the artifacts that produced it.

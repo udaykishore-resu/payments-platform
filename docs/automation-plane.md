@@ -335,7 +335,7 @@ flowchart TB
     COMP -->|"reverse order over completed steps"| EXT
     COMP --> PG
     REAP -->|"reclaim expired leases<br/>increment crash_count"| PG
-    STUCK -->|"pp_workflow_stuck_instances"| PG
+    STUCK -->|"pp_workflow_instances by state"| PG
     OPS -->|"Signal · Cancel · Requeue · Describe"| PG
     PG -.->|"NOTIFY workflow_runnable"| POLL
 ```
@@ -883,9 +883,9 @@ sequenceDiagram
     SM-->>WW: scheduled
     WW->>GW: compensate 5: Deprovision(externalRef) × 2 — reverse completion order
     GW-->>WW: ok
-    Note over WW: Steps 4, 3, 2, 1 have no compensation:<br/>4 created nothing; 3 is PAST THE PIVOT —<br/>the KYC record is retained by law.
+    Note over WW: Step 4 declares no compensation — it created nothing.<br/>Steps 3 and 2 DO declare cancel-kyc-case, but both are<br/>SKIPPED: the retained pivot has passed and the vendor's<br/>decision is a record kept by law. Step 1 is pure.
     WW->>PG: instance → FAILED · DLQ entry with the full error chain
-    WW->>PG: outbox: onboarding.failed.v1 · audit record
+    WW->>PG: audit record (the outbox carries no onboarding-specific<br/>event type — the merchant FSM transition is what is published)
     end
 
     OPS->>CP: GET .../onboarding
@@ -1095,6 +1095,8 @@ Baseline metrics (§22.2), plus the engine-specific series required to operate i
 | `pp_workflow_activity_concurrency` | gauge | `workflow` | Used slots of 32; distinguishes "worker-bound" from "vendor-bound" |
 | `pp_dlq_untriaged_age_seconds` | gauge | `queue` | Oldest untriaged entry |
 
+**What is registered today.** `internal/infrastructure/telemetry` registers three of these: `pp_workflow_instances{workflow,state}` — which subsumes what the table calls `pp_workflow_stuck_instances`, since a stuck instance is one sitting in `PARKED`, `RETRY_BACKOFF` or `POISONED` — `pp_workflow_step_duration_seconds`, and `pp_dlq_depth`. The rest of the table is the contract this plane is built toward; a metric that is not in the registry is not queryable, and the cardinality lint that guards the registry only guards what is in it.
+
 **Tracing.** One trace spans the whole instance: a root span per instance, a child span per step attempt, and a grandchild per external call. The trace context is checkpointed into `workflow_instances.context` so a resumed step **continues the original trace** rather than starting a new one — a 7-day onboarding is a single, navigable trace. Span attributes carry `instance_id`, `step`, `attempt`, `lease_epoch`, `failure_class`.
 
 **Logs.** Every workflow log line carries `instance_id`, `business_key`, `step`, `attempt`, `lease_epoch`, `worker_id`, plus the mandatory context of §22.1. `lease_epoch` in logs is what makes a split-brain investigation tractable — two workers logging the same instance with different epochs is immediately visible.
@@ -1134,7 +1136,7 @@ The threshold is derived from the step's own observed behaviour, so a 30-minute 
 | Poison instance just below threshold | `crash_count = 2` | Watch; it quarantines on the next acquisition |
 | Database contention on the lease query | Lease acquisitions slow, `contended` outcome rising | Index/vacuum investigation |
 
-**Alerting.** `pp_workflow_stuck_instances > 0` for 10 min → ticket. `> 5` or any instance stuck > 1 h → page. The alert carries the instance IDs and `lease_owner` values so the responder starts from a pod name rather than a query.
+**Alerting.** `sum(pp_workflow_instances{state=~"PARKED|RETRY_BACKOFF|POISONED"}) > 0` for 10 min → ticket. `> 5` or any instance stuck > 1 h → page. The alert carries the instance IDs and `lease_owner` values so the responder starts from a pod name rather than a query.
 
 ### 5.3 Operator surface
 
@@ -1228,6 +1230,7 @@ stateDiagram-v2
     [*] --> PENDING : instance reaches this step
 
     PENDING --> RUNNING : attempt n starts<br/>timeout_at = now + StepDef.Timeout<br/>lease_epoch stamped
+    PENDING --> SKIPPED : unreachable — a retained pivot has passed,<br/>so this step and everything before it<br/>is no longer compensatable
 
     RUNNING --> SUCCEEDED : activity returned, output checkpointed<br/>+ merchant FSM transition + outbox — ONE TXN
     RUNNING --> FAILED : activity returned an error
@@ -1246,14 +1249,16 @@ stateDiagram-v2
     AMBIGUOUS --> DLQ : lookup inconclusive → ClassManual
 
     FAILED --> DLQ : ClassTerminalTechnical,<br/>or ClassTransient with attempts exhausted
-    FAILED --> COMPENSATING_PEERS : ClassTerminalBusiness<br/>(instance aborts; peers compensate)
+    FAILED --> DLQ : ClassTerminalBusiness — the instance aborts<br/>and its completed PEER steps compensate.<br/>This step itself has no further state.
 
-    SUCCEEDED --> COMPENSATING : instance aborted; reverse-order walk
+    SUCCEEDED --> COMPENSATING : instance aborted, reverse-order walk
     COMPENSATING --> COMPENSATED : compensation succeeded (idempotent on K‖"compensate")
     COMPENSATING --> COMPENSATION_FAILED : retries exhausted<br/><b>orphaned external state — PAGE</b>
 
     SUCCEEDED --> [*]
+    SKIPPED --> [*]
     COMPENSATED --> [*]
+    COMPENSATION_FAILED --> [*]
     DLQ --> PENDING : operator Requeue (optional input patch)
 
     note right of RETRY_SCHEDULED

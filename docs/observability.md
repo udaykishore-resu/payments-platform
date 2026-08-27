@@ -22,7 +22,7 @@
 
 Three rules that are load-bearing and are tested, not merely stated:
 
-1. **Every metric has a question.** A metric that no dashboard panel, alert or runbook query reads is deleted. The registry lint (`scripts/metrics-lint.sh`) fails the build on an orphan metric.
+1. **Every metric has a question.** A metric that no dashboard panel, alert or runbook query reads is deleted. The registry lint — `scripts/check-metrics-cardinality.sh`, which §3.3 and older drafts also call `scripts/metrics-lint.sh` — fails the build on a forbidden label. Orphan-metric detection is **not** implemented. <!-- doc-refs: allow-missing -->
 2. **Cardinality is a budget, not a preference.** `merchant_id` and `payment_id` reach Prometheus only as *exemplar* attachments — never as labels (§22.3). The path from a metric to one merchant is the exemplar, not a label filter.
 3. **Audit is not logging.** Audit records are a domain aggregate (BC-9) written in the same transaction as the state change, hash-chained, and retained 7 years. Losing a log line is an inconvenience; losing an audit record is a compliance incident. They never share a pipeline.
 
@@ -91,7 +91,7 @@ Enforcement, so this is not a convention that decays:
 |---|---|
 | No package-level logger | `slog.Default()` and `log.*` are banned by `depguard` in `.golangci.yml`; the only exported entry point is `LoggerFrom(ctx)` |
 | No log without a span on the request path | Middleware starts the server span at pipeline stage 2 (§12) *before* any handler code runs; a handler cannot observe a context without one |
-| No `%+v` on request types | `forbidigo` rule + `scripts/check-logging.sh`, per §17.2 |
+| No `%+v` on request types | The `forbidigo` rules in `.golangci.yml`, per §17.2. There is no separate `scripts/check-logging.sh` | <!-- doc-refs: allow-missing -->
 | Domain layer cannot log | `internal/domain/**` may import stdlib only (§4). Domain code returns errors; the application layer logs them once, at the boundary |
 
 Log-once discipline: an error is logged exactly once, at the outermost boundary that handles it, with the full wrapped chain (`errors.Join` / `%w`). Intermediate layers wrap and return. This is what keeps a single failed payment from producing forty log lines.
@@ -403,7 +403,7 @@ Measured steady-state at 5 000 TPS: ~55 GB/day logs after sampling, ~40 GB/day t
 
 ### 3.1 The registry (§22.2, expanded)
 
-Every metric below is declared once in `internal/infrastructure/telemetry/registry.go`. Declaring a `pp_*` metric anywhere else fails `scripts/metrics-lint.sh`.
+Every metric below is declared once in `internal/infrastructure/telemetry/metrics.go`, which is the single place a `pp_*` metric may be declared. `scripts/check-metrics-cardinality.sh` enforces the label rules of §22.3 across the tree.
 
 | Metric | Type | Unit | Labels | Question it answers | Exemplars |
 |---|---|---|---|---|---|
@@ -813,7 +813,7 @@ Sampling is **consistent by `trace_id`**, not random per line: if a trace is kep
 |---|---|---|
 | No PAN, CVV or track data can be logged | It never enters the process — the L1 PAN detector rejects the request at the edge (§17.2), and the offending value is not included in the rejection log line | `TestPANDetectorNeverLogsTheValue` |
 | No secret can be logged | `Secret[T]`'s `String()`, `MarshalJSON()`, `Format()` all return `[REDACTED]`; credentials are only ever this type (§17.2) | `TestSecretNeverSerializes` — fuzzes every formatting verb |
-| No struct dumps | `%+v`/`%#v` on request types forbidden by lint; allowlist serializer has no reflective path | `scripts/check-logging.sh` |
+| No struct dumps | `%+v`/`%#v` on request types forbidden by lint; the allowlist serializer has no reflective path | `.golangci.yml` (`forbidigo`); `internal/platform/secret/secret_test.go` |
 | No auth material | The HTTP middleware log record has a fixed header allowlist (`content-type`, `user-agent` truncated to 64 B, `idempotency-key` **hashed**); `Authorization`, `Cookie`, `X-Api-Key` are not in it | `TestAccessLogHeaderAllowlist` |
 | No bank account numbers | Domain type `BankAccountNumber` logs as `****1234` (last 4 only) | `TestBankAccountRedaction` |
 | No PII of merchant principals | Names, emails, addresses, DOBs and KYC document contents are `Secret[T]` or referenced by ID; a KYC artifact is logged as its S3 key and SHA-256, never its content | `TestKYCArtifactLoggingIsReferenceOnly` |
@@ -1064,20 +1064,21 @@ sequenceDiagram
     C->>E: POST /v1/payments<br/>traceparent: 00-4bf92f…-a1b2…-01
     Note over E,API: span root: "POST /v1/payments"<br/>trace_id = 4bf92f…
     E->>API: forwarded, traceparent preserved
-    API->>API: pipeline.authn / tenant_resolve / authz / ratelimit (spans 3-6)
-    API->>API: pipeline.l1_validation (PAN detector)
-    API->>RDS: pipeline.idempotency_claim<br/>INSERT … ON CONFLICT DO NOTHING
+    API->>API: middleware.bodylimit — buffer the raw octets, then the L1 PAN scan<br/>the tracing span is opened above authn so "the 401s are slow" is answerable
+    API->>API: middleware.authn / tenant / authz / ratelimit / concurrency
+    API->>RDS: middleware.idempotency — claim, innermost<br/>INSERT … ON CONFLICT DO NOTHING
     RDS-->>API: claimed (IN_FLIGHT)
+    API->>API: handler.l1_schema (below the claim)
     API->>API: pipeline.merchant_context (cached, age 4 s)
     API->>API: pipeline.l5_validation + risk + routing
     Note right of API: span attrs: pp.routing.plan=rpl_…<br/>candidates=[adyen,stripe]
     API->>ORC: gRPC Dispatch(pay_…)  — otelgrpc injects traceparent
-    ORC->>RDS: INSERT payment_attempts (att_…, gateway_idempotency_key)
-    Note right of ORC: attempt row written BEFORE the gateway call
-    ORC->>GW: gateway.adyen.authorize (8 s hard timeout)<br/>traceparent injected, tracestate+baggage stripped
+    ORC->>RDS: T1 — INSERT payment_attempts (att_…, gateway_idempotency_key,<br/>gateway_connection_id) + payment → PROCESSING, COMMIT
+    Note right of ORC: attempt row, with the connection it will be<br/>dispatched over, written BEFORE the gateway call
+    ORC->>GW: T2 — gateway.adyen.authorize (8 s hard timeout)<br/>traceparent injected, tracestate+baggage stripped
     GW-->>ORC: 200 AUTHORISED
-    ORC->>ORC: pipeline.l6_response_validation (amount/currency echo)
-    ORC->>RDS: TX: state → AUTHORIZED + outbox_events(traceparent=4bf92f…)
+    ORC->>ORC: settle — unknown, then transport error, then contract, then outcome<br/>pipeline.l6_response_validation (amount/currency echo)
+    ORC->>RDS: T3 — state → AUTHORIZED + audit_records + outbox_events(traceparent=4bf92f…)
     ORC-->>API: attempt SUCCESS
     API-->>C: 201 Created, traceId 4bf92f…
     Note over API,C: exemplar attached to<br/>pp_http_request_duration_seconds
@@ -1087,10 +1088,10 @@ sequenceDiagram
     Note over OBX,K: new span, LINKED to the ORC span<br/>(not a child — different time domain)
     K->>CON: consume
     CON->>RDS: dedup INSERT + ledger append (one TX)
-    Note right of CON: span links to producer;<br/>logs carry trace_id 4bf92f…
+    Note right of CON: span links to producer.<br/>Logs carry trace_id 4bf92f…
 
     GW->>WH: POST /v1/webhooks/adyen (minutes later)
-    WH->>RDS: persist inbound_webhook (≤ 50 ms budget)
+    WH->>RDS: verify over the raw octets, claim the dedup key and persist<br/>the body in one transaction (≤ 50 ms budget), then 202
     Note over WH: separate trace, correlated by<br/>gateway_ref → payment_id → trace_id
 ```
 

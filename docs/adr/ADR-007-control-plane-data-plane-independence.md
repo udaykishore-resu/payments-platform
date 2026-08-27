@@ -121,7 +121,7 @@ Precisely:
 
 ## Validation
 
-- **Chaos test:** `tests/chaos/control_plane_loss_test.go` scales `control-plane-api` to zero for
+- **Chaos test: not implemented.** The intended test scales `control-plane-api` to zero for
   20 minutes under sustained payment load. Assertions: payment success rate stays within SLO for
   the first 15 minutes; the fail-closed cliff for *new* merchants engages at 15 minutes exactly;
   existing merchants continue throughout.

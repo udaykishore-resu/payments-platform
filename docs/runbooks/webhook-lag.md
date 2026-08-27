@@ -193,6 +193,6 @@ pp_reconciliation_exceptions{severity="critical"} == 0
 - If a signing-secret rotation caused rejections, the dual-run overlap was too short or was not
   used. That is a process fix in `docs/security.md` §5.3's territory.
 - Confirm the chaos coverage:
-  `tests/chaos/webhook_duplicate_test.go::TestDuplicateWebhookIsIdempotent` (same webhook 100×
+  `tests/integration/webhook_test.go::TestDuplicateWebhookIsDroppedByTheUniqueIndex` (the same webhook
   concurrently, exactly one state transition) and
-  `tests/chaos/webhook_replay_test.go::TestReplayedWebhookRejected`.
+  `tests/chaos/clock_skew_test.go::TestClockSkewBeyondTheWebhookToleranceFailsClosed`.

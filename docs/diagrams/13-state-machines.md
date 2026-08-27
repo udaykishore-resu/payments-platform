@@ -2,13 +2,15 @@
 
 ## What this shows and why it matters
 
-Two finite state machines govern everything the platform does with a merchant and with money, plus
-a third small one for the unit of gateway interaction. They are drawn here exactly as the
-transition tables in §8, §9 and §9.1 define them: anything not drawn is rejected with
-`409 INVALID_STATE_TRANSITION`. These diagrams are normative, not illustrative — the FSMs live in
-`internal/domain` (stdlib only, no I/O), are enforced inside aggregate methods at L7, and are
-mirrored by database constraints so that a bug above the domain layer still cannot move money
-twice.
+Four of the platform's fourteen finite state machines: the two that govern everything it does with
+a merchant and with money, and the two smaller ones for the unit of gateway interaction and for a
+refund. They are drawn here exactly as [`docs/state-machines.md`](../state-machines.md) — which is
+generated from `internal/domain` and is authoritative — defines them; anything not drawn is
+rejected with `409 INVALID_STATE_TRANSITION`. These diagrams are normative, not illustrative: the
+FSMs live in `internal/domain` (stdlib only, no I/O), are enforced inside aggregate methods at L7,
+and the merchant and payment machines are mirrored by database `CHECK` constraints so that a bug
+above the domain layer still cannot move money twice. The remaining ten are indexed at the foot of
+this page.
 
 ## Diagram A — Merchant lifecycle
 
@@ -133,28 +135,84 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> PENDING
     PENDING --> DISPATCHED: attempt row committed, then the gateway is called
+    PENDING --> ERROR: pre-dispatch failure after the row exists
     DISPATCHED --> SUCCESS: authorized or captured
     DISPATCHED --> DECLINED: the gateway definitively said no
     DISPATCHED --> ERROR: our side or transport failed before the gateway could act
-    DISPATCHED --> TIMEOUT_UNKNOWN: no response inside the 8 s hard timeout
+    DISPATCHED --> TIMEOUT_UNKNOWN: no response inside the deadline, or a response L6 refused
+
+    TIMEOUT_UNKNOWN --> SUCCESS: reconciler or webhook proves the gateway acted
+    TIMEOUT_UNKNOWN --> DECLINED: reconciler or webhook proves it declined
+    TIMEOUT_UNKNOWN --> ERROR: reconciler proves the gateway never saw it
 
     SUCCESS --> [*]
     DECLINED --> [*]
     ERROR --> [*]
-    TIMEOUT_UNKNOWN --> [*]
 
     note right of TIMEOUT_UNKNOWN
-        Never retried automatically.
-        Enters the reconciliation queue.
-        The payment stays PROCESSING.
+        Not terminal, and not retried.
+        It is the one non-terminal
+        outcome: only the reconciler,
+        a webhook or a settlement report
+        may resolve it.
     end note
 
     note right of DECLINED
         Failover only if the normalized reason
-        is in the retryable decline set.
-        A hard decline is terminal.
+        is in the four-member soft set.
+        Everything else, UNKNOWN included,
+        is hard and terminal.
     end note
 ```
+
+## Diagram D — Refund
+
+The refund is its own entity with its own lifecycle, distinct from the payment states it drives.
+`SUBMITTED` means the gateway accepted the instruction; `SUCCEEDED` means it confirmed the money
+moved, which normally arrives later as a webhook.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: AddRefund, committed BEFORE the gateway call
+    PENDING --> SUBMITTED: gateway accepted, RefundAccepted or Pending
+    PENDING --> CANCELED: withdrawn before it reached the gateway
+    PENDING --> FAILED: the gateway refused it outright
+    SUBMITTED --> SUCCEEDED: ConfirmRefund, usually from a webhook
+    SUBMITTED --> FAILED: the gateway reported it did not go through
+    SUCCEEDED --> [*]
+    FAILED --> [*]
+    CANCELED --> [*]
+
+    note right of PENDING
+        A refund whose outcome is unknown
+        STAYS here and enters reconciliation.
+        It is never retried: a duplicate
+        refund is a duplicate payout.
+    end note
+```
+
+## The other machines
+
+Eleven further machines are specified with full transition tables in
+[`docs/state-machines.md`](../state-machines.md), which is generated from `internal/domain` and
+`internal/workflows/engine` and is authoritative for all fourteen:
+
+| Machine | States | Drawn in |
+|---|---|---|
+| Merchant lifecycle | 21 | Diagram A above |
+| Payment | 14 | Diagram B above |
+| Payment attempt | 6 | Diagram C above |
+| Refund | 5 | Diagram D above |
+| Gateway health | 4 | [09 — Gateway routing](09-gateway-routing.md), Diagram B |
+| Gateway connection | 9 | `docs/state-machines.md` §7 |
+| Workflow instance | 11 | [04 — Automation plane](04-automation-plane.md), Diagram C |
+| Workflow step | 13 | [04 — Automation plane](04-automation-plane.md), Diagram D |
+| Tenant | 3 | `docs/state-machines.md` §10 |
+| API client | 3 | `docs/state-machines.md` §11 |
+| Onboarding case | 4 | `docs/state-machines.md` §12 |
+| Idempotency record | 3 | [08 — Payment flow](08-payment-flow.md), the stage 8 `alt` |
+| Inbound webhook | 7 | [11 — Webhook flow](11-webhook-flow.md), Diagrams A and B |
+| Reconciliation exception | 4 | `docs/state-machines.md` §15 |
 
 ## Legend and notes
 
@@ -172,6 +230,16 @@ stateDiagram-v2
   an ambiguous gateway outcome would have to be recorded as either success or failure, and both
   are potentially false. `PENDING` also carries genuinely asynchronous methods such as bank debits
   and vouchers (§9, §9.1).
+- **`TIMEOUT_UNKNOWN` is not a terminal outcome.** It is the one attempt state with outgoing edges
+  after the gateway call has finished, and they are only ever traversed by evidence: a webhook, a
+  reconciler lookup against the gateway using the deterministic key, or a settlement report. No
+  timer traverses them. An L6 contract violation also lands here rather than in `ERROR` — a
+  response we cannot trust leaves the outcome unknown, not failed.
+- **The refund's states are not the payment's.** `PENDING/SUBMITTED/SUCCEEDED/FAILED/CANCELED`
+  belongs to the `Refund` entity; `PARTIALLY_REFUNDED` and `REFUNDED` are payment states driven by
+  it. Conflating them is why the refund row must be committed before the gateway call: a refund
+  that is `SUBMITTED` on a payment still showing `CAPTURED` is the correct intermediate state, and
+  it has to be representable.
 - **Guards on `→ ACTIVE`**: at least one `GatewayConnection` in `CERTIFIED`, a non-empty validated
   `MerchantConfiguration`, a completed compliance attestation, and no open critical reconciliation
   exception. `→ TERMINATED` requires zero payments in a non-terminal state (§8).

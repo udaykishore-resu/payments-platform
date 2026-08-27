@@ -73,11 +73,11 @@ Strictly, "compensating control" is a PCI term for an alternative to a stated re
 
 | Control | Type | Implementation | Evidence |
 |---|---|---|---|
-| PAN detector at L1 | Scope-preserving | 13–19 digits, Luhn-valid, separators stripped, IIN-checked, recursive over every string field, depth-capped 32 → `400 SENSITIVE_DATA_IN_REQUEST`, value never logged, security event raised (baseline §17.2) | `internal/validation/rules/l1/pan_detector.go`; `tests/integration/pan_detector_test.go` with the full scheme test-card corpus and a Luhn-valid-but-not-a-PAN negative corpus |
+| PAN detector at L1 | Scope-preserving | 13–19 digits, Luhn-valid, separators stripped, IIN-checked, recursive over every string field, depth-capped 32 → `400 SENSITIVE_DATA_IN_REQUEST`, value never logged, security event raised (baseline §17.2) | rule `L1.NO_PAN_IN_ANY_STRING_FIELD` in `internal/validation/rules/l1api/rules.go`, over the detector in `internal/platform/secret/pan.go`; `internal/platform/secret/pan_test.go` carries the scheme corpus and the Luhn-valid-but-not-a-PAN negative corpus, and `internal/infrastructure/postgres/invariants_integration_test.go::TestPANTripwireRejectsABareCardNumber` is the database tripwire behind it |
 | PAN detector at the edge | Defence in depth | WAF rule W2 (`security.md` §2.1) blocks before the request reaches an application buffer | AWS WAF rule export + a synthetic probe asserting a `403` |
 | PAN detector in the log pipeline | Detective | Firehose transform re-scans every record; a hit quarantines and pages | Quarantine bucket (empty is the evidence); alert configuration |
 | Allowlist log serializer | Scope-preserving | Only registered fields serialize; no reflective logging path exists (`security.md` §6.2) | `logx` field registry; the `no-reflective-log` and `no-verbose-format-on-requests` lint passes, CI-blocking |
-| `Secret[T]` | Scope-preserving | `String`/`Format`/`MarshalJSON`/`LogValue` all return `[REDACTED]` | `pkg/secret/`; `TestSecretNeverRendersPlaintext` covering every format verb |
+| `Secret[T]` | Scope-preserving | `String`/`Format`/`MarshalJSON`/`LogValue` all return `[REDACTED]` | `internal/platform/secret/`; `TestSecretRedactsEveryFormattingVerb` covers every format verb, with `::TestSecretRedactsThroughJSON`, `::TestSecretRedactsThroughSlog` and `::TestUnmarshalJSONDoesNotEchoTheValue` beside it |
 | No card-data storage schema | Scope-preserving | No column anywhere in `migrations/` is capable of holding a PAN. `TestNoSchemaColumnAcceptsPAN` asserts that every `text`/`varchar` column on a payment table is either length-constrained below 13 or on a reviewed allowlist | Migration review + the test |
 | Encryption in transit | Requirement 4 | TLS 1.3 external and internal; mTLS between services; `verify-full` to Postgres; SASL_SSL to Kafka | TLS policy export, `TestPlaintextConnectionRefused` |
 | Encryption at rest | Requirement 3 | KMS CMK per environment/tenant across Aurora, S3, EBS, MSK, ElastiCache; field-level envelope encryption with AAD binding | Terraform state, KMS key policies, `TestEnvelopeAADBinding` |
@@ -85,7 +85,7 @@ Strictly, "compensating control" is a PCI term for an alternative to a stated re
 | Access control | Requirement 7 | Default-deny RBAC+ABAC; `secrets:*` denied to every principal; no human holds `payments:write` (`security.md` §4.2) | Role matrix, `authz` property tests, IAM policies, SCP |
 | Authentication | Requirement 8 | MFA mandatory for humans, WebAuthn for admin; 15-min tokens; no shared accounts; no static AWS keys | IdP configuration export, IAM credential report |
 | Logging and monitoring | Requirement 10 | Hash-chained audit records (§6), 400 d hot / 7 y WORM, time-synchronized, tamper-evident | Audit chain verification report, S3 Object Lock configuration |
-| Vulnerability management | Requirement 6, 11 | `govulncheck` + Trivy gates, daily rescan of production digests, dated exceptions | CI run history, `.security/exceptions.yaml` |
+| Vulnerability management | Requirement 6, 11 | `govulncheck` + Trivy gates, daily rescan of production digests, dated exceptions | CI run history, and a time-boxed exception file. **Neither exists**: there is no `.security/exceptions.yaml` and no CI step that expires an exception <!-- doc-refs: allow-missing --> |
 | Segmentation | Requirement 1 | No CDE to segment; the vault, if enabled, is a separate account with a single allowlisted path. Segmentation testing applies to the vault boundary | VPC/SG/NetworkPolicy exports, penetration test report |
 | Secure development | Requirement 6 | Spec-driven (baseline §27), architecture check, SAST, mandatory review, signed commits | CI configuration, PR history |
 
@@ -117,7 +117,7 @@ Offered as a separately contracted, separately assessed capability. Not part of 
 | Interface | `Tokenize(pan) → token`, `Detokenize(token) → pan` (restricted to a gateway-dispatch role), `Delete(token)`. Detokenization requires a per-call authorization with a payment context and is rate-limited and alerted per token | Detokenization is the crown-jewel operation; it is metered like one |
 | What the platform receives | Only the surrogate token. The orchestrator holds no detokenization right except through the vault's own dispatch path | The platform stays out of scope; the vault is the CDE |
 | Assessment | Its own SAQ-D / ROC, its own ASV scans, its own segmentation penetration test, its own change control | |
-| Effect on this platform | The vault adapter in `internal/adapters/vault` becomes a **connected-to** system: in scope for Requirements 1, 2, 6, 7, 8, 10, 11 but not 3 and 4 as a storer of account data | Stated explicitly so the scope delta is a decision, not a surprise |
+| Effect on this platform | A vault adapter — which this repository does not have; there is no `internal/adapters/vault` — would become a **connected-to** system <!-- doc-refs: allow-missing -->: in scope for Requirements 1, 2, 6, 7, 8, 10, 11 but not 3 and 4 as a storer of account data | Stated explicitly so the scope delta is a decision, not a surprise |
 | Default | **Not enabled.** A tenant asking for vaulting is asked first whether network tokens or gateway-side card-on-file meet the need — they usually do | The cheapest CDE is the one that does not exist |
 
 ### 1.6 Evidence a QSA would ask for
@@ -277,13 +277,15 @@ flowchart TD
     O -- "No, timeout 15 min" --> P[EXPIRED]
     J --> Q{Issuer response}
     Q -- Approved --> R[AUTHORIZED<br/>liability shift = false]
-    Q -- "Soft decline 65 / 1A" --> S[New attempt, force challenge]
-    Q -- Hard decline --> T[FAILED, no failover]
-    S --> K
+    Q -- "Issuer says SCA required<br/>normalized AUTHENTICATION_REQUIRED" --> T
+    Q -- "Soft decline: ISSUER_UNAVAILABLE, TRY_AGAIN_LATER,<br/>PROCESSING_ERROR, DO_NOT_HONOR" --> S[New attempt on the next<br/>routing-plan candidate]
+    Q -- "Anything else, UNKNOWN included" --> T[FAILED, no failover]
     M --> R
 ```
 
-Notes binding this to the baseline: `REQUIRES_ACTION` is a first-class payment state (§9) with an `EXPIRED` exit at 15 minutes; a soft decline produces a **new attempt** (§9.1, §14.4 — new attempt, new gateway idempotency key); a hard decline is terminal with **no failover** (§24), because retrying a hard decline elsewhere is card-testing behaviour; and the certification suite (§11.4) asserts that the 3DS challenge flow reaches `REQUIRES_ACTION` and completes before a merchant can go live.
+Notes binding this to the baseline. `REQUIRES_ACTION` is a first-class payment state (§9) with an `EXPIRED` exit at 15 minutes. A soft decline produces a **new attempt** on the next routing-plan candidate (§9.1, §14.4 — new attempt, new gateway idempotency key, new `connectionId`), and the soft set is an allowlist of exactly four normalized reasons. A hard decline is terminal with **no failover** (§24), because retrying a hard decline elsewhere is card-testing behaviour. The certification suite (§11.4) asserts that the 3DS challenge flow reaches `REQUIRES_ACTION` and completes before a merchant can go live.
+
+One case the diagram is deliberately explicit about: an issuer that declines with "SCA required" after an exemption was claimed normalizes to `AUTHENTICATION_REQUIRED`, which is **not** in the soft set, so the orchestrator does not automatically re-attempt with a forced challenge. The payment fails and the merchant re-submits with `require3DS`. Automatic step-up on a decline would mean the platform deciding, on the issuer's behalf, that a second authorization attempt is warranted — and the four-member allowlist exists precisely so that no such decision is taken implicitly.
 
 ---
 
@@ -305,7 +307,7 @@ Notes binding this to the baseline: `REQUIRES_ACTION` is a first-class payment s
 | Merchant onboarding and account administration | Art. 6(1)(b) contract | Between the tenant and their merchant; we process on instruction |
 | KYC/KYB identity verification, sanctions and PEP screening | Art. 6(1)(c) legal obligation (AMLD) | Not consent — a consent that cannot be withdrawn without terminating the relationship is not freely given, and the obligation exists regardless |
 | Payment execution | Art. 6(1)(b) contract, Art. 6(1)(c) for the regulatory elements | |
-| Fraud prevention and risk scoring | Art. 6(1)(f) legitimate interests, with a documented LIA; PSD2 Recital 49 recognizes fraud prevention explicitly | The LIA is version-controlled at `docs/compliance/lia-fraud-prevention.md` |
+| Fraud prevention and risk scoring | Art. 6(1)(f) legitimate interests, with a documented LIA; PSD2 Recital 49 recognizes fraud prevention explicitly | The LIA would be version-controlled alongside this document; **it has not been written** <!-- doc-refs: allow-missing --> |
 | Transaction and audit records retention | Art. 6(1)(c) legal obligation | This is the basis that survives an erasure request (§4.5) |
 | Security monitoring and logging | Art. 6(1)(f) legitimate interests | Bounded by 30 d hot / 400 d archive and the no-PII-in-logs rule |
 | Service improvement analytics | Art. 6(1)(f), on aggregated/pseudonymized data only | Never on identifiable payment data |
@@ -419,7 +421,7 @@ The mechanism is in `multi-tenancy.md` §6.1. The legal reasoning:
 | DSAR records | 3 years from response | Aurora + S3 | Batch delete | Demonstrating Art. 5(2) accountability |
 | Deleted-tenant erasure certificates | **Permanent** | S3 Object Lock | Never | Proof that erasure occurred |
 
-The schedule is machine-readable at `config/retention-policy.yaml`; the retention job reads it rather than hard-coding durations, and `TestRetentionPolicyMatchesDocumentation` fails the build if this table and the YAML diverge.
+The schedule is code: `internal/domain/compliance/retention.go` carries one `RetentionClass` per row of the table above, and `internal/domain/compliance/retention_test.go::TestEveryDataClassIsClassified` fails the build if a class is added without one. The design intends a machine-readable `config/retention-policy.yaml` as the join key between this table, the retention job and the storage-tier lifecycle configuration — `retention.go` says so in its own comment — but **that file does not exist**, so today the Go table is the only copy. <!-- doc-refs: allow-missing -->
 
 ---
 

@@ -2,10 +2,14 @@
 
 ## What this shows and why it matters
 
-How the nine deployables land on EKS: namespaces per plane, dedicated node groups so control-plane
-and data-plane workloads cannot contend for the same CPU, separate ingress paths for the money
-path and the admin path, a service mesh providing mTLS and per-gateway outlier detection, and
-autoscaling driven by the signal that actually predicts each workload's load. The organising
+How the deployables land on EKS: five namespaces, one per plane — `pp-control-plane`,
+`pp-data-plane`, `pp-automation`, `pp-platform`, `pp-observability`, each carrying a `pp.plane`
+label — dedicated node groups so control-plane and data-plane workloads cannot contend for the
+same CPU, separate ingress paths for the money path and the admin path, a service mesh providing
+mTLS and per-gateway outlier detection, and autoscaling driven by the signal that actually
+predicts each workload's load. Seven of the nine binaries are long-running workloads;
+`platformctl` runs as a Job with its own service account, and `gateway-simulator` is denied
+admission in production by policy. The organising
 principle is the same one that produced nine binaries rather than one: **blast radius**. A
 `workflow-worker` retry storm during a KYC vendor outage must not be able to evict a
 `payment-orchestrator` pod.
@@ -14,8 +18,8 @@ principle is the same one that produced nine binaries rather than one: **blast r
 
 ```mermaid
 flowchart TB
-  subgraph NGDATA["Node group data - compute optimized, taint plane equals data"]
-    subgraph NSDATA["Namespace pp-data"]
+  subgraph NGDATA["Node group data - compute optimized, taint pp.plane equals data"]
+    subgraph NSDATA["Namespace pp-data-plane, label pp.plane data"]
       PAPI["payment-api - HPA on RPS and concurrency, PDB minAvailable 75 percent"]
       PORC["payment-orchestrator - HPA on in-flight gateway calls"]
       WHIG["webhook-ingress - HPA on RPS, aggressive scale-up, slow scale-down"]
@@ -24,42 +28,43 @@ flowchart TB
     end
   end
 
-  subgraph NGCTL["Node group control - general purpose, taint plane equals control"]
-    subgraph NSCTL["Namespace pp-control"]
+  subgraph NGCTL["Node group control - general purpose, taint pp.plane equals control"]
+    subgraph NSCTL["Namespace pp-control-plane, label pp.plane control"]
       CPAPI["control-plane-api - HPA on RPS"]
     end
-    subgraph NSAUT["Namespace pp-automation"]
+    subgraph NSAUT["Namespace pp-automation, label pp.plane automation"]
       WFW["workflow-worker - KEDA on due-work backlog"]
     end
   end
 
-  subgraph NGSYS["Node group system - platform addons"]
-    subgraph NSOBS["Namespace pp-observability"]
-      OTELG["OTel collector gateway - StatefulSet"]
-      PROM["Prometheus agent, remote write"]
+  subgraph NGSYS["Node group general - platform addons"]
+    subgraph NSOBS["Namespace pp-observability, label pp.plane observability"]
+      OTELG["OTel collector gateway - Deployment, nodeSelector pp.plane general"]
+      OTELA["OTel collector agent - DaemonSet, tolerates every pp.plane taint so it can observe the tainted data nodes"]
     end
-    subgraph NSSYS["Namespace pp-system"]
+    subgraph NSSYS["Namespace pp-platform, label pp.plane platform"]
       MESH["Service mesh control plane"]
       ESO["External Secrets Operator"]
       CERTM["cert-manager"]
+      MIG["platformctl-migrator Job - migrate, seed, config, certify, dr-drill, outbox, workflow, verify-audit-chain"]
     end
   end
 
-  subgraph NGSILO["Node group silo tier - per-tenant isolation, optional"]
-    NSSILO["Namespace pp-tenant-silo"]
-  end
-
-  JOBS["Jobs and CronJobs - platformctl migrations, DR drills, reconciliation runs"]
   SPREAD["topologySpreadConstraints plus pod anti-affinity across 3 AZs"]
-  TAINT["Taint plane equals data is NoSchedule - control and automation carry no matching toleration"]
-  SILOP["Dedicated node group and namespace, contractual isolation only"]
+  TAINT["Taint pp.plane equals data is NoSchedule - control and automation carry no matching toleration"]
+  NETP["NetworkPolicy - pp-control-plane and pp-data-plane deny all ingress and egress, then allow by name"]
+  PRIO["PriorityClasses - pp-money-path 1000000, pp-platform-critical 900000, pp-control-plane 500000, pp-observability 400000, pp-batch 100000, pp-preview 0"]
+  DENY["Kyverno in the prod overlay denies any Pod whose image is gateway-simulator"]
 
   PAPI -.-> SPREAD
   PORC -.-> SPREAD
   CPAPI -.-> TAINT
   WFW -.-> TAINT
-  JOBS --> CPAPI
-  NSSILO -.-> SILOP
+  MIG --> CPAPI
+  NSDATA -.-> NETP
+  NSCTL -.-> NETP
+  PAPI -.-> PRIO
+  NSDATA -.-> DENY
 ```
 
 ## Diagram B — Ingress, mesh and autoscaling signals
@@ -70,8 +75,8 @@ flowchart LR
   WAF["AWS WAF - managed rules, per-IP rate limit, bot control"]
   ALBP["ALB - money path host, payments and webhooks"]
   ALBC["ALB - admin host, control plane"]
-  IGWP["Ingress pp-data"]
-  IGWC["Ingress pp-control"]
+  IGWP["Ingress pp-data-plane"]
+  IGWC["Ingress pp-control-plane"]
 
   subgraph MESHZ["Service mesh - mTLS everywhere, SPIFFE identity per workload"]
     SPAPI["payment-api sidecar"]
@@ -105,10 +110,19 @@ flowchart LR
 
 ## Legend and notes
 
-- **Taints and tolerations, not just node selectors.** Data-plane nodes carry `plane=data:NoSchedule`
-  so nothing without an explicit toleration can land there — including a mis-labelled batch job.
-  Control-plane and automation workloads have no matching toleration and therefore *cannot*
-  contend with the money path (§5).
+- **Taints and tolerations, not just node selectors.** Data-plane nodes carry
+  `pp.plane=data:NoSchedule` so nothing without an explicit toleration can land there — including
+  a mis-labelled batch job. Control-plane and automation workloads have no matching toleration and
+  therefore *cannot* contend with the money path (§5). The one deliberate exception is the OTel
+  agent DaemonSet, which tolerates `pp.plane` with `operator: Exists` because a node it cannot
+  land on is a node whose every pod is unobserved.
+- **`gateway-simulator` never reaches production, and it is not one control that says so.** The
+  root `Dockerfile` refuses to build the image without an explicit `ALLOW_TEST_SERVICE=1` build
+  arg, the prod overlay carries a Kyverno policy denying any Pod whose image matches it, and the
+  binary is `//go:build`-guarded out of production images (§5).
+- **Every namespace denies all traffic before allowing any.** `pp-control-plane` and
+  `pp-data-plane` each start from a deny-all `NetworkPolicy` in both directions and then name what
+  may talk to what, so a new workload is unreachable until somebody writes down who may reach it.
 - **`payment-orchestrator` scales on in-flight gateway calls, not CPU.** It spends most of its time
   waiting on a network call, so CPU is a lagging and misleading signal; a gateway slowing from
   200 ms to 3 s multiplies concurrency without moving CPU at all.
@@ -129,9 +143,10 @@ flowchart LR
 - **PodDisruptionBudgets plus multi-AZ topology spread plus 3× capacity headroom** is what makes
   the §18 targets survivable: node loss is a brief latency blip, AZ loss is invisible if headroom
   holds (§24).
-- **The silo node group is optional and contractual.** Tenants on the siloed tier get a dedicated
-  namespace and node group; the pooled tier shares pods with per-tenant concurrency bulkheads and
-  rate limits (§16.1).
+- **The silo tier is a contractual posture, not a manifest that exists today.** Baseline §16.1
+  provides for a dedicated namespace and node group per siloed tenant; `deployments/k8s` ships the
+  five pooled namespaces only, and the pooled tier is what the per-tenant concurrency bulkheads and
+  rate limits exist to isolate.
 
 ## Related
 

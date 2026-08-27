@@ -22,6 +22,8 @@
 #    13  check-secrets         credentials, keys, PANs
 #    14  check-licences        no copyleft
 #    15  check-runbook-links   every runbook_url resolves; every paging alert has one
+#    16  check-doc-references  every repo-relative path a document cites exists
+#    17  coverage              docs/testing.md §1.1 coverage floors and §1.2 critical paths
 #
 # WHY THIS ORDER
 #   Cheapest and most-likely-to-fail first. gofmt takes 200 ms and catches the most common
@@ -166,6 +168,19 @@ stage migrations           "numbering, pairing, RLS"          -- ./scripts/check
 stage secrets              "credentials, keys, PANs"          -- ./scripts/check-secrets.sh
 stage licences             "no copyleft in the graph"         -- ./scripts/check-licences.sh
 stage runbook-links        "alert runbook_url ↔ docs/runbooks" -- ./scripts/check-runbook-links.sh
+stage doc-references       "every path a document cites exists" -- ./scripts/check-doc-references.sh
+
+# Coverage runs last because it re-runs the -short suite to produce a profile. With --fast
+# only the critical-path registry is checked, which is instantaneous and is the half that
+# catches a renamed test.
+coverage_gate() {
+  if (( FAST )); then
+    ./scripts/coverage.sh --only-paths
+    return $?
+  fi
+  ./scripts/coverage.sh
+}
+stage coverage             "§1.1 coverage floors, §1.2 critical paths" -- coverage_gate
 
 # --- summary ---------------------------------------------------------------------------------
 echo

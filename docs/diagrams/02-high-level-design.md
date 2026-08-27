@@ -100,7 +100,7 @@ flowchart LR
     PGR["Aurora reader endpoint"]
     REDIS["ElastiCache Redis - idempotency mirror, rate limits, config cache"]
     S3["S3 - certification reports, KYC evidence, audit archive"]
-    SM["Secrets Manager plus KMS - gateway credentials"]
+    SM["Secrets provider - AWS Secrets Manager plus KMS in production, file backed in sandbox"]
   end
 
   subgraph BUS["Event backbone - MSK Kafka"]
@@ -129,8 +129,9 @@ flowchart LR
   PAPIRD["payment-api read path"] --> PGR
   PAPIRD --> REDIS
   WFW2 --> S3
-  WFW2 --> SM
-  PORC2 --> SM
+  WFW2 -->|"store credentials, keep only the reference"| SM
+  PORC2 -->|"resolve gateway credentials at the moment of use"| SM
+  WHIG2 -->|"current plus previous webhook signing secret"| SM
 
   PGW --> OBX
   OBX -->|"FOR UPDATE SKIP LOCKED"| RLY
@@ -170,7 +171,14 @@ flowchart LR
   accelerator and holds token buckets; a full Redis outage degrades latency and coarsens rate
   limits but cannot affect correctness, because Postgres holds the unique index (§14.3).
 - **`gateway-simulator` is `//go:build` guarded out of production images** and exists only as the
-  target of the adapter contract suite (§5).
+  target of the adapter contract suite (§5). It is also a registered adapter — `registry.BuiltIn`
+  returns `stripe`, `adyen`, `paypal` and `simulator`, and the simulator's factory is the one
+  handed a nil engine in a binary that has no use for it.
+- **All three secret-consuming binaries go through one `ports.SecretsProvider`.**
+  `payment-orchestrator` resolves gateway credentials at the moment of use, `workflow-worker`
+  writes them during onboarding and keeps only the reference, and `webhook-ingress` reads the
+  current *and* previous signing secret so a gateway's own rotation window does not become an
+  endpoint outage. `secrets.New` picks the backend once, by environment, for all nine binaries.
 - **The `TEL → control plane` feedback edge in Diagram A** is `gateway.health_changed.v1`: the
   observability plane's health windows drive routing and are recorded by the control plane. This
   is the only edge that runs "upstream" against the plane ordering, and it is intentional (§10).

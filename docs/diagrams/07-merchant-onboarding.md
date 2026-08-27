@@ -38,10 +38,11 @@ sequenceDiagram
     WF->>VP: step 1 validate-merchant, L2, 5 s budget
     VP-->>WF: pass
     WF->>OB: merchant.validated.v1, merchant to KYC_PENDING
-    WF->>KV: step 2 submit-kyc, vendor ref key, 5 retries exp
+    WF->>KV: step 2 submit-kyc, idempotent on the vendor case ref, 5 attempts exp 1 s to 60 s
     KV-->>WF: case accepted
-    WF->>WF: step 3 await-kyc-decision, signal wait up to 7 d
+    WF->>WF: step 3 await-kyc-decision, signal wait up to 7 d, lease released for the whole of it
     KV-->>WF: decision APPROVED via signal
+    Note over WF: PIVOT, retained - the decision is a regulated record kept 5 years, so steps 1 to 3 are no longer compensatable
     WF->>OB: merchant.kyc_approved.v1
     WF->>BV: step 4 validate-bank-account
     BV-->>WF: ownership confirmed
@@ -64,8 +65,15 @@ sequenceDiagram
     WF->>OB: merchant.certified.v1, connections to CERTIFIED
 
     WF->>CO: step 11 compliance-review, manual gate up to 5 d
-    CO-->>WF: signed approval, the signal itself is audited
+    alt Approved
+        CO-->>WF: signed approval, the signal itself is audited
+    else Rejected
+        CO-->>WF: rejection with a reason code
+        WF->>MR: merchant to COMPLIANCE_REJECTED - amendment A-01
+        Note over MR: onward to CONFIGURING for fixable configuration, KYC_PENDING for fixable evidence, or TERMINATED
+    end
     WF->>MR: step 12 activate, L7 guards the transition
+    Note over WF,MR: PIVOT, irreversible - real payments can now exist, so the declared compensation is suspend, which is forward recovery
     MR->>OB: merchant.activated.v1
     OB-->>CP: data plane cache warms, merchant is live
 ```
@@ -100,7 +108,7 @@ sequenceDiagram
         WF->>GA: compensate step 7, delete webhook registrations
         WF->>SM: compensate step 6, delete secret version
         WF->>GA: compensate step 5, de-provision gateway sub-accounts
-        WF->>WF: compensate steps 3 and 2, cancel KYC case
+        Note over WF: the unwind STOPS at the retained pivot - steps 3, 2 and 1 are SKIPPED, the KYC case is not cancelled because its decision has already landed
         WF->>MR: merchant to TERMINATED, requires zero non-terminal payments
     end
 
@@ -116,7 +124,17 @@ sequenceDiagram
 
 - **Steps 1, 4, 9, 10 and 11 have no compensation** and so do not appear in the unwind sequence.
   A validation, a lookup, a sandbox run and a human decision leave no external side effect to
-  undo (§11).
+  undo — and each of those is a *positive declaration* in `definition.go`, reviewed as such,
+  rather than an omission (§11).
+- **Step 4 has no compensation but is still `SideEffecting`.** A penny-drop verification creates
+  nothing to undo, but it does move money, so a duplicate submission would initiate a second
+  micro-deposit — which is exactly why the ambiguity rule applies to a timeout on it.
+- **Two pivots, two different kinds of irreversibility, and conflating them produces a wrong
+  design.** Step 3's is external and regulatory (`PivotRetained`): cancelling the vendor case
+  stops the process but cannot un-submit the data, so once the decision lands nothing before it is
+  compensatable and the unwind stops there. Step 12's is money-path (`PivotIrreversible`): once
+  the merchant is `ACTIVE`, payments exist with their own lifecycles, so its declared compensation
+  is `suspend-merchant` marked `CompensationForward` — forward recovery, not rollback.
 - **Compensation order is strictly reverse and only covers completed steps.** Step 8 rolls back
   before step 7 deletes webhooks, because a configuration that still points at a webhook we are
   about to delete is a worse intermediate state than the reverse.

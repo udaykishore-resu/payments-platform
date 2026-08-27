@@ -208,5 +208,5 @@ rate(pp_workflow_compensations_total[1h])
 - If the SLO breach was caused by a dependency, consider whether that step should be asynchronous
   with its own timeout rather than inline in the duration the SLO measures.
 - Confirm the chaos coverage:
-  `tests/chaos/workflow_crash_test.go::TestResumeFromCheckpointNoStepReplay` SIGKILLs a worker
+  `tests/chaos/crash_test.go::TestWorkerCrashMidWorkflowResumesWithoutRepeatingASideEffect` kills a worker
   mid-step and asserts the side effect occurred exactly once and compensation order is preserved.

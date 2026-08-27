@@ -183,6 +183,6 @@ There should be no growth in `PROCESSING` attributable to the window.
   validation rule that a production routing policy names at least two gateways per corridor.
 - Verify the inhibition rule worked: exactly one page should have been delivered. If the rotation
   got thirty, the Alertmanager inhibition is broken and that is its own ticket.
-- Add or extend the chaos case: `tests/chaos/no_gateway_test.go::TestAllGatewaysDownFailsClosed`
+- Add or extend the case: `internal/application/payment/service_test.go::TestNoEligibleGatewayIsAnAnswerNotJustARefusal`
   asserts 503, `Retry-After`, and no payment left non-terminal. If this incident's shape is not
   covered there, add it.

@@ -793,7 +793,7 @@ sequenceDiagram
     Note over SUP: preStop sleep 5 s — covers endpoint<br/>propagation delay. Without it, requests<br/>arrive after we stopped accepting.
     SUP->>SRV: GracefulStop() — no new streams, drain in-flight
     SRV-->>SUP: drained or deadline
-    SUP->>BG: cancel; workers finish current unit only
+    SUP->>BG: cancel — workers finish the current unit only
     BG->>DB: release workflow leases explicitly (workflow-worker)
     BG->>DB: commit or roll back in-flight transactions
     BG-->>SUP: stopped
@@ -1122,9 +1122,11 @@ sequenceDiagram
     participant OB as outbox_events
 
     M->>API: POST /v1/payments<br/>Idempotency-Key: k1
-    API->>API: 2-7 · trace · authn · tenant guard<br/>authz · rate limit · L1 (+PAN detector)
-    API->>PG: T1 INSERT idempotency_records<br/>ON CONFLICT DO NOTHING
+    API->>API: recover · requestid · tracing · logging · metrics<br/>bodylimit buffers the raw octets and runs the L1 PAN scan<br/>contenttype · cors · securityheaders
+    API->>API: authn · tenant · authz · ratelimit · concurrency
+    API->>PG: stage 8 INSERT idempotency_records<br/>ON CONFLICT DO NOTHING
     PG-->>API: ClaimAcquired
+    API->>API: handler decodes the body — L1 schema, below the claim
     API->>ORC: gRPC CreatePayment (deadline 10 s)
 
     ORC->>CFG: Get(merchantId) — no network
@@ -1134,27 +1136,30 @@ sequenceDiagram
     ORC->>RT: BuildPlan(eligible, health, weights, residency)
     RT-->>ORC: [stripe(PRIMARY), adyen(FALLBACK)]
 
+    ORC->>ORC: breaker.Allow · bulkhead.Acquire · Gateways.Resolve<br/>a refusal here means the gateway was never touched
+
     rect rgb(40,60,40)
-    Note over ORC,OB: T2 — one transaction
+    Note over ORC,OB: T1 — the attempt exists before the gateway is called
     ORC->>PG: INSERT payments (CREATED, v1)
     ORC->>PG: INSERT routing_plans
-    ORC->>PG: INSERT payment_attempts (PENDING)<br/>gateway_idempotency_key = HMAC(attempt_id)
+    ORC->>PG: INSERT payment_attempts (PENDING)<br/>gateway_idempotency_key = HMAC(attempt_id ‖ operation)<br/>gateway_connection_id bound BEFORE the commit
+    ORC->>PG: UPDATE payments → PROCESSING
     ORC->>OB: INSERT payment.created.v1 + payment.attempted.v1
     ORC->>PG: COMMIT
     end
 
-    Note over ORC,GW: NO transaction open across the gateway call
-    ORC->>GW: TryAcquire bulkhead permit
-    GW-->>ORC: acquired
+    Note over ORC,GW: T2 — NO transaction open across the gateway call
     ORC->>GW: Authorize (ctx 8 s, Idempotency-Key = gateway key)
     GW-->>ORC: 200 · authorized · ref=ch_123 · amount echo
-    ORC->>ORC: L6 — signature, schema, amount/currency echo
+    ORC->>ORC: settle classifies: unknown, then transport error,<br/>then contract, then the business outcome
+    ORC->>ORC: L6 — schema, amount/currency echo
 
     rect rgb(40,60,40)
-    Note over ORC,OB: T3 — one transaction
+    Note over ORC,OB: T3 — one transaction, and nothing writes one part without the others
     ORC->>PG: UPDATE payment_attempts → SUCCESS<br/>(partial unique index enforces I3)
     ORC->>PG: UPDATE payments → AUTHORIZED, v2<br/>WHERE version = 1  (L7 + optimistic lock)
-    ORC->>PG: INSERT payment_events
+    ORC->>PG: INSERT payment_event_log
+    ORC->>PG: INSERT audit_records (hash-chained)
     ORC->>OB: INSERT payment.authorized.v1
     ORC->>PG: COMMIT
     end
@@ -1165,6 +1170,8 @@ sequenceDiagram
 ```
 
 Budget check against §12: stages 2–13 sum to 59 ms, gateway ≤ 8 s, stages 15–17 sum to 18 ms. p99 target 250 ms **excluding** gateway time — met with 173 ms of slack.
+
+The three transaction boundaries are named after `Orchestrator.attemptOnce` and `settle`: **T1** commits the attempt (with its bound `connectionId`) before the gateway is called, **T2** is the call itself under its own deadline so a hung gateway cannot consume the caller's whole budget, and **T3** commits the answer, the state transition, the audit record and the outbox event together. Reversing T1 and T2 would mean a crash between them leaves a charge at the gateway that no record in the system refers to — and no reconciliation process can find what it does not know exists.
 
 ### 6.2 Capture
 
@@ -1192,7 +1199,7 @@ sequenceDiagram
         ORC-->>API: 422 PAYMENT_METHOD_NOT_SUPPORTED<br/>(capability, not a runtime surprise)
         API-->>M: 422
     else
-        ORC->>PG: T2 INSERT payment_attempts(CAPTURE, PENDING) + COMMIT
+        ORC->>PG: T1 INSERT payment_attempts(CAPTURE, PENDING)<br/>connectionId bound · COMMIT before the call
         ORC->>GW: Capture(ref=ch_123, amount, gateway key)
         alt success
             GW-->>ORC: 200 captured · amount echo
@@ -1240,15 +1247,15 @@ sequenceDiagram
     ORC->>ORC: L5 — within maxRefundWindowDays (180)
     ORC->>ORC: merchant may be SUSPENDED — refunds are<br/>still permitted (§8): you must always be able<br/>to give money back
 
-    ORC->>PG: T2 INSERT refunds(PENDING) + attempt + COMMIT
+    ORC->>PG: AddRefund → refunds(PENDING) + COMMIT<br/>BEFORE the gateway call, same reason as the attempt
     ORC->>GW: Refund(ref=ch_123, 3000 USD, gateway key)
-    GW-->>ORC: 200 refunded · re_456
-    ORC->>ORC: L6 amount/currency echo
+    GW-->>ORC: 200 · RefundAccepted · re_456
+    ORC->>ORC: refund PENDING → SUBMITTED<br/>SUCCEEDED only once the gateway confirms, usually by webhook
 
     rect rgb(40,60,40)
-    ORC->>PG: T3 UPDATE refunds → SUCCEEDED
+    ORC->>PG: UPDATE refunds → SUBMITTED
     ORC->>PG: UPDATE payments → PARTIALLY_REFUNDED, v6<br/>WHERE version = 5<br/>DB CHECK also enforces I1
-    ORC->>PG: INSERT outbox payment.refunded.v1
+    ORC->>PG: INSERT audit_records + outbox payment.refunded.v1
     ORC->>PG: COMMIT
     end
 
@@ -1260,7 +1267,9 @@ sequenceDiagram
     EC->>PG: append balanced ledger posting<br/>(unbalanced postings are unconstructible)
 ```
 
-Two invariants are enforced twice on purpose: I1 in the domain (`Payment.Refund`) and again as a database `CHECK` plus the `FOR UPDATE` serialization. Defence in depth, because a bug in the domain must still not be able to over-refund (§13.5's closing argument).
+Two invariants are enforced twice on purpose: I1 in the domain (`Payment.AddRefund`) and again as a database `CHECK` plus the `FOR UPDATE` serialization. Defence in depth, because a bug in the domain must still not be able to over-refund (§13.5's closing argument).
+
+The refund entity has its own five-state machine — `PENDING → SUBMITTED → SUCCEEDED | FAILED`, plus `PENDING → CANCELED` — which is *not* the payment's. `SUBMITTED` means the gateway accepted the instruction; `SUCCEEDED` means it confirmed the money moved, which is normally a later webhook calling `ConfirmRefund`. A refund whose outcome is unknown stays `PENDING` and opens a reconciliation exception; it is never retried, because a duplicate refund is a duplicate payout.
 
 ### 6.4 Gateway failover
 
@@ -1276,13 +1285,9 @@ sequenceDiagram
 
     Note over ORC: plan = [stripe(PRIMARY), adyen(FALLBACK)]
 
-    ORC->>PG: T2 attempt#1 (stripe, key=HMAC(att_1))
+    ORC->>PG: T1 attempt#1 (stripe, key=HMAC(att_1 ‖ authorize), connectionId bound)
     ORC->>S: Authorize
     S-->>ORC: 503 · transport class = Transport
-    ORC->>S: retry 1 (full jitter, same attempt, same key)
-    S-->>ORC: 503
-    ORC->>S: retry 2
-    S-->>ORC: 503
     ORC->>HW: Observe(ERROR, 210 ms)
     HW-->>ORC: DEGRADED → UNHEALTHY (>25% over 30 s, ≥20 samples)
     ORC->>ORC: circuit OPEN for (stripe, authorize)
@@ -1295,26 +1300,27 @@ sequenceDiagram
     ORC->>PG: T3a UPDATE attempt#1 → ERROR
     end
 
-    ORC->>ORC: classify: ERROR is retryable-elsewhere<br/>(a HARD DECLINE would stop here — no failover)
+    ORC->>ORC: att.PermitsFailover() — OutcomeError permits<br/>(a HARD DECLINE or a TIMEOUT_UNKNOWN would stop here)
 
     rect rgb(40,60,40)
-    Note over ORC,PG: NEW attempt, NEW gateway idempotency key
-    ORC->>PG: T2b INSERT attempt#2 (adyen, key=HMAC(att_2))
+    Note over ORC,PG: NEW attempt, NEW gateway idempotency key, NEW connectionId
+    ORC->>PG: T1b INSERT attempt#2 (adyen, key=HMAC(att_2 ‖ authorize))
     end
     ORC->>A: Authorize
     A-->>ORC: 200 authorized · ref=ps_789
     ORC->>ORC: L6
     ORC->>PG: T3b attempt#2 SUCCESS (I3: only ONE SUCCESS<br/>per payment — partial unique index)<br/>payments → AUTHORIZED · outbox payment.authorized.v1
 
-    Note over ORC,K: PROBING after 30 s cool-down;<br/>3 consecutive successes → HEALTHY.<br/>Any failure doubles cool-down, cap 5 min.
+    Note over ORC,K: PROBING after 30 s cool-down.<br/>3 consecutive successes → HEALTHY.<br/>Any failure doubles cool-down, cap 5 min.
 ```
 
-**The three rules this diagram encodes:**
-1. A retry to the *same* gateway reuses the *same* gateway idempotency key — the gateway dedupes, so no double charge.
-2. A failover to a *different* gateway is a *new attempt* with a *new* key — correctly a genuinely new authorization.
-3. A **hard decline never fails over.** Retrying a stolen-card decline on another gateway is card-testing behaviour and gets the platform de-registered by the schemes.
+**The rules this diagram encodes:**
+1. A failover to a *different* gateway is a *new attempt* with a *new* key — correctly a genuinely new authorization. The old attempt is closed and never mutated again.
+2. A **hard decline never fails over.** Retrying a stolen-card decline on another gateway is card-testing behaviour and gets the platform de-registered by the schemes. The soft set is an allowlist of exactly four reasons, so an unmapped reason is hard.
+3. The gateway key is derived from `attempt_id ‖ operation`, which makes any transport-level retry to the *same* gateway safe by construction — the gateway dedupes on the key it already saw.
+4. `TIMEOUT_UNKNOWN` produces **no failover at all**: it goes to reconciliation, because we do not know whether Stripe authorized (A7). An L6 contract violation lands in the same place, for the same reason.
 
-If attempt #1 had timed out rather than erroring, there would be **no failover at all**: `TIMEOUT_UNKNOWN` goes to reconciliation, because we do not know whether Stripe authorized (A7).
+**One thing the diagram used to show and no longer does:** a same-gateway retry loop. `Config.SameGatewayRetries` declares a budget of 2 for it, but nothing reads that field — neither `Orchestrator.Dispatch` nor the `httpx` client retries a transport failure. Today the first `ERROR` advances straight to the next candidate, so rule 3 is a property of the key derivation rather than of an exercised code path.
 
 ### 6.5 Webhook processing
 
@@ -1332,20 +1338,21 @@ sequenceDiagram
     GW->>WI: POST /v1/webhooks/stripe<br/>Stripe-Signature: t=…,v1=…
     rect rgb(40,60,40)
     Note over WI,PG: ≤ 50 ms budget. Accept and persist ONLY.
-    WI->>WI: VerifyWebhook — HMAC, constant-time compare<br/>timestamp skew ≤ 5 min (replay defence)
-    alt signature invalid
-        WI-->>GW: 401 WEBHOOK_SIGNATURE_INVALID + security event
-    else skew exceeded / nonce reused
-        WI-->>GW: 401 WEBHOOK_REPLAY_DETECTED + security event
+    WI->>WI: resolve the signing secrets — current AND AWSPREVIOUS,<br/>so a delivery mid-rotation still verifies
+    WI->>WI: Verify over the RAW octets — HMAC, constant-time,<br/>timestamp skew ≤ 5 min, before any parser sees the body
+    alt signature invalid or skew exceeded
+        WI-->>GW: 401 WEBHOOK_SIGNATURE_INVALID<br/>deliberately uninformative — no signing oracle
+    else no gateway event id
+        WI-->>GW: 400 WEBHOOK_UNKNOWN_EVENT_TYPE<br/>without a dedup key every retry re-applies
     else
+        Note over WI,PG: ONE transaction: claim first, body second
         WI->>PG: INSERT webhook_dedup(gateway, gateway_event_id)<br/>ON CONFLICT DO NOTHING
         alt 0 rows — duplicate
-            WI-->>GW: 200 (idempotent, counted, dropped)
+            WI-->>GW: 200 · duplicate true
         else
-            WI->>PG: INSERT inbound_webhooks (raw, allowlisted headers)
-            WI->>PG: INSERT outbox webhook.received.v1
-            WI->>PG: COMMIT
-            WI-->>GW: 200 (≤ 50 ms)
+            WI->>PG: INSERT inbound_webhooks (raw body, tenant NULL,<br/>allowlisted headers) · COMMIT
+            WI->>WI: best-effort enqueue AFTER the commit
+            WI-->>GW: 202 Accepted (≤ 50 ms)
         end
     end
     end
@@ -1361,24 +1368,31 @@ sequenceDiagram
     alt 0 rows
         EC->>K: ACK, drop
     else
-        EC->>EC: adapter translates gateway payload → domain event (ACL)
-        EC->>PG: SELECT payment by gateway_ref / gateway idempotency key
-        EC->>EC: L7 CanTransitionTo?
-        alt legal transition
-            EC->>PG: UPDATE payments (state, version) + payment_events<br/>+ outbox terminal event · SAME TX as dedup row
+        EC->>PG: load the stored delivery — already processed means ALREADY_PROCESSED
+        EC->>EC: RE-VERIFY the stored payload against its STORED<br/>receipt time — not now, or the replay window<br/>would reject every retried delivery
+        EC->>EC: adapter translates gateway payload → normalized kind (ACL)
+        alt kind not modelled
+            EC->>K: ACK · IGNORED — a vendor feature launch is not our incident
+        else no payment reference, or no such payment
+            EC->>PG: OpenException(CRITICAL) + MarkProcessed PARKED + COMMIT
+            EC->>K: ACK
+            Note right of EC: money moved for something we<br/>had no record of — the most alarming<br/>thing this processor can see
+        else transition legal
+            EC->>PG: UPDATE payments (state, version) + ledger entries<br/>+ MarkProcessed APPLIED + outbox terminal event<br/>· SAME TX as the dedup row
             EC->>PG: COMMIT
             EC->>K: ACK
             Note right of EC: This is how a TIMEOUT_UNKNOWN<br/>attempt gets resolved — resolution<br/>path (a) of §12.3
-        else illegal (e.g. late auth webhook for a REFUNDED payment)
-            EC->>PG: record reconciliation_exception + COMMIT dedup
-            EC->>K: ACK
-            Note right of EC: Never force an illegal transition.<br/>Out-of-order arrival is expected:<br/>ordering is per partition key only.
+        else illegal, or the state did not move
+            EC->>K: ACK · NO_OP
+            Note right of EC: Out-of-order and duplicate arrivals are<br/>the normal case, not a fault. Treating them<br/>as errors would put a healthy platform's<br/>commonest event on the failure dashboard.
         end
     end
     end
 ```
 
-Two properties worth stating: the ACK to the gateway happens in ≤ 50 ms and is completely decoupled from processing, so our processing latency never causes gateway-side retries or endpoint disablement; and processing failure never returns a non-2xx to the gateway, because the event is already durably ours — retrying delivery would only produce duplicates that our dedup table drops anyway.
+Three properties worth stating. The ACK to the gateway happens in ≤ 50 ms and is completely decoupled from processing, so our processing latency never causes gateway-side retries or endpoint disablement. Processing failure never returns a non-2xx to the gateway, because the event is already durably ours — retrying delivery would only produce duplicates our dedup table drops anyway. And the processor **re-verifies** rather than trusting the stored row: the accept path checked the signature but did not carry that forward as a fact anything else can rely on, and the row is read minutes or hours later, possibly by a different process. One HMAC is cheap next to a processor that trusts a database row an operator could have edited.
+
+**Where the wiring stops today.** `webhook-ingress` does not write a `webhook.received.v1` outbox row (`WebhookIngestStore.Record` commits the dedup claim and the body and nothing else), and no binary calls `Ingester.ClaimUnprocessed`. The `event-consumer` side of this diagram — `webhookProjection` driving `webhook.Processor` — is built and wired, but nothing currently publishes the event that would trigger it, and the `Processor`'s `Ledger` field is left nil in that composition root. The steps above the relay are what the platform does; the steps below it are what it is built to do.
 
 ---
 

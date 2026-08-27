@@ -56,7 +56,7 @@ flowchart TB
     end
 
     subgraph api["control-plane-api"]
-        REST["REST /v1 · gRPC internal<br/>authn · tenant guard · authz · L1"]
+        REST["REST /v1 · gRPC internal<br/>authn (jwt/jwks · mtls · apikey) · tenant guard · authz · L1"]
         IDEM["Idempotency (§14)<br/>required on every mutation"]
         ETAG["Optimistic concurrency<br/>ETag / If-Match"]
     end
@@ -297,14 +297,14 @@ sequenceDiagram
     CP-->>B: 200 · ETag "6-3ab1..."
 
     A->>CP: PUT · If-Match "6-3ab1..." · Idempotency-Key kA
-    CP->>PG: BEGIN; SELECT version FOR UPDATE → 6 ✓
+    CP->>PG: BEGIN, then SELECT version FOR UPDATE → 6 ✓
     CP->>PG: L4 validate (reference data FOR SHARE)
     CP->>PG: INSERT version 7 · UPDATE current WHERE current_version = 6
     CP->>PG: INSERT audit · INSERT outbox · COMMIT
     CP-->>A: 200 · ETag "7-9f2c..."
 
     B->>CP: PUT · If-Match "6-3ab1..." · Idempotency-Key kB
-    CP->>PG: BEGIN; SELECT version FOR UPDATE → 7 ✗
+    CP->>PG: BEGIN, then SELECT version FOR UPDATE → 7 ✗
     CP->>PG: ROLLBACK
     CP-->>B: 412 PRECONDITION_FAILED<br/>{currentVersion: 7, currentETag: "7-9f2c..."}
     Note over B: B re-reads, re-applies its intent<br/>onto v7, and retries.<br/>B's change is never silently lost.
@@ -340,10 +340,10 @@ sequenceDiagram
     participant DP as Data plane pods
     participant PR as Propagation probe
 
-    Note over OPS: v7 raised the 3DS threshold;<br/>authorization rate dropped 9 pp.<br/>Burn-rate alert fired.
+    Note over OPS: v7 raised the 3DS threshold.<br/>Authorization rate dropped 9 pp.<br/>Burn-rate alert fired.
 
     OPS->>CP: POST .../configuration/rollback<br/>{toVersion: 6, reason: "auth rate regression, INC-4471"}<br/>Idempotency-Key · scope config:write
-    CP->>PG: BEGIN; SELECT current FOR UPDATE → 7
+    CP->>PG: BEGIN, then SELECT current FOR UPDATE → 7
     CP->>PG: SELECT document FROM configuration_versions WHERE version = 6
     CP->>L4: Validate(document_v6, current reference data)
 
@@ -489,7 +489,7 @@ The four secondary metrics decompose the end-to-end number into its hops, so a b
 | No network route | Network policy: `payment-api` and `payment-orchestrator` have **no egress rule** to `control-plane-api`. The call is not merely absent from the code; it is not routable |
 | No interface to express it | `ports.ConfigSnapshotProvider.Get` returns from memory. There is no method on any port available to the payment use cases that performs a configuration fetch |
 | Test | `TestPaymentPathHasNoControlPlaneDependency` runs the create-payment use case with every control-plane dependency replaced by a panicking stub and asserts a successful payment |
-| Chaos | `tests/chaos/control_plane_outage_test.go` scales `control-plane-api` to zero under sustained payment load and asserts throughput and error rate are unchanged for the first 15 minutes |
+| Chaos | **Not implemented.** The property — `control-plane-api` at zero replicas leaves payment throughput and error rate unchanged for the first 15 minutes — rests on `internal/platform/config/provider_test.go::TestStalenessLadder` and `::TestFailedRefreshIsFailStatic`, which assert the fail-static behaviour in isolation. Nothing exercises it end to end against a running data plane |
 
 ### 4.3 What the data plane does when the control plane is unreachable
 
@@ -587,6 +587,8 @@ Rotation is a workflow (`credential-rotation@v1`), not an inline mutation, becau
 
 The **overlap** is the whole design: at no instant is there a single point at which a request could be signed with a credential the gateway does not recognise.
 
+The inbound direction uses the same two staging labels and needs no workflow at all. `webhook-ingress` resolves a gateway's signing secret as *both* `AWSCURRENT` and `AWSPREVIOUS` and offers every value to the verifier, so a delivery signed with either verifies throughout the window. The previous version is read by *staging label* rather than by version number, deliberately: the ingress does not track version numbers and must not have to, and `AWSPREVIOUS` is exactly "the one that was current before the last rotation" — which is the set the gateway may still be signing with. An ingress that read only the current secret would turn every rotation into a rejection of the deliveries in flight, and a gateway that gets 401s eventually stops retrying.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -635,7 +637,7 @@ sequenceDiagram
 
     rect rgb(45,45,55)
     Note over WW,GW: PHASE 4 — soak, then revoke
-    WW->>WW: wait overlap_window (default 24 h; ≥ 10× cache TTL<br/>and ≥ the longest gateway retry window)
+    WW->>WW: wait overlap_window (default 24 h — at least 10× cache TTL<br/>and at least the longest gateway retry window)
     WW->>CP: read last_used_at for v7
     alt v7 still used within the last hour
         WW->>WW: extend overlap 24 h, alert (max 3 extensions, then page)

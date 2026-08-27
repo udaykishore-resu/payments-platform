@@ -96,7 +96,7 @@ flowchart TB
     ALBA --> N1 & N2 & N3
     N1 & N2 & N3 --> AW
     AW -. 6-way storage replication .- AR1
-    AW -. .- AR2
+    AW -. replication .- AR2
   end
 
   subgraph RB["Region B — eu-central-1 · PASSIVE (warm)"]
@@ -573,7 +573,7 @@ Roles: **IC** incident commander, **SRE** on-call SRE, **DBA** database on-call 
 | **T+2:00** | SRE | Confirmed: Region A is unreachable on all paths. Declare **SEV-1**. Page the SRE lead and the DBA | Incident record opened; `INC-…` assigned |
 | **T+2:30** | COMMS | Status page → "investigating". Do **not** yet promise a failover | — |
 | **T+3:00** | SRE lead (IC) | **Decision 2 — the only decision that matters: promote or wait?** Criteria, in order: (a) Is Region A expected back within 10 min per AWS Health? (b) Is the observed replication lag within RPO? (c) Is Region B healthy? Promotion is irreversible-in-practice — failback is a planned operation costing hours, not a toggle | AWS Health shows no ETA → **promote**. Record the decision, the time and the rationale in the incident channel *before* acting |
-| **T+3:15** | DBA | Capture the pre-promotion lag. **This number is the measured RPO for this event and goes in the postmortem** | `evidence/rpo-observed.json` → `Maximum: 0.41s` |
+| **T+3:15** | DBA | Capture the pre-promotion lag. **This number is the measured RPO for this event and goes in the postmortem** | `evidence/rpo-observed.json` (written by the drill; not committed to this repository) → `Maximum: 0.41s` | <!-- doc-refs: allow-missing -->
 | **T+3:30** | DBA | **Fence.** Conditional DynamoDB write, epoch 42 → 43, `active_region` → `eu-central-1` | Conditional write succeeds. A failure here means someone else already promoted — **stop and reconcile before doing anything** |
 | **T+3:40** | SRE | Confirm Region A pods are fencing themselves. (If the EKS API is reachable, also scale Region A's data plane to zero — belt and braces. If unreachable, the fence is sufficient) | `kubectl --context pp-prod-eu-west-1 -n pp-data-plane get deploy` (likely times out — acceptable) |
 | **T+4:00** | DBA | Promote Aurora. Region A unreachable → **unplanned** path: `aws rds remove-from-global-cluster --region eu-central-1 …` | Command accepted |
@@ -638,6 +638,8 @@ sequenceDiagram
     SRE->>B: T+11:00 reconciliation sweep over PROCESSING / TIMEOUT_UNKNOWN
     SRE->>SRE: T+13:00 full service — RTO 13 min, RPO 0.41 s
 ```
+
+**On step T+11:00.** `payment.Reconciler` implements the sweep — `ResolveUnknown` polls each gateway with the attempt's deterministic idempotency key, `SweepExpiredAuthorizations` closes holds the gateway has released, `IngestSettlement` reconciles the report — and it is unit-tested. It is not yet constructed by any binary, so today this step is an operator following the runbook rather than a process the promotion kicks off. That does not change the sequence: the gap between the last replicated transaction and the last committed one is real whether or not a scheduler closes it, and closing it is what stops a `PROCESSING` payment in the failed region from becoming a silent loss.
 
 ---
 
@@ -831,12 +833,12 @@ sequenceDiagram
 
     CAB->>G: approve CHG-… (7 preconditions verified)
     G->>A: terraform apply + argocd sync --prune  (rebuilt from Git, not resumed)
-    B->>A: add as Global secondary; replicate
+    B->>A: add as Global secondary, then replicate
     A-->>B: lag < 1s sustained 1h
     G->>A: scale to full + cache warm  (BEFORE promotion)
     Note over A: fully warm, still read-only
     B->>DDB: epoch 43→44, active_region = eu-west-1 (conditional)
-    Note over B: Region B pods fence within 10s;<br/>in-flight writes drain or fail closed
+    Note over B: Region B pods fence within 10s.<br/>In-flight writes drain or fail closed
     B->>A: failover-global-cluster  (PLANNED — zero data loss)
     A-->>B: pg_is_in_recovery() = f
     A->>A: synthetic canary payment → authorized
@@ -873,7 +875,7 @@ Produced within 5 business days, retained 7 years alongside the incident record 
 | Section | Contents |
 |---|---|
 | Timeline | Every action from §6 with actual timestamps, actor, command, and its output |
-| **Measured RPO** | The pre-promotion replication lag from `evidence/rpo-observed.json`, plus the count of records confirmed lost via check #11/#12 |
+| **Measured RPO** | The pre-promotion replication lag from the `evidence/rpo-observed.json` the drill writes, plus the count of records confirmed lost via check #11/#12 | <!-- doc-refs: allow-missing -->
 | **Measured RTO** | Detection → full service, with the phase breakdown |
 | Decision log | Each of the three decisions, who made it, on what evidence, and — for each — whether the criteria as written were sufficient |
 | Money impact | Payments rejected (`503` count), payments left `PROCESSING` and their resolution, orphan authorizations found and how each was closed, refunds issued, total value affected |

@@ -20,8 +20,9 @@ flowchart LR
     AUDW["Audit writer - hash-chained records"]
   end
 
-  AGENT["OTel collector agent - DaemonSet, tail sampling buffer, resource detection"]
-  GWC["OTel collector gateway - StatefulSet, batching, redaction processor, tenant attribution"]
+  AGENT["OTel collector agent - DaemonSet, tolerates every pp.plane taint, tail sampling buffer, resource detection"]
+  GWC["OTel collector gateway - Deployment on the general node pool, batching, redaction processor, tenant attribution"]
+  GUARD["Cardinality and redaction guards - pp_log_field_rejected_total, pp_log_lines_suppressed_total, pp_metric_series_overflow_total"]
 
   subgraph BACK["Backends"]
     TRACE["Trace backend - exemplar linked"]
@@ -41,6 +42,8 @@ flowchart LR
 
   SDK --> AGENT
   MET --> AGENT
+  MET --> GUARD
+  GUARD --> AGENT
   AGENT --> GWC
   GWC --> TRACE
   GWC --> TSDB
@@ -100,7 +103,11 @@ flowchart TB
   They live in logs, traces and metric *exemplars*, so a spike on a low-cardinality series links
   straight to a representative trace carrying the high-cardinality identity. CI runs a cardinality
   lint over the metric registry and a label set may not exceed 10⁴ series per metric per service
-  (§22.3).
+  (§22.3). The guard is live as well as static: the registry counts
+  `pp_metric_series_overflow_total` when a metric exceeds its series budget, and the allowlist
+  logger counts `pp_log_field_rejected_total` and `pp_log_lines_suppressed_total` when it drops an
+  unregistered field or a suppressed line — so a violation is a series you can alert on, not only
+  a build that failed once.
 - **The audit path is deliberately not the telemetry path.** Audit records go through the same
   transactional outbox as domain events, are hash-chained, are never sampled, and land in S3 with
   Object Lock for 7-year WORM. Telemetry may be sampled and dropped under load; audit may not

@@ -53,24 +53,26 @@ sequenceDiagram
     participant CON as event-consumer
 
     MER->>API: POST /v1/payments<br/>Idempotency-Key: idem-7f2a<br/>{amount:8450, currency:USD, token, capture:AUTOMATIC}
-    API->>API: L1 (schema, PAN detector) · authn · tenant · rate limit
+    API->>API: bodylimit buffers the raw octets and runs the L1 PAN scan<br/>then authn · tenant · authz · rate limit · concurrency
     API->>PG: claim idempotency (INSERT ON CONFLICT DO NOTHING)
     PG-->>API: 1 row — we own it
+    API->>API: handler decodes the body — L1 schema, below the claim
     API->>ORC: CreatePayment (gRPC, mTLS)
-    ORC->>ORC: L5 (48 rules) · risk · routing → rpl_… [stripe, adyen, paypal]
-    ORC->>PG: T1 payment CREATED v1 + payment.created.v1 (outbox)
-    ORC->>PG: T2 attempt PENDING (gw idem key) + payment PROCESSING v2 + payment.attempted.v1
+    ORC->>ORC: L5 · construct the aggregate (not yet persisted) · risk · routing → rpl_… [stripe, adyen, paypal]
+    Note over ORC: constructed before risk so both have a stable payment ID to key on,<br/>persisted after it so a risk-declined payment never leaves a phantom row
+    ORC->>PG: payment CREATED v1 + audit record, one transaction
+    ORC->>PG: T1 attempt PENDING (gw idem key, connectionId bound) + payment PROCESSING v2
     Note over ORC,PG: attempt row is durable BEFORE any network call
     ORC->>GW: POST /charges  amount=8450 USD  Idempotency-Key: att-derived
     GW-->>ORC: 200 {status: succeeded, id: ch_3Q…, amount: 8450, currency: usd}
     ORC->>ORC: L6 — signature n/a (sync), schema, amount echo, currency echo, status mapping
-    ORC->>PG: T3 attempt SUCCESS + payment CAPTURED v3 + ledger entries + payment.captured.v1
+    ORC->>PG: T3 attempt SUCCESS + payment CAPTURED v3 + audit record + payment.captured.v1<br/>ONE transaction — no path writes one without the others
     ORC-->>API: PaymentView{status: captured}
     API->>PG: idempotency COMPLETED + response snapshot
     API-->>MER: 201 Created {status:"captured", id:"pay_01JB…"}
     REL->>CON: payment.captured.v1
     CON->>CON: ledger projection · merchant notification · analytics
-    GW-->>API: (async) webhook charge.succeeded → dedup: already applied, drop
+    GW-->>API: (async) webhook charge.succeeded → the aggregate refuses the transition, NO_OP
 ```
 
 The webhook that arrives after a synchronous success is a duplicate by design. It is signature-verified, deduped on `(gateway, event_id)`, counted, and dropped (§24). The system must be correct whether the synchronous response or the webhook arrives first — that property is what makes §9's timeout branch survivable.
@@ -83,7 +85,7 @@ The webhook that arrives after a synchronous success is a duplicate by design. I
 |---|---|
 | Actors | MER → API → ORC → GW (twice, hours apart) |
 | Transitions | `CREATED → PROCESSING → AUTHORIZED` … then `AUTHORIZED → CAPTURED` |
-| Attempts | authorization attempt `SUCCESS`; the capture is **not** a new attempt — it is an operation against the same connection (sticky affinity is forced, data-plane §4.5) |
+| Attempts | authorization attempt `SUCCESS`; the capture opens a **new attempt row** with operation `capture`, on the *same* gateway and connection that holds the authorization. `Orchestrator.CaptureExisting` reads that gateway from `pay.SuccessfulAttempt()` — there is no routing and no failover — and `followUp` commits the new attempt before the call, the same T1-before-T2 ordering as authorization. |
 | Events | `payment.created.v1`, `payment.attempted.v1`, `payment.authorized.v1`; later `payment.captured.v1` |
 | Ledger | **none at authorization** · at capture: DR `gateway_receivable` 8450 / CR `merchant_revenue` 8450; DR `fee_expense` 275 / CR `gateway_receivable` 275 |
 | Idempotency | two independent scopes: `POST /v1/payments` with key `A`, `POST /v1/payments/{id}/capture` with key `B` (§14.1 scope includes `path_template`) |
@@ -178,7 +180,9 @@ sequenceDiagram
 | Ledger | DR `refund_expense` 8450 / CR `gateway_receivable` 8450. Fees are usually **not** returned — that is the gateway's policy, not ours, and the ledger reflects reality: the merchant is out 8450 plus the original 275. If the gateway does return the fee it arrives as a settlement adjustment (§16) and posts DR `gateway_receivable` / CR `fee_expense`. |
 | Idempotency | key on `POST /{id}/refund`. A retry with the same key replays the same `ref_…`; a **new** key creates a **second refund**, which is why I1 exists |
 | Availability | refunds are permitted while the merchant is `SUSPENDED` (§8) and are shed last under load (data-plane §5.4) |
-| Failure branches | gateway rejects (funds already returned by dispute) → `422` · refund window closed → `422 REFUND_WINDOW_EXPIRED` before any gateway call · async refund (bank debit) → refund stays `PENDING` until the webhook confirms |
+| Refund FSM | `PENDING → SUBMITTED → SUCCEEDED \| FAILED`, plus `PENDING → CANCELED`. The row is created `PENDING` and **committed before the gateway call**, for the same reason the attempt is: a crash mid-refund must leave a record, or the merchant has told a customer their money is coming back and nothing in the system knows. |
+| When the payment moves | **Only on `ConfirmRefund`**, i.e. when the refund reaches `SUCCEEDED`. A gateway that answers `RefundAccepted` leaves the refund `SUBMITTED` and the payment where it was; the transition to `PARTIALLY_REFUNDED`/`REFUNDED` and the `payment.refunded.v1` event both happen inside `ConfirmRefund`, which the settlement webhook normally triggers. |
+| Failure branches | gateway rejects (funds already returned by dispute) → refund `FAILED` · refund window closed → `422 REFUND_WINDOW_EXPIRED` before any gateway call · async refund (bank debit) → refund stays `SUBMITTED` until the webhook confirms · **unknown outcome → the refund stays `PENDING` and enters reconciliation; it is emphatically never retried** |
 
 ```mermaid
 sequenceDiagram
@@ -190,15 +194,26 @@ sequenceDiagram
     participant CON as event-consumer
 
     MER->>ORC: POST /v1/payments/pay_01JB…/refund {amount:8450}  Idempotency-Key: R1
-    ORC->>ORC: I1: 0 + 8450 ≤ 8450 ✓ · within 180-day window ✓ · no open dispute ✓
+    ORC->>ORC: AddRefund · I1 over PENDING and SUBMITTED refunds too: 0 + 8450 ≤ 8450 ✓
+    ORC->>ORC: refund ref_01JB… created PENDING and COMMITTED before the call
     ORC->>GW: refund ch_3Q… 8450 (gw idem key derived from ref_…)
-    GW-->>ORC: refund pending/succeeded, re_8H…
-    ORC->>ORC: L6 amount + currency echo · L7 CAPTURED→REFUNDED
-    ORC->>CON: payment.refunded.v1 {refundId:"ref_01JB…", amount:8450, refundedTotal:8450}
-    CON->>CON: DR refund_expense 8450 / CR gateway_receivable 8450
-    ORC-->>MER: 200 {status:"refunded", refundedAmount:8450}
-    GW-->>WHI: charge.refund.updated (settled)
-    WHI->>CON: webhook.received.v1 → refund settlement recorded, state unchanged
+    alt Gateway accepted, settlement later
+        GW-->>ORC: RefundAccepted, re_8H…
+        ORC->>ORC: refund PENDING → SUBMITTED · payment state UNCHANGED
+        ORC-->>MER: 200 {status:"captured", refunds:[{status:"submitted"}]}
+        GW-->>WHI: charge.refund.updated (succeeded)
+        WHI->>CON: the processor calls ConfirmRefund → refund SUCCEEDED · L7 CAPTURED→REFUNDED
+        CON->>CON: payment.refunded.v1 · DR refund_expense 8450 / CR gateway_receivable 8450
+    else Gateway settled inline
+        GW-->>ORC: Refunded, re_8H…
+        ORC->>ORC: refund SUBMITTED then ConfirmRefund → SUCCEEDED · L7 CAPTURED→REFUNDED
+        ORC->>CON: payment.refunded.v1 {refundId:"ref_01JB…", amount:8450, refundedTotal:8450}
+        ORC-->>MER: 200 {status:"refunded", refundedAmount:8450}
+    else Outcome unknown
+        GW--xORC: timeout
+        ORC->>ORC: refund STAYS PENDING · RequireReconciliation · NEVER retried
+        Note over ORC: a duplicate refund is a duplicate payout
+    end
 ```
 
 ---
@@ -208,7 +223,7 @@ sequenceDiagram
 | Aspect | Detail |
 |---|---|
 | Transitions | `CAPTURED → PARTIALLY_REFUNDED`; further refunds `PARTIALLY_REFUNDED → PARTIALLY_REFUNDED`; the refund that exhausts the captured amount → `REFUNDED` (§9) |
-| Guards | I1 on the running total. Two concurrent partial refunds of 5000 against 8450 captured: the payment row is locked `FOR UPDATE` in T3, so the second sees `refundedTotal = 5000` and is rejected by `L7.REFUNDS_NOT_EXCEED_CAPTURED` with `422 REFUND_EXCEEDS_CAPTURED`. The `CHECK` constraint is the backstop if the lock is ever bypassed. |
+| Guards | I1 on the running total, and the ceiling counts refunds that are merely **in flight** (`PENDING` or `SUBMITTED`) as well as succeeded ones — otherwise two concurrent requests for the full amount could both be admitted. Two concurrent partial refunds of 5000 against 8450 captured: the payment row is locked `FOR UPDATE`, so the second sees the first's in-flight 5000 and is rejected by `L7.I1_REFUND_WITHIN_CAPTURE` with `422 REFUND_EXCEEDS_CAPTURED`. The `CHECK` constraint is the backstop if the lock is ever bypassed. |
 | Events | `payment.refunded.v1` per refund, each with its own `refundId` and the running `refundedTotal` |
 | Ledger | per refund: DR `refund_expense` *n* / CR `gateway_receivable` *n* |
 | Idempotency | one key per refund; the same-key-replays / new-key-creates asymmetry is the most common integration bug in this flow |
@@ -223,13 +238,14 @@ sequenceDiagram
     participant CON as event-consumer
 
     MER->>ORC: refund 3000  Idempotency-Key: R1
-    ORC->>PG: SELECT … FOR UPDATE · I1: 0+3000 ≤ 8450 ✓
-    ORC->>CON: payment.refunded.v1 {amount:3000, refundedTotal:3000}
+    ORC->>PG: SELECT … FOR UPDATE · I1 counts PENDING and SUBMITTED too: 0+3000 ≤ 8450 ✓
+    ORC->>PG: refund ref_A PENDING committed, then dispatched, then SUBMITTED
+    ORC->>CON: on ConfirmRefund — payment.refunded.v1 {amount:3000, refundedTotal:3000}
     ORC-->>MER: 200 {status:"partially_refunded", refundedAmount:3000}
 
     MER->>ORC: refund 5450  Idempotency-Key: R2
     ORC->>PG: I1: 3000+5450 = 8450 ≤ 8450 ✓
-    ORC->>CON: payment.refunded.v1 {amount:5450, refundedTotal:8450}
+    ORC->>CON: on ConfirmRefund — payment.refunded.v1 {amount:5450, refundedTotal:8450}
     ORC-->>MER: 200 {status:"refunded", refundedAmount:8450}
 
     MER->>ORC: refund 100  Idempotency-Key: R3
@@ -397,7 +413,7 @@ sequenceDiagram
     participant WHI as webhook-ingress
 
     MER->>ORC: POST /v1/payments  Idempotency-Key: U1
-    ORC->>PG: attempt att_5D… PENDING, gw_idem_key = base32(HMAC(att_5D…))
+    ORC->>PG: T1 attempt att_5D… PENDING, connectionId bound,<br/>gw_idem_key = base32(HMAC(att_5D… ‖ authorize)) · COMMIT before the call
     ORC->>GW: authorize 8450 (8 s deadline)
     Note over ORC,GW: ✗ no response within 8 s — the gateway MAY have authorized
     ORC->>PG: attempt → TIMEOUT_UNKNOWN · payment stays PROCESSING
@@ -418,7 +434,7 @@ sequenceDiagram
             GW-->>REC: 404
             REC->>PG: attempt → ERROR · failover now permitted
         else lookup errors
-            REC->>REC: backoff 60 s → 15 min; at 15 min emit payment.reconciliation_required.v1
+            REC->>REC: backoff 60 s → 15 min, then emit payment.reconciliation_required.v1
         end
     end
 ```
@@ -436,9 +452,9 @@ sequenceDiagram
 | Events | `payment.attempted.v1` per attempt (routing-feedback consumers use these), then `payment.captured.v1` |
 | Ledger | posts once, on the successful attempt |
 | Idempotency | one client key spanning both attempts. The client sees one payment and one response. |
-| Budget | ≤ 2 failovers, ≤ 12 s wall clock (data-plane §4.6) |
+| Budget | `Config.MaxAttempts`, default **2** — two *attempts in total*, so exactly one failover. Not arbitrary: the timeout cascade proves three gateway calls cannot fit inside the orchestrator's budget, so a third would be started only to be abandoned (data-plane §4.6). |
 | Invariant | I3 — the partial unique index permits at most one attempt per payment in a successful terminal state, so even a pathological double-failover cannot double-charge |
-| Failure branches | all candidates exhausted → `FAILED` with `NO_ELIGIBLE_GATEWAY` · budget exhausted mid-failover → `FAILED` with `ROUTING_BUDGET_EXHAUSTED` · second attempt times out → `TIMEOUT_UNKNOWN`, payment stays `PROCESSING`, §9 applies and no third attempt is made |
+| Failure branches | all candidates exhausted → the loop ends, the payment is reloaded from the writer, and the last error is returned (`NO_ELIGIBLE_GATEWAY` when the plan was empty to begin with, `GATEWAY_DECLINED` when the last attempt declined) · second attempt times out → `TIMEOUT_UNKNOWN`, payment stays `PROCESSING`, §9 applies and no third attempt is made · **if the reloaded payment is still in flight, the answer is 202-shaped rather than an error** — the merchant polls and must not retry |
 
 ```mermaid
 sequenceDiagram
@@ -452,13 +468,13 @@ sequenceDiagram
 
     MER->>ORC: POST /v1/payments  Idempotency-Key: F1
     ORC->>RTE: plan → rpl_… [stripe 0.8018, adyen 0.6511, paypal 0.6347]
-    ORC->>PG: attempt att_A PENDING, key K_A
+    ORC->>PG: T1 attempt att_A PENDING, key K_A, connectionId bound, COMMIT
     ORC->>G1: authorize 8450
     G1-->>ORC: declined, code 91 (issuer unavailable)
-    ORC->>ORC: L6.DECLINE_CLASS_IS_KNOWN → SOFT, in the retryable set
-    ORC->>PG: att_A → DECLINED · payment STAYS PROCESSING
-    ORC->>RTE: next candidate, anti-affinity removes stripe
-    ORC->>PG: attempt att_B PENDING, key K_B (new — genuinely a new authorization)
+    ORC->>ORC: normalized to ISSUER_UNAVAILABLE — one of the four soft reasons<br/>att.PermitsFailover() true · breaker deliberately NOT charged for a decline
+    ORC->>PG: att_A → DECLINED · payment STAYS PROCESSING, MarkFailed is skipped
+    ORC->>RTE: Plan.Next(tried) — stripe is excluded, no re-routing
+    ORC->>PG: T1 attempt att_B PENDING, key K_B, its own connectionId (new — genuinely a new authorization)
     ORC->>G2: authorize 8450
     G2-->>ORC: approved
     ORC->>PG: att_B → SUCCESS (I3 partial unique index holds) · L7 PROCESSING→CAPTURED
@@ -472,7 +488,7 @@ sequenceDiagram
 | Aspect | Detail |
 |---|---|
 | Transitions | `CREATED → PROCESSING → FAILED` (terminal) |
-| Attempt | one attempt, `DECLINED`, mapped hard class (stolen card `43`, invalid account `14`, pickup `04`, restricted `62`, or **any unmapped reason** — `L6.DECLINE_REASON_IS_MAPPABLE` degrades unknown to hard) |
+| Attempt | one attempt, `DECLINED`, normalized to a reason outside the four-member soft set — `STOLEN_CARD`, `LOST_CARD`, `INVALID_ACCOUNT`, `RESTRICTED_CARD`, `INSUFFICIENT_FUNDS`, `CARD_EXPIRED`, `INCORRECT_NUMBER`, `INCORRECT_CVC`, `FRAUDULENT`, `CURRENCY_NOT_SUPPORTED`, `AUTHENTICATION_REQUIRED`, `BLOCKED_BY_GATEWAY_RISK`, or **`UNKNOWN`**. The soft set is an allowlist of exactly four, so an untaught reason code maps to `UNKNOWN` and is hard by construction. |
 | Events | `payment.attempted.v1`, `payment.failed.v1` with the normalized decline reason |
 | Ledger | none |
 | Idempotency | the record completes as `FAILED_TERMINAL`; a retry with the same key replays the same `402` error rather than re-attempting (§14.3) |
@@ -489,9 +505,9 @@ sequenceDiagram
     MER->>ORC: POST /v1/payments  Idempotency-Key: H1
     ORC->>G1: authorize 8450
     G1-->>ORC: declined, code 43 (stolen card)
-    ORC->>ORC: L6 mapping → HARD · failover NOT considered
+    ORC->>ORC: adapter normalizes to STOLEN_CARD · not in softDeclines<br/>att.PermitsFailover() false, so MarkFailed runs in the same commit
     ORC->>ORC: L7 PROCESSING→FAILED · payment.failed.v1
-    ORC-->>MER: 402 GATEWAY_DECLINED<br/>{declineReason:"CARD_REPORTED_LOST_OR_STOLEN", retryable:false}
+    ORC-->>MER: 402 GATEWAY_DECLINED<br/>{declineReason:"STOLEN_CARD", retryable:false}
     MER->>ORC: retry with the SAME key H1
     ORC-->>MER: 402 replayed from FAILED_TERMINAL snapshot<br/>Idempotent-Replay: true
 ```
@@ -530,14 +546,14 @@ sequenceDiagram
     Note over MER,API: client's 2 s timeout fires
 
     MER->>API: POST /v1/payments  Key: D1  {amount:8450}   (retry #1)
-    API->>PG: claim → 0 rows; state IN_FLIGHT, lease live
+    API->>PG: claim → 0 rows — state IN_FLIGHT, lease live
     API-->>MER: 409 IDEMPOTENT_REQUEST_IN_PROGRESS · Retry-After: 1
 
     ORC-->>API: captured
     API->>PG: idempotency COMPLETED + snapshot(201)
 
     MER->>API: POST /v1/payments  Key: D1  {amount:8450}   (retry #2)
-    API->>PG: claim → 0 rows; state COMPLETED
+    API->>PG: claim → 0 rows — state COMPLETED
     API-->>MER: 201 replayed · Idempotent-Replay: true · same pay_01JB…
 
     MER->>API: POST /v1/payments  Key: D1  {amount:9900}   (bug)
@@ -554,13 +570,13 @@ Gateways deliver at-least-once and retry aggressively after their own incidents;
 | Aspect | Detail |
 |---|---|
 | Actors | GW → WHI → Kafka → processor |
-| Two dedup layers | (1) ingress: `webhook_dedup` on `(gateway, event_id)` — a duplicate is dropped with a `2xx` so the gateway stops retrying; (2) consumer: `(consumer_group, event_id)` dedup insert in the same transaction as the handler (§13.5) |
-| Third layer | state-machine idempotence: applying `charge.succeeded` to a payment already `CAPTURED` is rejected by `L6.STATE_IS_REACHABLE_FROM_CURRENT`/`L7.PAYMENT_TRANSITION_IS_ALLOWED` and recorded as a no-op, not an error |
+| Four dedup layers | (1) ingress: `webhook_dedup` on `(gateway_id, gateway_event_id)`, claimed *before* the body is written and in the same transaction — a duplicate answers `200 {duplicate: true}` so the gateway stops retrying; (2) processor: the stored row's `processed_at`, which turns a duplicate queue delivery into `ALREADY_PROCESSED` rather than a second application; (3) consumer: `(consumer_group, event_id)` dedup insert in the same transaction as the handler (§13.5); (4) ledger: the posting is idempotent on the gateway's own event id, so a replay cannot double-post |
+| Fifth layer | state-machine idempotence: applying `charge.succeeded` to a payment already `CAPTURED` is refused by the aggregate and recorded as `NO_OP`, not an error. Out-of-order and duplicate arrivals are the normal case; treating them as failures would put a healthy platform's commonest event on the failure dashboard. |
 | Transitions | none on the duplicate |
 | Events | none re-emitted |
 | Ledger | none — this is what I1/I2/I3 and the dedup table exist to guarantee |
-| Response | always `2xx` to the gateway. A `4xx` on a duplicate teaches the gateway to disable the endpoint. |
-| Out-of-order delivery | a `charge.succeeded` arriving **after** `charge.refunded` is not a duplicate — it is out of order. `L6.STATE_IS_REACHABLE_FROM_CURRENT` rejects the transition and parks it in the exception queue as `LATE_EVENT` (§17), where the triage rule is "compare gateway timestamps; if the parked event is older, discard". |
+| Response | `202 Accepted` for a delivery we did not already hold, `200 OK` with `duplicate: true` for one we did. Always `2xx`: a `4xx` on a duplicate teaches the gateway to disable the endpoint. Adyen additionally requires the literal body `[accepted]`. |
+| Out-of-order delivery | a `charge.succeeded` arriving **after** `charge.refunded` is not a duplicate — it is out of order. The aggregate refuses the transition, the processor records `NO_OP`, and the delivery is marked processed. A webhook the processor cannot attach to *any* payment is different and much more alarming: it opens a `CRITICAL` reconciliation exception and is recorded `PARKED`. |
 | Failure branches | signature invalid → `401` + security event, **never** deduped (an attacker must not be able to poison the dedup table with a chosen `event_id`) · replay outside the 5-minute timestamp window → `401 WEBHOOK_REPLAY_DETECTED` |
 
 ```mermaid
@@ -572,17 +588,21 @@ sequenceDiagram
     participant CON as webhook processor
 
     GW->>WHI: POST /v1/webhooks/stripe  evt_abc  (delivery 1)
-    WHI->>WHI: L6.SIGNATURE_VERIFIES ✓ · timestamp within 5 min ✓
+    WHI->>WHI: verify over the RAW octets ✓ · timestamp within 5 min ✓<br/>current AND previous signing secret are both offered
+    Note over WHI,PG: ONE transaction — claim first, body second
     WHI->>PG: INSERT webhook_dedup (stripe, evt_abc) → 1 row
-    WHI->>PG: INSERT inbound_webhooks + raw body to S3
-    WHI-->>GW: 200 (≤ 50 ms, no business processing)
-    WHI->>CON: webhook.received.v1
-    CON->>CON: dedup (group, evt_abc) → new · apply L6 + L7 · payment CAPTURED
+    WHI->>PG: INSERT inbound_webhooks (raw body in the row, tenant NULL) · COMMIT
+    WHI-->>GW: 202 Accepted (≤ 50 ms, no business processing)
+    WHI->>CON: the asynchronous processor picks it up
+    CON->>CON: re-verify against the STORED receipt time · apply through the aggregate<br/>state, ledger and MarkProcessed APPLIED in one transaction
 
     GW->>WHI: POST /v1/webhooks/stripe  evt_abc  (delivery 2 — gateway retry)
     WHI->>WHI: signature ✓
-    WHI->>PG: INSERT webhook_dedup → 0 rows (conflict)
-    WHI-->>GW: 200 · pp_webhook_duplicates_total++ · dropped
+    WHI->>PG: INSERT webhook_dedup → 0 rows (conflict) · nothing committed
+    WHI-->>GW: 200 · {duplicate: true} · counted, not errored
+
+    GW->>WHI: POST /v1/webhooks/stripe  evt_abc  (delivery 3, after processing)
+    WHI-->>GW: 200 · duplicate — and had the queue delivered it twice,<br/>the processor's processed_at check answers ALREADY_PROCESSED
 
     GW->>WHI: POST /v1/webhooks/stripe  evt_abc  forged signature
     WHI-->>GW: 401 WEBHOOK_SIGNATURE_INVALID · security event · NOT deduped
@@ -636,7 +656,7 @@ sequenceDiagram
         GW-->>WHI: charge.dispute.closed {status: lost}
         ORC->>ORC: L7 DISPUTED→REFUNDED
         CON->>CON: DR chargeback_expense 8450 / CR dispute_holding 8450
-        CON->>CON: risk: fingerprint → platform blocklist; merchant dispute ratio updated
+        CON->>CON: risk fingerprint → platform blocklist, merchant dispute ratio updated
     end
 ```
 

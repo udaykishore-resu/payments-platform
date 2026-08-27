@@ -45,7 +45,7 @@ be assumed by somebody:
 | **An architect** evaluating the design | [`docs/architecture.md`](docs/architecture.md) | The five planes, the control loop, the container/component view, and a 15-entry trade-off register with the rejected options steelmanned |
 | **A reviewer** checking the design holds together | [`docs/spec/00-design-baseline.md`](docs/spec/00-design-baseline.md) | Everything, normatively: ambiguity register, bounded contexts, layering rule, state machines, idempotency contract, CAP-per-operation, PCI boundary, definition of done |
 | **A security architect** | [`docs/security.md`](docs/security.md) then [`docs/compliance.md`](docs/compliance.md) | Trust zones, identity flow, secret handling, the `Secret[T]` type, threat model; then PCI/PSD2/GDPR/AML boundaries and evidence |
-| **An SRE / on-call engineer** | [`docs/failure-handling.md`](docs/failure-handling.md), [`docs/observability.md`](docs/observability.md), [`docs/disaster-recovery.md`](docs/disaster-recovery.md) | What breaks, how it degrades, what the SLIs and burn-rate alerts are, and the ordered region-failover procedure. **The runbook directory `docs/runbooks/` is currently empty — see [status](#status-and-limitations).** |
+| **An SRE / on-call engineer** | [`docs/runbooks/README.md`](docs/runbooks/README.md), then [`docs/failure-handling.md`](docs/failure-handling.md), [`docs/observability.md`](docs/observability.md), [`docs/disaster-recovery.md`](docs/disaster-recovery.md) | **35 runbooks** behind an index, one per distinct `runbook_url`, with `scripts/check-runbook-links.sh` asserting that no alert reference dangles and that no paging alert lacks one. Then: what breaks, how it degrades, what the SLIs and burn-rate alerts are, and the ordered region-failover procedure |
 | **A payments specialist** | [`docs/payment-flow.md`](docs/payment-flow.md) then [`docs/data-plane.md`](docs/data-plane.md) | Authorize → capture → settle → refund → dispute, where idempotency binds, and the 17-stage request pipeline with its latency budgets |
 | **A cloud architect** | [`docs/deployment.md`](docs/deployment.md) + [`terraform/README.md`](terraform/README.md) | Environments, progressive delivery, the AWS substrate and the multi-region posture |
 | **A compliance reviewer / auditor** | [`docs/compliance.md`](docs/compliance.md), [`docs/spec/09-traceability.md`](docs/spec/09-traceability.md) | Regulatory boundaries, retention, and the requirement → design → code → test matrix |
@@ -53,7 +53,7 @@ be assumed by somebody:
 | **Looking for a decision's rationale** | [`docs/adr/README.md`](docs/adr/README.md) | 24 indexed ADRs, each naming a mechanical check that would catch its violation |
 | **Writing code here** | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Layering rules, definition of done, and the recipes for adding a gateway, a rule, an event, a state or a migration |
 
-A full annotated index of all 67 documents is in [`docs/README.md`](docs/README.md).
+A full annotated index is in [`docs/README.md`](docs/README.md); `docs/` now holds 104 markdown files, 35 of them runbooks.
 
 ---
 
@@ -326,9 +326,9 @@ deploy/                     docker-compose.dev.yml and the local observability c
 deployments/k8s/            kustomize base + dev/staging/prod overlays; deployments/argocd/
 helm/                       umbrella chart + 9 service subcharts + pp-common
 terraform/                  12 modules + dev/staging/prod stacks + policy references
-docs/                       spec/, adr/, diagrams/, runbooks/ (currently empty), plane docs
+docs/                       spec/, adr/, diagrams/, runbooks/ (35 runbooks + an index), plane docs
 tests/                      integration/, contract/, e2e/, chaos/, load/, testenv/
-scripts/                    verify, the nine CI fitness functions, dev stack, migrate, seed, DR drill
+scripts/                    verify, the twelve fitness functions it runs, dev stack, migrate, seed, DR drill
 ```
 
 The one deliberate exception to the layering table is `internal/adapters/gateway/spi`: it is a
@@ -553,7 +553,7 @@ make verify        # everything CI verifies, in CI's order — run this before p
 make verify-fast   # the same, minus the race detector (~4 min tier)
 ```
 
-`scripts/verify.sh` runs 14 gates. It is ordered cheapest-and-most-likely-to-fail first, because a
+`scripts/verify.sh` runs 17 gates. It is ordered cheapest-and-most-likely-to-fail first, because a
 developer who waits four minutes to be told about a formatting problem stops running the script. It
 does **not** stop at the first failure — every stage runs and the summary lists all of them, so one
 CI round trip does not become five. Pass `--fail-fast` when iterating on a single stage,
@@ -575,8 +575,12 @@ CI round trip does not become five. Pass `--fail-fast` when iterating on a singl
 | 12 | `migrations` | Numbering, up/down pairing, RLS presence, destructive-change markers |
 | 13 | `secrets` | Credential, key and PAN patterns across the tree |
 | 14 | `licences` | No copyleft in the dependency graph |
+| 15 | `runbook-links` | Every alert's `runbook_url` resolves to a file under `docs/runbooks/`; every alert with `page: "true"` has one; every runbook is referenced or indexed |
+| 16 | `doc-references` | Every repo-relative path cited by a document under `docs/` or a root `*.md` exists. This is the check that catches a document promising a script that was never written |
+| 17 | `coverage` | The per-scope coverage floors of `docs/testing.md` §1.1, and the 36 critical-path properties of §1.2 — each must still name a test that exists. With `--fast`, only the registry half runs |
 
-Individual gates are also targets: `make check-arch`, `make check-contracts`, `make check-security`.
+Individual gates are also targets: `make check-arch`, `make check-contracts`, `make check-security`,
+`make check-runbooks`, `make check-docs`, `make critical-paths`.
 `make traceability` regenerates `docs/spec/09-traceability.md`.
 
 CI (`.github/workflows/ci.yml`) runs these as 15 jobs, adding SAST (CodeQL), `govulncheck`,
@@ -594,12 +598,12 @@ those has to justify its maintenance cost.
 
 | Level | Command | Build tag | Needs running services |
 |---|---|---|---|
-| Unit (pure domain, application with fakes) | `make test` (`go test ./... -short`) | none | **No** |
-| Unit with the race detector | `make test-race` | none | **No** |
-| Contract (gateway adapters, event schemas, JSON Schema compatibility) | `make test-contract` | `contract` (the tag is passed; the files carry no constraint, so they also run under `make test`) | **No** — the adapter suite runs against the in-process simulator |
-| Integration (real Postgres, Redis, Kafka) | `make test-integration` | `integration` | **Yes** — testcontainers, or `PP_TEST_POSTGRES_DSN` / `PP_TEST_REDIS_ADDR` / `PP_TEST_KAFKA_BROKERS` |
-| End-to-end (black-box, through the HTTP edge) | `make test-e2e` | `e2e` | **Yes** — `make dev-up` first, plus `PP_TEST_BASE_URL`, `PP_TEST_AUTH_TOKEN`, `PP_TEST_TENANT_ID`, `PP_TEST_SIMULATOR_URL` |
-| Chaos (fault injection, crash, partition, clock skew, retry storm) | `make test-chaos` | `chaos` | **Yes** — in-process port decorators always run; the destructive infrastructure scenarios need `PP_TEST_CHAOS_INFRA=1` |
+| Unit (pure domain, application and infrastructure with fakes) — 1 179 tests | `make test` (`go test ./... -short`) | none | **No** |
+| The same with the race detector | `make test-race` (`-race -count=1`) | none | **No** |
+| Contract (gateway adapters, event schemas, JSON Schema compatibility) — 50 tests | `make test-contract` | **none** — no tag is passed, deliberately: the suite reads committed schemas and drives adapters against stubbed transports, so it belongs in the cheapest stage and also runs under `make test` | **No** |
+| Integration (real Postgres, Redis, Kafka) — 66 tests | `make test-integration` | `integration` | **Yes** — services that are **already running**; there is no testcontainers dependency. Point `PP_TEST_POSTGRES_DSN` / `PP_TEST_REDIS_ADDR` / `PP_TEST_KAFKA_BROKERS` at them, or run `make dev-up` |
+| End-to-end (black-box, through the HTTP edge) — 6 tests | `make test-e2e` | `e2e` | **Yes** — `make dev-up` first, plus `PP_TEST_BASE_URL`, `PP_TEST_AUTH_TOKEN`, `PP_TEST_TENANT_ID`, `PP_TEST_SIMULATOR_URL` |
+| Chaos (fault injection, crash, partition, clock skew, retry storm) — 20 tests | `make test-chaos` | `chaos` | **Yes** — in-process port decorators always run; the destructive infrastructure scenarios need `PP_TEST_CHAOS_INFRA=1` |
 | Load (k6: steady-state, ramp, spike, soak) | `make loadtest SCENARIO=… BASE=… TOKEN=…` | n/a (JavaScript) | **Yes** — a deployed target |
 | Everything but chaos and load | `make test-all` | — | Yes (integration) |
 
@@ -607,9 +611,13 @@ those has to justify its maintenance cost.
 message names the exact variable and what it should contain. That is deliberate: a suite that fails
 on a laptop for want of a container teaches people to ignore red.
 
-`make cover` produces `coverage.out` and `coverage.html` and prints the total. Note that it
-*reports* rather than *blocks* and says so — the per-package gates of `docs/testing.md` §1.1 are
-enforced by `scripts/coverage.sh`, which is not present in this tree.
+`make cover` produces `coverage.out` and `coverage.html`, prints the total, and then runs
+`scripts/coverage.sh` against the profile it has just produced. That script **fails** on a drop
+below the per-scope floor and **warns** on the distance to the `docs/testing.md` §1.1 target,
+which every scope is currently below; `scripts/coverage.sh --enforce-targets` treats the target as
+the threshold and currently fails. It then checks that all 36 properties in
+[`tests/critical_paths.yaml`](tests/critical_paths.yaml) still name a test that exists —
+`make critical-paths` runs that half alone, in under a second.
 
 Full strategy, the named failure-scenario tests, the data policy and the flakiness policy:
 [`docs/testing.md`](docs/testing.md) and [`tests/README.md`](tests/README.md).
@@ -641,29 +649,33 @@ Measured against this tree, not estimated. Commands are given so any number can 
 
 | Metric | Value | How measured |
 |---|---:|---|
-| Go packages | 82 | `go list ./... \| wc -l` |
-| Go files | 470 | `find . -name '*.go' \| wc -l` |
-| — implementation | 310 files, **107 811 lines** | `find . -name '*.go' -not -name '*_test.go' \| xargs wc -l` |
-| — test | 160 files, **58 246 lines** | `find . -name '*_test.go' \| xargs wc -l` |
-| Total Go | 166 057 lines | sum of the two |
-| Test-to-implementation ratio | 0.54 : 1 | — |
-| Top-level test functions | **1 199** | `grep -rhc '^func Test' --include='*_test.go' .` (internal 1 116 · cmd 22 · tests 61) |
-| Benchmarks | 2 | `grep -rhc '^func Benchmark'` |
+| Go packages | 83 | `go list ./... \| wc -l` |
+| Go files | 478 | `find . -name '*.go' \| wc -l` |
+| — implementation | 311 files, **108 391 lines** | `find . -name '*.go' -not -name '*_test.go' \| xargs wc -l` |
+| — test | 167 files, **63 795 lines** | `find . -name '*_test.go' \| xargs wc -l` |
+| Total Go | 172 186 lines | sum of the two |
+| Test-to-implementation ratio | 0.59 : 1 | — |
+| Top-level test functions | **1 271** | `grep -rh '^func Test' --include='*_test.go' . \| wc -l` (internal 1 186 · tests 61 · cmd 22 · scripts 2 · pkg 0) |
+| — run by `go test ./...` (untagged) | 1 179 in 138 files | the rest are behind `integration` (66), `chaos` (20) and `e2e` (6) |
+| Benchmarks | 2 | `grep -rh '^func Benchmark' --include='*_test.go' . \| wc -l` |
+| Statement coverage, `go test ./... -short` | **57.9 %** overall; `internal/domain/payment` 97.2 %, `internal/domain/merchant` 99.3 % | `make cover`; per-scope figures in [`docs/testing.md`](docs/testing.md) §1.1 |
 | Deployable binaries | 9 | `ls cmd/` |
 | Gateway adapters | 4 (stripe, adyen, paypal, simulator) behind 1 SPI | `ls internal/adapters/gateway/` |
-| Build tags in use | `integration` (18 files), `chaos` (8), `e2e` (4), `temporal` (2), `grpc` (1), `tools` (1) | `grep -rh '^//go:build'` |
+| Build tags in use | `integration` (18 files), `chaos` (8), `e2e` (4), `temporal` (2), `grpc` (1), `tools` (1) | `grep -rh '^//go:build' --include='*.go' . \| sort \| uniq -c` |
 
 ### Contracts and data
 
 | Metric | Value | How measured |
 |---|---:|---|
-| OpenAPI document | 6 677 lines, **21 paths**, **36 operations** (26 REST + 10 webhook callbacks) | `grep -c 'operationId:' api/openapi/payments-platform.v1.yaml` |
-| Protobuf files | 6 | `find api/proto -name '*.proto'` |
-| Event JSON Schemas | **26** (25 `.v1` event types + 1 envelope) | `ls api/events/*.schema.json` |
-| Error codes | **97** | `grep -c '^  - code:' api/errors/catalog.yaml` |
+| OpenAPI document | 6 677 lines, **21 paths**, **36 operations** (26 path operations + 10 webhook callbacks) | `wc -l`, and `grep -c 'operationId:' api/openapi/payments-platform.v1.yaml` |
+| Protobuf files | 6 | `find api/proto -name '*.proto' \| wc -l` |
+| Event JSON Schemas | **26** (25 `.v1` event types + 1 envelope) | `ls api/events/*.schema.json \| wc -l` |
+| Error codes | **81**, plus 16 detail sub-codes | `python3 -c "import yaml;d=yaml.safe_load(open('api/errors/catalog.yaml'));print(len(d['codes']),len(d['detail_codes']))"`. Note that `grep -c '^  - code:'` returns 97 because it counts both lists |
 | Validation rules registered | **243** across L1–L7 (L1 38 · L2 40 · L3 28 · L4 44 · L5 48 · L6 22 · L7 23) | `docs/validation-plane.md` §3.8, asserted by `rules.Count()` |
 | Additional documented rule identifiers | 156 emitted directly by aggregates and invariant checks | `docs/validation-plane.md` §6 |
-| SQL migrations | **16** up/down pairs, 2 595 lines of forward SQL | `ls migrations/*.up.sql` |
+| SQL migrations | **16** up/down pairs, 2 595 lines of forward SQL | `ls migrations/*.up.sql \| wc -l`; `ls migrations/*.up.sql \| xargs wc -l` |
+| State machines with an exhaustive transition test | **10**, over 1 103 `(from, to)` pairs, 166 accepted and 937 rejected | [`docs/state-machines.md`](docs/state-machines.md) §16.2 |
+| Critical-path properties with a named test | **36**, 70 test references | `tests/critical_paths.yaml`, checked by `scripts/coverage.sh` |
 | Bounded contexts | 9 | baseline §3 |
 | Planes | 5 | baseline §2 ("Plane"), `docs/architecture.md` §2.2 |
 
@@ -671,134 +683,226 @@ Measured against this tree, not estimated. Commands are given so any number can 
 
 | Metric | Value | How measured |
 |---|---:|---|
-| Markdown documents under `docs/` | **67** | `find docs -name '*.md' \| wc -l` |
+| Markdown documents under `docs/` | **104** | `find docs -name '*.md' \| wc -l` |
+| — runbooks | **35** plus an index | `ls docs/runbooks/*.md \| wc -l` (36 including `README.md`) |
 | — normative specification documents | 8 (`docs/spec/`) | the baseline alone is 1 089 lines |
-| — architecture and plane documents | 18 (`docs/*.md`) | — |
-| — ADRs | **24 indexed**, 19 present as files (ADR-006…024); ADR-001…005 are index entries only | `ls docs/adr/` |
-| — diagram documents | 20 + an index | `ls docs/diagrams/` |
-| Markdown documents repository-wide | 79 | `find . -name '*.md' -not -path './.git/*'` |
-| Mermaid diagrams in `docs/diagrams/` | **42** | ` grep -c '^```mermaid' docs/diagrams/*.md` |
-| Mermaid diagrams across all of `docs/` | 120 | same, recursive |
-| Terraform files / modules / env stacks | 57 / 12 / 3 | `find terraform -name '*.tf'` |
-| Helm files / subcharts | 129 / 9 + `pp-common` + umbrella | `find helm -type f` |
-| Kubernetes + ArgoCD manifests | 28 files | `find deployments -type f` |
-| Make targets | **45** | `grep -cE '^[a-z][a-z0-9-]*:' Makefile` |
-| Shell scripts in `scripts/` | 17 (+2 Go tools: `archcheck`, `specdump`) | `ls scripts/*.sh` |
+| — architecture and plane documents | 18 plus `docs/README.md` | `ls docs/*.md \| wc -l` returns 19 |
+| — ADRs | **24 indexed**, 19 present as files (ADR-006…024); ADR-001…005 are index entries only | `ls docs/adr/*.md \| wc -l` returns 20, including the index |
+| — diagram documents | 20 + an index | `ls docs/diagrams/ \| wc -l` |
+| Markdown documents repository-wide | 119 | `find . -name '*.md' -not -path './.git/*' \| wc -l` |
+| Mermaid diagrams in `docs/diagrams/` | **42** | `grep -c '^```mermaid' docs/diagrams/*.md` summed |
+| Mermaid diagrams across all of `docs/` | 122 | same, recursive. All 122, plus the 3 in this file, parse under `mermaid.parse()` |
+| Terraform files / modules / env stacks | 57 / 12 / 3 | `find terraform -name '*.tf' \| wc -l`; `ls terraform/modules \| wc -l`; `ls terraform/envs` |
+| Helm files / subcharts | 129 / 9 + `pp-common` + umbrella | `find helm -type f \| wc -l`; `ls helm/charts` |
+| Kubernetes + ArgoCD manifests | 28 files | `find deployments -type f \| wc -l` |
+| Make targets | **51** | `grep -cE '^[a-z][a-z0-9-]*:' Makefile` |
+| Shell scripts in `scripts/` | 21 (+3 Go tools: `archcheck`, `specdump`, `devissuer`) | `ls scripts/*.sh \| wc -l` |
 | CI/CD workflows | 4 (`ci` with 15 jobs, `cd`, `codeql`, `nightly`) | `.github/workflows/` |
-| Verification gates in `make verify` | 14 | `scripts/verify.sh` |
+| Verification gates in `make verify` | **17** | `scripts/verify.sh` |
 
 ---
 
 ## Status and limitations
 
-**This is a reference implementation, built as a single deliverable. It has never processed real
-money, has never run in a production environment, and has never been assessed by a QSA.** The design
-is complete and internally consistent, the code compiles cleanly (`go build ./...` exits 0), and
-1 199 tests exist — but the following are real, specific gaps, and a reader should weigh them before
-treating any part of this as production-ready.
+**This is a reference implementation, delivered as a single body of work. It has never processed
+real money, has never run in a production environment, and has never been assessed by a QSA.** The
+design is complete and internally consistent, the module compiles clean (`go build ./...`,
+`go vet ./...` and `go test ./... -race` all exit 0), `golangci-lint run` reports **0 findings**,
+and **1 271** test functions exist — but the following are real, specific gaps, and a reader
+should weigh them before treating any part of this as production-ready.
 
 ### Build-tagged code that the default build does not compile
 
 - **The Temporal workflow adapter** (`internal/workflows/engine/temporal/temporal.go`) is behind
   `//go:build temporal` and **requires `go.temporal.io/sdk`, which is not in `go.mod`**. `go build
-  ./...` and `go test ./...` never see it. The decision is deliberate — the SDK pulls in a large
-  gRPC/protobuf surface that only one alternative engine implementation needs — but the consequence
-  is that the "the port keeps the build-vs-buy decision reversible" claim of
+  ./...` and `go test ./...` never see it, and **nothing in CI compiles it** — no job passes
+  `-tags temporal`. The decision is deliberate: the SDK pulls in a large gRPC/protobuf surface
+  that only one alternative engine implementation needs. The consequence is that the "the port
+  keeps the build-vs-buy decision reversible" claim of
   [ADR-014](docs/adr/ADR-014-owned-workflow-engine-behind-port.md) is **unverified by any build in
   this repository**. The default Postgres engine is fully built and tested.
 - **The gRPC service implementations** (`internal/transport/grpcapi/services.go`) are behind
-  `//go:build grpc` and compile only after `buf generate --template api/proto/buf.gen.yaml
-  api/proto` has produced the bindings, which are deliberately not committed. The gRPC *harness* —
-  interceptor chain, error mapping, health service, keepalive, graceful stop — carries no tag and is
-  always built, vetted and race-tested. `doc.go` states that CI runs codegen and then builds with
-  `-tags grpc`; **it does not.** There is no `buf` step in `.github/workflows/ci.yml`, so the tagged
-  file is currently compiled by nothing.
+  `//go:build grpc` pending protobuf codegen: they compile only after `buf generate` has produced
+  the bindings, which are deliberately not committed. **No CI job runs `buf generate`**, so the
+  tagged file is currently compiled by nothing. The gRPC *harness* — interceptor chain, error
+  mapping, health service, keepalive, graceful stop — carries no tag and is always built, vetted
+  and race-tested.
+
+### Two services cannot start locally, and one of the two defects also breaks production TLS
+
+`make run-outbox-relay` and `make run-event-consumer` cannot start. Two independent defects:
+
+1. **The environment sets do not intersect.** `isLocal` in
+   `internal/infrastructure/kafka/config.go` and `internal/infrastructure/redis/client.go` both
+   accept `local`, `test`, `development` or `dev`, and permit `PLAINTEXT`/`SASL_PLAINTEXT` only
+   when it returns true. `shared.ParseEnvironment` accepts only `sandbox` and `production`. The
+   two sets have **no intersection**, so plaintext is unreachable from any configuration the
+   platform will actually start with. This is why [`.env.dev`](.env.dev) leaves `PP_REDIS_ADDR`
+   empty and lets idempotency fall back to Postgres.
+2. **`kafka.Config.ClientOptions` sets both `kgo.Dialer` and `kgo.DialTLSConfig`.** franz-go
+   rejects that combination outright, so client construction fails — and this one is **not**
+   limited to local runs: it breaks `SSL` and `SASL_SSL`, which is what production configuration
+   uses.
+
+Both fixes are small — accept `sandbox` in both `isLocal`s, and drop the plain dialer when
+`DialTLSConfig` is set — and both are stated in [`.env.dev`](.env.dev) where a developer meets
+them. The other six `run-*` targets start.
+
+### Domain defects found by the state-machine audit
+
+Each of these is a genuine code defect, not a documentation gap; they are documented in
+[`docs/state-machines.md`](docs/state-machines.md) at the section that describes the machine.
+
+- **Multiple partial captures are impossible.** `CAPTURED → CAPTURED` is not a declared
+  self-transition, so a second `MarkCaptured` on an already-captured payment is refused with
+  `INVALID_STATE_TRANSITION` — *after* invariant I2's cumulative check has already passed, so the
+  error the caller sees is about the state machine rather than about the amount. Any configured
+  multiple-partial-capture limit above 1 is unreachable. (`docs/state-machines.md` §3.)
+- **A dispute won after settlement lands in `CAPTURED`, not `SETTLED`.**
+  `Payment.ResolveDispute(won=true)` decides between the two by scanning the aggregate's
+  **pending-event** slice for `payment.settled.v1`, and the repository drains that slice on every
+  write. A payment loaded from the database therefore always looks unsettled. (§3.)
+- **The documented bank-replacement recovery always fails.**
+  `merchant.ValidateBankAccount` special-cases `BANK_VALIDATION_FAILED` as a state to advance
+  from, but then attempts `→ BANK_VALIDATED`, which the transition table permits only from
+  `KYC_APPROVED`; from `BANK_VALIDATION_FAILED` the only forward edge is `→ KYC_APPROVED`. The
+  call is always refused — and it **mutates the bank-account record before** the refused
+  transition, so the aggregate is left with an account marked verified and a status that says
+  otherwise. (§2.1.)
+
+### Schema drift: three column constraints are narrower than their state machine
+
+`migrations/0013_state_guards.up.sql` seeds real transition tables for the payment and merchant
+machines, and `TestTransitionTablesMatchDomain` keeps those two honest. Nothing compares a
+machine's state universe with the `CHECK (… IN (…))` on its column, and three have drifted apart:
+
+| Column | Migration allows | The domain has | Cannot be persisted |
+|---|---:|---:|---|
+| `pp.gateway_connections.status` | 7 | 9 | `PROVISIONING_FAILED`, `CERTIFICATION_FAILED` |
+| `pp.workflow_instances.state` | 7 | 11 | `RETRY_BACKOFF`, `PARKED`, `POISONED`, `COMPENSATED`, `CANCELED` — and the migration allows `ABORTED`, which the domain does not define |
+| `pp.workflow_steps.state` | 8 | 13 | `TIMED_OUT`, `AMBIGUOUS`, `LEASE_LOST`, `RETRY_SCHEDULED`, `DLQ` — the entire retry and unknown-outcome path |
+
+In every case the states that cannot be persisted are the failure and recovery states, which is
+to say the ones that matter when something has gone wrong. A check comparing each machine's
+`States()` against its column constraint would catch all three and does not exist.
 
 ### Suites that need services and skip otherwise
 
-Integration, e2e and the destructive half of chaos require running Postgres/Redis/Kafka, a running
-stack, and in the e2e case a bearer token. They **skip with an explanatory message** when their
-environment variables are unset. That is the right default, but it also means a green `make test`
-says nothing about them, and the CI integration job is the only place they are known to have run.
+Integration (66 tests), e2e (6) and the destructive half of chaos require running
+Postgres/Redis/Kafka, a running stack, and in the e2e case a bearer token. They **skip with an
+explanatory message** naming the exact variable when it is unset. That is the right default — a
+suite that fails on a laptop for want of a container teaches people to ignore red — but it also
+means a green `make test` says nothing about those 92 tests, and the CI integration job is the
+only place they are known to have run.
 
 ### Infrastructure that was validated structurally but never applied
 
-Terraform was checked with `fmt -check`, `validate`, `tflint` and `checkov`; Helm and Kustomize
-output was rendered and validated by `helm/scripts/validate-manifests.py`. **Neither has ever been
-applied to a real cluster or a real AWS account.** No `terraform apply` has run, no chart has been
-installed, the ArgoCD `ApplicationSet` has never synced, and the DR drill (`make dr-drill`) has never
-executed against real infrastructure — it needs credentials for a `dr-verify` account that does not
-exist. Consequently the RPO ≤ 5 s / RTO ≤ 15 min targets in baseline §18 are **design targets, not
+Terraform was validated **structurally**: HCL2 parse, reference resolution, and module-input
+completeness. Helm and Kustomize were validated the same way: YAML parse, template balance, values
+resolution, and per-kind field assertions. **Neither has ever been applied to a real cluster or a
+real AWS account.** No `terraform apply` has run, no chart has been installed, the ArgoCD
+`ApplicationSet` has never synced, and the DR drill (`make dr-drill`) has never executed against
+real infrastructure — it needs credentials for a `dr-verify` account that does not exist. Note
+also that `terraform`, `helm` and `kubeconform` **could not be installed in the build
+environment**, so the structural validation above is what was possible, not what was preferred.
+Consequently the RPO ≤ 5 s / RTO ≤ 15 min targets in baseline §18 are **design targets, not
 measured results**.
+
+### Chaos scenarios that exist as design rather than as tests
+
+`tests/chaos/` covers 20 scenarios in-process against the real orchestrator and the real
+resilience primitives. Node loss, AZ loss, region loss, disk pressure, certificate expiry,
+Secrets Manager denial, KEDA scaling under outbox backlog and the combined-fault scenario need a
+cluster, and no cluster has ever run this. They are specified in
+[`docs/failure-handling.md`](docs/failure-handling.md) and
+[`docs/disaster-recovery.md`](docs/disaster-recovery.md) §9 and tested by nothing.
 
 ### Documented artifacts that do not exist
 
-Found while writing this README. Each is a place where a document promises something the tree does
-not contain:
+<!-- doc-refs: allow-missing begin -->
 
 | Referenced by | Missing artifact |
 |---|---|
-| — | *(resolved)* `docs/runbooks/` now holds 35 runbooks (RB-001…RB-035) plus an index, one per distinct `runbook_url`. `scripts/check-runbook-links.sh` asserts that no reference dangles and that no alert with `page: "true"` lacks a runbook. |
-| `docs/testing.md` §1.1, `Makefile` `cover` target | `scripts/coverage.sh` — the per-package coverage gates (95 % domain, 100 % idempotency/tenantctx) are therefore **not enforced by anything**. The `cover` target says so out loud rather than pretending. |
-| `docs/testing.md` §1.2 | `tests/critical_paths.yaml` and `scripts/mutation-probe.sh` — the 47-entry critical-path registry and the mutation-probe harness. The named test paths in the excerpt (`tests/chaos/gateway_timeout_test.go`, `tests/integration/tenancy_test.go`, `internal/domain/payment/refund_test.go`) also do not exist under those names. |
-| — | *(resolved)* `scripts/dev-token.sh` and `scripts/devissuer` exist; `deploy/docker-compose.dev.yml` and `scripts/dev-up.sh` start the issuer at the `:8088` that `config/dev.yaml` points `PP_AUTH_JWKS_URL` at. |
-| `api/errors/catalog.yaml` header | `pkg/apierror/codes_gen.go`, `docs/errors/`, and the `make docs-errors` / `make openapi-error-examples` targets. The catalogue is validated by `check-error-catalog.sh` but nothing is generated from it. |
-| baseline §25 | `pkg/otelx` — `pkg/` contains `apierror`, `ids` and `money` only. |
+| `docs/testing.md` §1.2 | `scripts/mutation-probe.sh` — the mutation-probe harness, and the `mutation_probes` key in the critical-path registry. §1.2 now says so and says what building it would take. The registry itself exists (`tests/critical_paths.yaml`, 36 entries) and is checked by `scripts/coverage.sh` |
+| `docs/testing.md` §9.3 | `scripts/flaky-gate.sh`, and the 30-day per-test results store the whole flakiness policy depends on. The nightly `flake-hunt` job is the one part that is real |
+| `docs/observability.md`, `docs/deployment.md` §4.1 | `scripts/metrics-lint.sh` and `scripts/check-logging.sh` — the metric-cardinality and logging fitness functions are `scripts/check-metrics-cardinality.sh` and the `.golangci.yml` rules respectively |
+| `docs/deployment.md`, `docs/runbooks/error-budget-policy.md` | `scripts/slo-gate.sh` — the error-budget gate is a policy, not a script |
+| baseline §25 | `pkg/otelx` — `pkg/` contains `apierror`, `ids` and `money` only |
+| `docs/events.md` | `scripts/check-event-compat.sh` — event compatibility is asserted by `tests/contract/compat_test.go` instead |
+
+<!-- doc-refs: allow-missing end -->
+
+`scripts/check-doc-references.sh` (the `doc-references` stage of `make verify`) now asserts that
+every repo-relative path cited by a document under `docs/` or by a root `*.md` resolves. The table
+above is the residue: artifacts a document deliberately reports as absent, marked so the check
+does not flag them.
 
 ### Test coverage that is thinner than the numbers suggest
 
-1 199 test functions is a real number, but it is unevenly distributed. Fifteen packages containing
-implementation code have **no test file at all**, and the list includes the two most important
-aggregates in the system:
+1 271 test functions is a real number, but it is unevenly distributed, and the overall statement
+coverage under `go test ./... -short` is **57.9 %**. Packages with implementation code and **no
+test file at all** include:
 
-- `internal/domain/payment` (the payment and attempt FSMs, refund arithmetic) — **no in-package
-  tests**
-- `internal/domain/merchant` (the merchant lifecycle FSM) — **no in-package tests**
-- `internal/domain/shared` (IDs, clock, primitives, the generic FSM) — none
-- `pkg/money`, `pkg/ids`, `pkg/apierror` — none. `Money` is the type baseline §7 says is "enforced
-  by the type system and by tests"; the tests are the half that is missing.
-- `internal/transport/httpapi` (router, decode, problem rendering) — none at that level, though
+- `internal/domain/shared` — IDs, clock, primitives, and the generic `StateMachine` that every FSM
+  in the platform is built from. Exercised only through its users
+- `pkg/money`, `pkg/ids`, `pkg/apierror` — **none**. `Money` is the type baseline §7 says is
+  "enforced by the type system and by tests"; the tests are the half that is missing, and
+  `docs/testing.md` §2.3 lists the five properties that ought to be asserted
+- `internal/transport/httpapi` — router, decode, problem rendering; none at that level, though
   `httpapi/handlers` is well covered
+- every `cmd/` composition root
 
-Both aggregates *are* exercised indirectly — by the L5/L6/L7 validation-rule suites, the
-application-layer orchestrator/service tests, and the Postgres integration tests — all of which run
-without services except the last. But there is no dedicated exhaustive transition table test for
-either FSM, which is precisely the test `docs/testing.md` §2.1 shows as the canonical example.
+The two aggregates the earlier version of this section listed as untested are no longer:
+`internal/domain/payment` is at **97.2 %** and `internal/domain/merchant` at **99.3 %**, with
+**70** test functions and **314** cases between them, including three exhaustive FSM property
+tests (`TestPaymentMachineAcceptsExactlyTheDeclaredEdges`,
+`TestAttemptMachineAcceptsExactlyTheDeclaredEdges`,
+`TestMerchantMachineAcceptsExactlyTheDeclaredEdges`).
+
+Per-scope coverage against the gates `docs/testing.md` §1.1 declares, all of which are below
+target: domain 80.5 % (target 95), application 52.5 % (90), validation 80.3 % (95), workflows
+57.7 % (85), adapters 54.0 % (80), infrastructure 53.2 % (70), repository overall 57.9 % (80).
+`scripts/coverage.sh` fails on a **drop** below the measured floor and warns on the distance to
+the target, so the gap is visible on every run rather than only in a document.
+
+### Requirements traceability
+
+**44 of 190 requirements remain untraced.** 31 are process or operational commitments with no code
+to point at — a runbook that must be followed, a review that must happen, an SLO that is a
+promise. The other **13 are real coverage gaps**: a requirement the design states and nothing in
+the tree demonstrably implements or tests. `docs/spec/09-traceability.md` names each one;
+`make traceability` regenerates it.
 
 ### Other known inconsistencies
 
-- **`make run-outbox-relay` and `make run-event-consumer` cannot start**, and neither can any
-  TLS-using Kafka client, including production's. Two independent defects in
-  `internal/infrastructure/kafka`:
-  1. `Config.isLocal` permits `PLAINTEXT`/`SASL_PLAINTEXT` only when the environment is `local`,
-     `test`, `development` or `dev`, while `runtime.ParseEnvironment` accepts only `sandbox` and
-     `production`. The two sets do not intersect, so plaintext is unreachable from any startable
-     configuration. `internal/infrastructure/redis` has the identical mismatch, which is why
-     `.env.dev` leaves `PP_REDIS_ADDR` empty and lets idempotency fall back to Postgres.
-  2. `Config.ClientOptions` sets both `kgo.Dialer` and `kgo.DialTLSConfig`; franz-go rejects that
-     combination outright ("cannot set both Dialer and DialTLSConfig"), so client construction
-     fails for `SSL` and `SASL_SSL` too.
-
-  The fixes are small — accept `sandbox` in both `isLocal`s, and drop the plain dialer when
-  `DialTLSConfig` is set — and both are stated in [`.env.dev`](.env.dev) where a developer meets
-  them. The other six `run-*` targets start.
 - **ADR-001 through ADR-005 have no files.** They are index entries in `docs/adr/README.md`
   describing pre-expansion decisions, explicitly recorded "for continuity". ADR-003's partial
   supersession by ADR-020 is therefore documented in the superseding record only.
 - **`docs/spec/` skips 07 and 08.** The sequence runs 00–06 then 09; the traceability matrix is 09.
-- `config/*.yaml` is read by no Go code and consumed by no chart or overlay. `config/README.md` now
+- `config/*.yaml` is read by no Go code and consumed by no chart or overlay. `config/README.md`
   says so at the top rather than describing a precedence order that nothing implements; the files
   document the shape of each environment's configuration, and `.env.dev` is what actually drives a
   local run.
+- The four state machines of `docs/state-machines.md` §12–§15 — onboarding case, idempotency
+  record, inbound webhook, reconciliation exception — have no `shared.StateMachine` table and
+  therefore no exhaustive property test. They are enforced by a column `CHECK` and by the SQL
+  each command issues.
+- The workflow instance and step machines have exhaustive tests, but those derive their
+  expectation from the machine itself rather than from an independent table, so they cannot catch
+  a wrong edge. `docs/state-machines.md` §16.2 marks them as such.
 
 ### What is genuinely solid
 
-For balance: the module compiles clean; the layering rule is enforced by an executable fitness
-function rather than by review; the idempotency, outbox, RLS, invariant and concurrency behaviours
-have real integration tests against real Postgres; the 243 validation rules are registered,
-documented and CI-checked for documentation; the OpenAPI contract is large, example-rich and
-breaking-change-diffed against `main`; and every ADR names the mechanical check that would catch its
-violation. The gaps above are gaps in *evidence and operations*, not in the design.
+For balance: the module compiles clean and `golangci-lint` reports zero findings; the layering
+rule is enforced by an executable fitness function rather than by review; the idempotency, outbox,
+RLS, invariant and concurrency behaviours have real integration tests against real Postgres; ten
+state machines are asserted exhaustively over 1 103 ordered pairs, eight of them against an
+independently transcribed expectation; the payment and merchant aggregates are near-fully covered;
+the 243 validation rules are registered, documented and CI-checked for documentation; the OpenAPI
+contract is large, example-rich and breaking-change-diffed against `main`; every ADR names the
+mechanical check that would catch its violation; and 36 named money-safety properties each point
+at a test that a build gate proves still exists. The gaps above are gaps in *evidence and
+operations*, and three specific domain defects — not gaps in the design.
 
 ---
 

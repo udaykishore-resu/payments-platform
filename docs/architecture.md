@@ -291,7 +291,7 @@ flowchart TB
         PORC["<b>payment-orchestrator</b><br/>payment FSM · routing · risk<br/>gateway calls · 99.99%<br/>scales on in-flight gateway calls"]
         WHI["<b>webhook-ingress</b><br/>accept-and-persist only<br/>≤50 ms · 99.99% · spiky"]
         REL["<b>outbox-relay</b><br/>Postgres → Kafka<br/>the ONLY publisher"]
-        EC["<b>event-consumer</b><br/>projections · ledger<br/>audit · notifications · reconciler"]
+        EC["<b>event-consumer</b><br/>runs the asynchronous webhook processor<br/>re-verifies · applies · posts the ledger<br/>further projections are specified, not yet wired"]
     end
 
     subgraph ops["OPS / TEST"]
@@ -303,7 +303,7 @@ flowchart TB
     RD[("Redis<br/>cache · token buckets<br/>idempotency mirror")]
     KF[("Kafka / MSK")]
     S3[("S3 · Object Lock")]
-    SM["Secrets Manager / KMS"]
+    SM["Secrets provider<br/>AWS Secrets Manager + KMS in production<br/>file backed in sandbox · one port, one chooser"]
 
     MER --> WAF --> PAPI
     TI --> WAF --> CPA
@@ -330,6 +330,8 @@ flowchart TB
     CPA --> SM
     PORC --> SM
     WW --> SM
+    WHI --> SM
+    EC --> SM
     EC --> S3
     WW --> S3
     PCTL --> PG
@@ -401,11 +403,12 @@ Every boundary is one shape or the other for a stated reason. "It was easier" is
 ```mermaid
 flowchart TB
     subgraph app["internal/application/payment · use cases (ports owned here)"]
-        UC1["CreatePayment"]
-        UC2["CapturePayment"]
-        UC3["RefundPayment"]
-        UC4["VoidPayment"]
-        UC5["ResolveAttempt<br/><i>reconciler entry point</i>"]
+        UC1["Service.Create → Orchestrator.Dispatch"]
+        UC2["Service.Capture → Orchestrator.CaptureExisting"]
+        UC3["Service.Refund → Orchestrator.RefundExisting"]
+        UC4["Service.Void → Orchestrator.VoidExisting"]
+        UC5["Reconciler<br/>ResolveUnknown · SweepExpiredAuthorizations · IngestSettlement"]
+        UC6["Supporting components<br/>context_loader · candidates · gateway_resolver<br/>risk_evaluator · velocity · validator"]
     end
 
     subgraph dom["internal/domain · stdlib only"]
@@ -429,17 +432,21 @@ flowchart TB
         P4["OutboxWriter"]
         P5["RiskScorer"]
         P6["Clock · IDGenerator"]
+        P7["SecretsProvider"]
     end
 
     subgraph adapters["internal/adapters + internal/infrastructure"]
         AD1["gateway/stripe"]
         AD2["gateway/adyen"]
         AD3["gateway/paypal"]
-        AD4["gateway/registry<br/>capability descriptors"]
+        AD5["gateway/simulator<br/>non-production"]
+        AD4["gateway/registry + gateway/spi<br/>factory set, port, capability descriptors"]
+        AD6["gateway/contract<br/>the suite every adapter is held to"]
         IN1["postgres.PaymentRepository"]
         IN2["redis.ConfigCache"]
-        IN3["resilience<br/>breaker · bulkhead · retry"]
-        IN4["httpx<br/>per-gateway tuned clients"]
+        IN3["resilience<br/>breaker · bulkhead · shedder · adaptive limiter"]
+        IN4["gateway/httpx<br/>per-gateway tuned clients"]
+        IN5["secrets<br/>file backend · AWS SecretsManager over in-package SigV4"]
     end
 
     UC1 --> PAY
@@ -458,21 +465,29 @@ flowchart TB
     PAY --> L7
     UC1 --> L6
 
+    UC1 --> UC6
+    UC1 --> P7
+
     P1 -.->|implemented by| IN1
     P2 -.->|implemented by| AD1
     P2 -.->|implemented by| AD2
     P2 -.->|implemented by| AD3
+    P2 -.->|implemented by| AD5
     P3 -.->|implemented by| IN2
+    P7 -.->|implemented by| IN5
     AD1 --> IN3
     AD1 --> IN4
     AD2 --> IN3
     AD2 --> IN4
     AD3 --> IN3
     AD3 --> IN4
+    AD6 -.->|asserts| P2
     AD4 --> RTE
 ```
 
 Note the direction of every dashed arrow: adapters point *at* ports. `internal/domain` has no outgoing arrow to anything outside itself.
+
+Two details this view is careful about. `Orchestrator` is separate from `Service` because the sequencing — T1 before T2, T3 as one transaction, `PermitsFailover` consulted on the attempt rather than the loop — *is* the product, and it is worth a type of its own that contains no gateway-specific logic at all. And `registry.BuiltIn` is the only place in the repository where the four gateways are named together: adding a fifth is one line there, not an edit to a switch statement in the orchestrator, and `registry_test.go` fails the build if such a switch reappears.
 
 ---
 
