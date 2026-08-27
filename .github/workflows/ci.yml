@@ -749,7 +749,7 @@ jobs:
             terraform -chdir="$d" validate
           done
 
-      - uses: terraform-linters/setup-tflint@v4
+      - uses: terraform-linters/setup-tflint@v6
         if: needs.prepare.outputs.has_terraform == 'true'
         with: { tflint_version: v0.55.0 }
 
