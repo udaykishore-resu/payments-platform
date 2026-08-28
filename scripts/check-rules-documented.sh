@@ -101,6 +101,17 @@ for r in reg:
 # what it finds, and D2 needs it to know which IDs exist. --no-source-scan silences D3's
 # report only, which is what its documented contract says it does.
 LIT = re.compile(r'"(L[1-7]\.[A-Z][A-Z0-9_]{2,})"')
+
+# The Go-wide marker for machine-written source, as specified by `go generate`. Generated
+# files are skipped because a rule ID inside one is never an emission: protoc copies the
+# .proto's comments into the .pb.go verbatim, so an ID cited as an *example* of the format
+# ("Stable rule identifier, e.g. \"L2.WEBSITE_NOT_REACHABLE\"") arrives here looking exactly
+# like a rule the server returns. Documenting it to satisfy this check would put a rule in the
+# catalogue that no validator can ever emit, which is a worse failure than the one being
+# silenced. Rule IDs that a generated file genuinely carries — an enum value, say — belong in
+# the .proto's own contract and are caught by check-error-catalog.
+GENERATED = re.compile(r"^// Code generated .* DO NOT EDIT\.$", re.MULTILINE)
+
 used = {}
 for root, dirs, files in os.walk("."):
     dirs[:] = [d for d in dirs
@@ -112,6 +123,8 @@ for root, dirs, files in os.walk("."):
         try:
             src = open(p, encoding="utf-8").read()
         except OSError:
+            continue
+        if GENERATED.search(src[:4096]):
             continue
         for m in LIT.finditer(src):
             used.setdefault(m.group(1), p)

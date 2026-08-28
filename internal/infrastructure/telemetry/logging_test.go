@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -129,6 +130,61 @@ func TestAllowlistNormalizesCamelCaseAliases(t *testing.T) {
 	}
 	if _, ok := line["gatewayId"]; ok {
 		t.Error("the camelCase spelling reached the output; there must be exactly one wire name")
+	}
+}
+
+// TestAllowlistKeepsTheConventionalErrorKey is the regression test for a defect that made every
+// ERROR line in the Postgres workflow engine useless.
+//
+// Those call sites write `log.ErrorContext(ctx, "lease acquisition failed", "error", err)` — the
+// spelling in the standard library's own examples. "error" was not a registered key, so the
+// allowlist dropped it, and the line that reached the operator said a lease acquisition had
+// failed and nothing whatsoever about why. Twice a second, indefinitely.
+func TestAllowlistKeepsTheConventionalErrorKey(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{"error", "err"} {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			acct := newFakeAccounting()
+			log := telemetry.NewLogger(&buf, telemetry.LogOptions{Metrics: acct})
+
+			log.Error("lease acquisition failed", key, errors.New("relation pp.workflow_instances does not exist"))
+
+			line := decodeLines(t, &buf)[0]
+			got, ok := line[telemetry.KeyErrorMessage]
+			if !ok {
+				t.Fatalf("%q did not reach the output as %s: %v", key, telemetry.KeyErrorMessage, line)
+			}
+			if s, _ := got.(string); !strings.Contains(s, "workflow_instances") {
+				t.Errorf("the error text was lost: %v", got)
+			}
+			if _, ok := line[key]; ok {
+				t.Errorf("the %q spelling reached the output; there must be exactly one wire name", key)
+			}
+			if fields := strings.Join(acct.rejectedFields(), ","); strings.Contains(fields, key) {
+				t.Errorf("%q was counted as rejected while also being emitted", key)
+			}
+		})
+	}
+}
+
+// TestAllowlistStillRefusesAnUnregisteredErrorLikeKey pins that the alias above is exactly two
+// spellings of one registered dimension, not a hole in the allowlist.
+func TestAllowlistStillRefusesAnUnregisteredErrorLikeKey(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	log := telemetry.NewLogger(&buf, telemetry.LogOptions{Metrics: newFakeAccounting()})
+	log.Error("x failed", "error_detail", "customer@example.com", "errors", "leak")
+
+	line := decodeLines(t, &buf)[0]
+	for _, forbidden := range []string{"error_detail", "errors"} {
+		if _, ok := line[forbidden]; ok {
+			t.Errorf("unregistered key %q was emitted", forbidden)
+		}
+	}
+	if strings.Contains(buf.String(), "customer@example.com") {
+		t.Fatalf("a dropped value still reached the output: %s", buf.String())
 	}
 }
 

@@ -1,18 +1,24 @@
 //go:build grpc
 
 // This file is built only after `buf generate` has produced the bindings for
-// api/proto/payments/v1. See doc.go for the command, the CI invocation and why the generated code
-// is not committed.
+// api/proto/payments/v1. See doc.go for the command and the CI invocation.
 //
-// It is written against the generated types as buf will name them: package `paymentsv1`, service
-// server interfaces `PaymentServiceServer`, `MerchantServiceServer`, `OnboardingServiceServer`,
+// It is written against the generated types: package `paymentsv1`, service server interfaces
+// `PaymentServiceServer`, `MerchantServiceServer`, `OnboardingServiceServer`,
 // `ConfigurationServiceServer` and `GatewayServiceServer`, each with an embedded
 // `Unimplemented…Server` for forward compatibility.
+//
+// Every RPC returns its own response message rather than the bare resource. That is not
+// ceremony: it is what lets an RPC grow a second return value — the routing plan on
+// CreatePayment, the idempotency replay marker on every unsafe operation, the snapshot age on
+// a configuration read — without a breaking change to the wire contract. The RPCs this file
+// does not implement are served by the embedded Unimplemented servers and return UNIMPLEMENTED.
 
 package grpcapi
 
 import (
 	"context"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -27,6 +33,7 @@ import (
 	domaingateway "github.com/udaykishore-resu/payments-platform/internal/domain/gateway"
 	"github.com/udaykishore-resu/payments-platform/internal/domain/merchant"
 	"github.com/udaykishore-resu/payments-platform/internal/domain/payment"
+	"github.com/udaykishore-resu/payments-platform/internal/domain/routing"
 	"github.com/udaykishore-resu/payments-platform/internal/domain/shared"
 	"github.com/udaykishore-resu/payments-platform/internal/platform/tenantctx"
 	"github.com/udaykishore-resu/payments-platform/pkg/apierror"
@@ -123,7 +130,7 @@ type paymentServer struct {
 // `state == PROCESSING`, not on the absence of an error: baseline §12.3's rule that no timer may
 // fail a payment applies identically on this transport.
 func (s *paymentServer) CreatePayment(ctx context.Context,
-	req *paymentsv1.CreatePaymentRequest) (*paymentsv1.Payment, error) {
+	req *paymentsv1.CreatePaymentRequest) (*paymentsv1.CreatePaymentResponse, error) {
 	tc, err := tenantctx.FromContext(ctx)
 	if err != nil {
 		return nil, Status(err)
@@ -150,19 +157,27 @@ func (s *paymentServer) CreatePayment(ctx context.Context,
 		StatementRef:   req.GetStatementDescriptor(),
 		Reference:      req.GetReference(),
 		Metadata:       req.GetMetadata(),
-		IdempotencyKey: req.GetIdempotencyKey(),
+		IdempotencyKey: req.GetIdempotency().GetKey(),
 		CorrelationID:  correlationIDFrom(ctx),
 		RequestID:      requestIDFrom(ctx),
 	})
 	if err != nil {
 		return nil, Status(err)
 	}
-	return paymentProto(res.Payment), nil
+	return &paymentsv1.CreatePaymentResponse{
+		Payment:     paymentProto(res.Payment),
+		RoutingPlan: routingPlanProto(res.Plan, merchantID),
+	}, nil
 }
 
 // GetPayment implements the read.
+//
+// include_routing_plan is honoured by omission rather than by ignoring it: this narrowing of the
+// application service does not load the plan, so the field stays unset and a caller that needs it
+// calls GetRoutingPlan. Returning a plan-shaped zero value would be worse — it reads as "no
+// candidates were considered", which is a specific and different fact.
 func (s *paymentServer) GetPayment(ctx context.Context,
-	req *paymentsv1.GetPaymentRequest) (*paymentsv1.Payment, error) {
+	req *paymentsv1.GetPaymentRequest) (*paymentsv1.GetPaymentResponse, error) {
 	id, err := shared.ParsePaymentID(req.GetPaymentId())
 	if err != nil {
 		return nil, Status(err)
@@ -171,7 +186,7 @@ func (s *paymentServer) GetPayment(ctx context.Context,
 	if err != nil {
 		return nil, Status(err)
 	}
-	return paymentProto(p), nil
+	return &paymentsv1.GetPaymentResponse{Payment: paymentProto(p)}, nil
 }
 
 // ListPayments implements the cursor-paginated listing.
@@ -186,13 +201,15 @@ func (s *paymentServer) ListPayments(ctx context.Context,
 		filter.MerchantID = id
 	}
 	items, next, err := s.svc.List(ctx, filter, ports.Page{
-		Limit:  int(req.GetLimit()),
-		Cursor: req.GetCursor(),
+		Limit:  int(req.GetPage().GetPageSize()),
+		Cursor: req.GetPage().GetPageToken(),
 	})
 	if err != nil {
 		return nil, Status(err)
 	}
-	out := &paymentsv1.ListPaymentsResponse{NextCursor: next}
+	out := &paymentsv1.ListPaymentsResponse{
+		Page: &paymentsv1.PageResponse{NextPageToken: next},
+	}
 	for _, p := range items {
 		out.Payments = append(out.Payments, paymentProto(p))
 	}
@@ -201,7 +218,7 @@ func (s *paymentServer) ListPayments(ctx context.Context,
 
 // CapturePayment converts an authorization hold into a debit.
 func (s *paymentServer) CapturePayment(ctx context.Context,
-	req *paymentsv1.CapturePaymentRequest) (*paymentsv1.Payment, error) {
+	req *paymentsv1.CapturePaymentRequest) (*paymentsv1.CapturePaymentResponse, error) {
 	id, tc, err := paymentTarget(ctx, req.GetPaymentId())
 	if err != nil {
 		return nil, Status(err)
@@ -219,18 +236,18 @@ func (s *paymentServer) CapturePayment(ctx context.Context,
 		PaymentID:      id,
 		Amount:         amount,
 		Final:          req.GetIsFinalCapture(),
-		IdempotencyKey: req.GetIdempotencyKey(),
+		IdempotencyKey: req.GetIdempotency().GetKey(),
 		CorrelationID:  correlationIDFrom(ctx),
 	})
 	if err != nil {
 		return nil, Status(err)
 	}
-	return paymentProto(res.Payment), nil
+	return &paymentsv1.CapturePaymentResponse{Payment: paymentProto(res.Payment)}, nil
 }
 
 // RefundPayment returns money to the payer.
 func (s *paymentServer) RefundPayment(ctx context.Context,
-	req *paymentsv1.RefundPaymentRequest) (*paymentsv1.Payment, error) {
+	req *paymentsv1.RefundPaymentRequest) (*paymentsv1.RefundPaymentResponse, error) {
 	id, tc, err := paymentTarget(ctx, req.GetPaymentId())
 	if err != nil {
 		return nil, Status(err)
@@ -248,18 +265,21 @@ func (s *paymentServer) RefundPayment(ctx context.Context,
 		PaymentID:      id,
 		Amount:         amount,
 		Reason:         refundReasonOf(req.GetReason()),
-		IdempotencyKey: req.GetIdempotencyKey(),
+		IdempotencyKey: req.GetIdempotency().GetKey(),
 		CorrelationID:  correlationIDFrom(ctx),
 	})
 	if err != nil {
 		return nil, Status(err)
 	}
-	return paymentProto(res.Payment), nil
+	return &paymentsv1.RefundPaymentResponse{
+		Payment: paymentProto(res.Payment),
+		Refund:  latestRefundProto(res.Payment),
+	}, nil
 }
 
 // VoidPayment reverses an authorization hold before capture.
 func (s *paymentServer) VoidPayment(ctx context.Context,
-	req *paymentsv1.VoidPaymentRequest) (*paymentsv1.Payment, error) {
+	req *paymentsv1.VoidPaymentRequest) (*paymentsv1.VoidPaymentResponse, error) {
 	id, tc, err := paymentTarget(ctx, req.GetPaymentId())
 	if err != nil {
 		return nil, Status(err)
@@ -267,13 +287,13 @@ func (s *paymentServer) VoidPayment(ctx context.Context,
 	res, err := s.svc.Void(ctx, apppayment.VoidCommand{
 		TenantID:       tc.TenantID,
 		PaymentID:      id,
-		IdempotencyKey: req.GetIdempotencyKey(),
+		IdempotencyKey: req.GetIdempotency().GetKey(),
 		CorrelationID:  correlationIDFrom(ctx),
 	})
 	if err != nil {
 		return nil, Status(err)
 	}
-	return paymentProto(res.Payment), nil
+	return &paymentsv1.VoidPaymentResponse{Payment: paymentProto(res.Payment)}, nil
 }
 
 type merchantServer struct {
@@ -283,7 +303,7 @@ type merchantServer struct {
 
 // GetMerchant reads one merchant within the caller's tenant.
 func (s *merchantServer) GetMerchant(ctx context.Context,
-	req *paymentsv1.GetMerchantRequest) (*paymentsv1.Merchant, error) {
+	req *paymentsv1.GetMerchantRequest) (*paymentsv1.GetMerchantResponse, error) {
 	tc, err := tenantctx.FromContext(ctx)
 	if err != nil {
 		return nil, Status(err)
@@ -296,7 +316,7 @@ func (s *merchantServer) GetMerchant(ctx context.Context,
 	if err != nil {
 		return nil, Status(err)
 	}
-	return merchantProto(m), nil
+	return &paymentsv1.GetMerchantResponse{Merchant: merchantProto(m)}, nil
 }
 
 // ListMerchants reads a cursor-paginated page of the tenant's merchants.
@@ -307,11 +327,13 @@ func (s *merchantServer) ListMerchants(ctx context.Context,
 		return nil, Status(err)
 	}
 	items, next, err := s.svc.List(ctx, tc.TenantID, ports.MerchantFilter{},
-		ports.Page{Limit: int(req.GetLimit()), Cursor: req.GetCursor()})
+		ports.Page{Limit: int(req.GetPage().GetPageSize()), Cursor: req.GetPage().GetPageToken()})
 	if err != nil {
 		return nil, Status(err)
 	}
-	out := &paymentsv1.ListMerchantsResponse{NextCursor: next}
+	out := &paymentsv1.ListMerchantsResponse{
+		Page: &paymentsv1.PageResponse{NextPageToken: next},
+	}
 	for _, m := range items {
 		out.Merchants = append(out.Merchants, merchantProto(m))
 	}
@@ -325,12 +347,15 @@ type onboardingServer struct {
 
 // GetOnboardingCase reads a workflow instance's current state.
 func (s *onboardingServer) GetOnboardingCase(ctx context.Context,
-	req *paymentsv1.GetOnboardingCaseRequest) (*paymentsv1.OnboardingCase, error) {
+	req *paymentsv1.GetOnboardingCaseRequest) (*paymentsv1.GetOnboardingCaseResponse, error) {
 	tc, err := tenantctx.FromContext(ctx)
 	if err != nil {
 		return nil, Status(err)
 	}
-	id, err := shared.ParseWorkflowID(req.GetWorkflowInstanceId())
+	// case_id and the workflow instance identifier are the same value in this implementation:
+	// the case IS the workflow instance, and giving it a second identifier would create two
+	// names for one row and a reconciliation problem between them.
+	id, err := shared.ParseWorkflowID(req.GetCaseId())
 	if err != nil {
 		return nil, Status(err)
 	}
@@ -338,7 +363,7 @@ func (s *onboardingServer) GetOnboardingCase(ctx context.Context,
 	if err != nil {
 		return nil, Status(err)
 	}
-	return caseProto(c), nil
+	return &paymentsv1.GetOnboardingCaseResponse{OnboardingCase: caseProto(c)}, nil
 }
 
 type configServer struct {
@@ -348,7 +373,7 @@ type configServer struct {
 
 // GetActiveConfiguration reads a merchant's live desired-state document.
 func (s *configServer) GetActiveConfiguration(ctx context.Context,
-	req *paymentsv1.GetActiveConfigurationRequest) (*paymentsv1.ConfigurationVersion, error) {
+	req *paymentsv1.GetActiveConfigurationRequest) (*paymentsv1.GetActiveConfigurationResponse, error) {
 	tc, err := tenantctx.FromContext(ctx)
 	if err != nil {
 		return nil, Status(err)
@@ -361,7 +386,11 @@ func (s *configServer) GetActiveConfiguration(ctx context.Context,
 	if err != nil {
 		return nil, Status(err)
 	}
-	return configProto(c), nil
+	// snapshot_age_ms is left at zero because this read goes to the store, not to a cached
+	// snapshot: the document is as fresh as the query. A non-zero age here would have to be
+	// invented, and an invented staleness figure is the one number an operator must be able to
+	// trust during a configuration incident (baseline §23.4).
+	return &paymentsv1.GetActiveConfigurationResponse{Configuration: configProto(c)}, nil
 }
 
 type gatewayServer struct {
@@ -376,7 +405,10 @@ func (s *gatewayServer) ListGateways(ctx context.Context,
 	if err != nil {
 		return nil, Status(err)
 	}
-	out := &paymentsv1.ListGatewaysResponse{}
+	// The catalogue is platform-global and small enough to return whole, so the page token is
+	// always empty. Callers still read it, which is what lets the catalogue grow a cursor later
+	// without a client change.
+	out := &paymentsv1.ListGatewaysResponse{Page: &paymentsv1.PageResponse{}}
 	for _, g := range items {
 		out.Gateways = append(out.Gateways, gatewayProto(g))
 	}
@@ -487,9 +519,88 @@ func caseProto(c *apponboarding.Case) *paymentsv1.OnboardingCase {
 		Id:                 c.WorkflowID.String(),
 		MerchantId:         c.MerchantID.String(),
 		WorkflowInstanceId: c.WorkflowID.String(),
-		CurrentStepKey:     c.CurrentStep,
+		WorkflowName:       c.Definition,
+		CurrentStepKey:     stepKeyProto(c.CurrentStep),
+		Version:            int64(c.Version),
 		OpenedAt:           timestamppb.New(c.CreatedAt),
 	}
+}
+
+// stepKeyProto maps the saga's step name onto the wire enum.
+//
+// The saga names steps in kebab-case ("sandbox-validation") because that is what reads well in a
+// definition file and in a log line; the enum is SCREAMING_SNAKE because that is what protobuf
+// requires. An unrecognised step maps to UNSPECIFIED rather than being dropped or guessed: a step
+// added to the saga before the .proto is regenerated must be visibly unknown to a consumer, not
+// silently reported as some other step.
+func stepKeyProto(step string) paymentsv1.OnboardingStepKey {
+	if step == "" {
+		return paymentsv1.OnboardingStepKey_ONBOARDING_STEP_KEY_UNSPECIFIED
+	}
+	name := "ONBOARDING_STEP_KEY_" + strings.ToUpper(strings.ReplaceAll(step, "-", "_"))
+	if v, ok := paymentsv1.OnboardingStepKey_value[name]; ok {
+		return paymentsv1.OnboardingStepKey(v)
+	}
+	return paymentsv1.OnboardingStepKey_ONBOARDING_STEP_KEY_UNSPECIFIED
+}
+
+// latestRefundProto renders the refund a RefundPayment call just created.
+//
+// It reads the last element rather than searching by identifier because the aggregate appends
+// refunds in creation order and the application service has just appended this one. If that
+// ordering ever stops holding, the aggregate's own invariants break first and much more loudly.
+func latestRefundProto(p *payment.Payment) *paymentsv1.Refund {
+	if p == nil {
+		return nil
+	}
+	refunds := p.Refunds()
+	if len(refunds) == 0 {
+		return nil
+	}
+	r := refunds[len(refunds)-1]
+	return &paymentsv1.Refund{
+		Id:            r.ID().String(),
+		PaymentId:     p.ID().String(),
+		Amount:        moneyProto(r.Amount()),
+		State:         paymentsv1.RefundState(paymentsv1.RefundState_value["REFUND_STATE_"+string(r.Status())]),
+		RefundedTotal: moneyProto(p.RefundedAmount()),
+		CapturedTotal: moneyProto(p.CapturedAmount()),
+		CreatedAt:     timestamppb.New(r.CreatedAt()),
+	}
+}
+
+// routingPlanProto renders the decision that produced the dispatch.
+//
+// Both selections and rejections become candidates, distinguished by `eligible` and by a rank of
+// zero on the rejected ones. Returning only the selections would make the plan an account of what
+// happened rather than a record of what was decided, and "why was gateway X not used" is the
+// question this message exists to answer.
+func routingPlanProto(p *routing.Plan, merchantID shared.MerchantID) *paymentsv1.RoutingPlan {
+	if p == nil {
+		return nil
+	}
+	out := &paymentsv1.RoutingPlan{
+		Id:         p.ID.String(),
+		MerchantId: merchantID.String(),
+		PaymentId:  p.PaymentID.String(),
+		Strategy:   string(p.Strategy),
+		DecidedAt:  timestamppb.New(p.CreatedAt),
+	}
+	for _, sel := range p.Selections() {
+		out.Candidates = append(out.Candidates, &paymentsv1.RoutingCandidate{
+			GatewayId: sel.GatewayID.String(),
+			Rank:      int32(sel.Rank),
+			Score:     sel.Score,
+			Eligible:  true,
+		})
+	}
+	for _, rej := range p.Rejections() {
+		out.Candidates = append(out.Candidates, &paymentsv1.RoutingCandidate{
+			GatewayId: rej.GatewayID.String(),
+			Eligible:  false,
+		})
+	}
+	return out
 }
 
 func configProto(c *domainconfig.MerchantConfig) *paymentsv1.ConfigurationVersion {

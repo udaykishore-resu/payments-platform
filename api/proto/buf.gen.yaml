@@ -5,11 +5,19 @@ version: v2
 # Run from `api/proto`:
 #   buf generate
 #
-# Output lands in the repository root's `api/proto/payments/v1` Go package path, which
-# matches the `go_package` option in every .proto file. Generated files are committed:
-# a build that regenerates protobuf output cannot be reproduced from a tag alone once a
-# plugin version drifts, and reviewers should be able to see the wire shape change in
-# the diff that changes it.
+# `out: .` is relative to this file, and `paths=source_relative` then places each file
+# beside its .proto — `payments/v1/payment.proto` becomes `payments/v1/payment.pb.go`,
+# which is the directory the `go_package` option in every .proto names. Do not change
+# `out` to `../..` without also dropping `source_relative`: the two settings together
+# decide the output path, and getting them out of step writes the whole tree into the
+# repository root.
+#
+# Generated files are committed. A build that regenerates protobuf output cannot be
+# reproduced from a tag alone once a plugin version drifts, reviewers should be able to
+# see the wire shape change in the diff that changes it, and — the practical reason —
+# `go mod tidy` loads every package in the module regardless of build tags, so an
+# uncommitted generated package makes `tidy` fail for everyone whether or not they build
+# with `-tags grpc`.
 managed:
   enabled: true
   override:
@@ -24,28 +32,27 @@ managed:
       path: payments/v1
 
 plugins:
-  # Message types.
-  - remote: buf.build/protocolbuffers/go:v1.36.4
-    out: ../..
+  # Message types. Pinned to the same version as the google.golang.org/protobuf runtime
+  # in go.mod — generated code and runtime are a matched pair, and a plugin newer than
+  # the runtime emits calls the runtime does not have.
+  - remote: buf.build/protocolbuffers/go:v1.36.5
+    out: .
     opt:
       - paths=source_relative
 
   # Service stubs.
   - remote: buf.build/grpc/go:v1.5.1
-    out: ../..
+    out: .
     opt:
       - paths=source_relative
       - require_unimplemented_servers=true
 
-  # Runtime validation generated from the same source of truth as the docs, so a field
-  # constraint cannot drift between the contract and the server.
-  - remote: buf.build/bufbuild/validate-go:v1.2.1
-    out: ../..
-    opt:
-      - paths=source_relative
-
-  # A descriptor set for the schema registry, the gRPC reflection service and the
-  # contract tests in `tests/contract`.
-  - local: protoc-gen-descriptor-set
-    out: ../../build/descriptors
-    strategy: all
+# There is deliberately no validate-go plugin here. Field constraints are expressed in
+# the validation plane (internal/validation), which enforces them identically for REST
+# and gRPC and emits the platform's own rule IDs; generating a second, weaker check from
+# protobuf annotations would give two answers to "is this request valid" and only one of
+# them would appear in the validation report.
+#
+# A descriptor set for the schema registry and the contract tests is produced by
+# `buf build -o build/descriptors/payments.binpb`, not by a plugin — it is an artifact of
+# the module, not of code generation.

@@ -15,6 +15,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"net"
 	"os"
 	"runtime"
 	"strconv"
@@ -213,10 +214,11 @@ func (c Config) Validate() error {
 		// The velocity counters and the idempotency accelerator carry tenant and merchant
 		// identifiers. Those are not secrets, but they are tenant data crossing a network, and
 		// "it is only a cache" is how an unencrypted channel gets justified.
-		bad(EnvTLS, "TLS may not be disabled outside a local environment")
+		bad(EnvTLS, "TLS may not be disabled for a non-loopback address; "+
+			"plaintext is permitted only when the connection stays on this host")
 	}
 	if c.InsecureSkipVerify && !local {
-		bad(EnvInsecure, "certificate verification may not be disabled outside a local environment")
+		bad(EnvInsecure, "certificate verification may not be disabled for a non-loopback address")
 	}
 	if c.PoolSize < 1 {
 		bad(EnvPoolSize, "must be at least 1")
@@ -239,9 +241,56 @@ func (c Config) Validate() error {
 	return apierror.New(apierror.CodeConfigurationInvalid, "redis configuration is invalid").WithDetails(details...)
 }
 
+// isLocal reports whether this configuration describes a connection that never leaves the host,
+// which is the only condition under which the TLS requirement is relaxed.
+//
+// It used to compare the environment's *name* against "local", "test", "development" and "dev".
+// That was unworkable, and the way it failed is worth keeping written down. runtime.ParseEnvironment
+// accepts only "sandbox" and "production", and runtime.OpenRedis assigns what it produced straight
+// onto Config.Environment — so none of the four names this function accepted could ever be present
+// on a running service. The two vocabularies did not intersect, which left no startable
+// configuration in which a developer could run a plaintext Redis on their own machine:
+//
+//	PP_REDIS_TLS=false  →  "TLS may not be disabled outside a local environment"
+//	PP_REDIS_TLS=true   →  every operation fails a handshake against a plaintext container
+//
+// The documented workaround — set PLATFORM_ENVIRONMENT — was dead: that variable is read only by
+// ConfigFromEnv, which the services do not call. So local development ran with Redis switched off
+// entirely, and a fallback path meant to cover an incident became the everyday configuration.
+//
+// The rule now tests the property the control actually cares about. TLS is required here because
+// velocity counters and idempotency keys carry tenant and merchant identifiers: not secrets, but
+// tenant data crossing a network. A loopback address crosses no network, so the rationale does not
+// apply — and anything else does, whatever the environment is called. That is a strictly tighter
+// rule than the one it replaces, which would have permitted plaintext to a remote host in any
+// environment named "dev".
+//
+// Production is refused regardless of the address. A loopback Redis in production is a sidecar,
+// and a sidecar carrying tenant data over plaintext is a decision that needs a review, not a
+// predicate in a config validator.
 func (c Config) isLocal() bool {
-	e := strings.ToLower(c.Environment)
-	return e == "local" || e == "test" || e == "development" || e == "dev"
+	if strings.EqualFold(strings.TrimSpace(c.Environment), "production") {
+		return false
+	}
+	return addrIsLoopback(c.Addr)
+}
+
+// addrIsLoopback reports whether a host:port names this machine.
+//
+// A hostname other than "localhost" is not resolved. Resolution would make the answer depend on
+// DNS at validation time, so a name that resolves to 127.0.0.1 on a laptop and to a shared cache
+// in a cluster would validate identically in both — and the one place that must not happen is a
+// control deciding whether tenant data may cross a network in the clear.
+func addrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 // TLSConfig builds the tls.Config, loading a private CA bundle when configured.

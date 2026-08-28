@@ -68,6 +68,68 @@ func TestRedisLocalMayDisableTLS(t *testing.T) {
 	}
 }
 
+// TestRedisPlaintextIsPermittedByAddressNotByEnvironmentName pins the property that makes local
+// development possible at all.
+//
+// The predicate used to compare Config.Environment against "local", "test", "development" and
+// "dev". runtime.ParseEnvironment produces only "sandbox" and "production", and runtime.OpenRedis
+// assigns that onto Config.Environment, so the branch was unreachable and a developer had no way
+// to run a plaintext Redis on their own machine. Every case below would have failed the old
+// predicate; the first is the one that was impossible.
+func TestRedisPlaintextIsPermittedByAddressNotByEnvironmentName(t *testing.T) {
+	t.Parallel()
+	for _, addr := range []string{"localhost:6379", "127.0.0.1:6379", "[::1]:6379"} {
+		t.Run(addr, func(t *testing.T) {
+			t.Parallel()
+			c := DefaultConfig()
+			c.Addr = addr
+			c.TLS = false
+			c.Environment = "sandbox" // what runtime.ParseEnvironment actually produces
+			if err := c.Validate(); err != nil {
+				t.Fatalf("plaintext to a loopback address was rejected in sandbox: %v", err)
+			}
+		})
+	}
+}
+
+// TestRedisPlaintextIsRefusedOffHost is the other half, and it is the half that matters: the new
+// rule must be TIGHTER than the one it replaced, not merely different. The old predicate would
+// have accepted every case here as long as the environment happened to be named "dev".
+func TestRedisPlaintextIsRefusedOffHost(t *testing.T) {
+	t.Parallel()
+	cases := map[string]func(*Config){
+		"remote host in sandbox": func(c *Config) {
+			c.Environment = "sandbox"
+			c.Addr = "redis.internal:6379"
+		},
+		"remote host in an environment named dev": func(c *Config) {
+			c.Environment = "dev"
+			c.Addr = "redis.internal:6379"
+		},
+		"loopback in production": func(c *Config) {
+			c.Environment = "production"
+			c.Addr = "127.0.0.1:6379"
+		},
+		// A docker-compose service name resolves to a container on a bridge network. It is not
+		// this host, and it must not read as one.
+		"compose service name": func(c *Config) {
+			c.Environment = "sandbox"
+			c.Addr = "redis:6379"
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := DefaultConfig()
+			c.TLS = false
+			mutate(&c)
+			if err := c.Validate(); err == nil {
+				t.Fatalf("Validate accepted plaintext for %s", name)
+			}
+		})
+	}
+}
+
 func TestRedisConfigNeverRendersThePassword(t *testing.T) {
 	t.Parallel()
 	c := prodRedisConfig()

@@ -4,11 +4,22 @@
 // # Build constraint
 //
 // The adapter itself — temporal.go — carries `//go:build temporal` and **compiles only with
-// `-tags temporal`**, after `go get go.temporal.io/sdk`. The default build of this repository
-// deliberately excludes it and does not depend on the Temporal SDK: the module is pinned, the
-// SDK pulls in a large gRPC and protobuf surface, and a dependency that only one alternative
-// implementation needs should not be in every binary's supply chain. `go build ./...` and
-// `go test ./...` therefore see only this file and contract.go, both of which are SDK-free.
+// `-tags temporal`**. `go build ./...` and `go test ./...` see only this file and contract.go,
+// both of which are SDK-free, and no binary in this repository links the Temporal SDK unless it
+// is built with that tag.
+//
+// The SDK is nevertheless a requirement in go.mod, and the distinction matters. `go mod tidy`
+// loads every package in the module regardless of build tags: a tagged file importing a module
+// that is not required makes `tidy` fail for every developer, including ones who will never
+// build with `-tags temporal`. The requirement is what keeps `tidy` working; the build tag is
+// what keeps the SDK out of the compiled binaries. What the requirement does cost is download
+// time — `go mod download` in a Docker builder stage fetches the whole build list, SDK included,
+// whether or not the tag is set.
+//
+// Removing that cost means moving this package into a nested module with its own go.mod, which
+// takes it out of the parent's package graph entirely. That is the right end state and it is not
+// free: contract.go, which both engines import, would have to move to a package of its own
+// first, since a nested module cannot be imported by its parent.
 //
 // The point of the port is that `internal/workflows/onboarding` — the definition and its twelve
 // activities — is **unchanged** between the two implementations. Switching costs an adapter and
@@ -122,14 +133,18 @@
 //
 // # What is in this package
 //
+//   - go.mod: the module boundary. Read its header comment first — it is the reason the platform
+//     does not depend on the Temporal SDK, and it records what happened when it did.
 //   - doc.go (this file, no build tag): the mapping and the decision criteria.
-//   - contract.go (no build tag): EngineContractSuite, the behavioural contract **both**
-//     implementations must satisfy. It imports `testing` from a non-test file on purpose, the
-//     same way net/http/httptest does, so that an implementation in any package can run it. It
-//     does not import the Temporal SDK.
 //   - temporal.go (`//go:build temporal`): the adapter, written against the real
 //     go.temporal.io/sdk client, workflow, activity and worker APIs.
 //   - temporal_guard_test.go (`//go:build temporal`): a compile-time assertion that the adapter
 //     satisfies engine.Engine, so a signature change in the port breaks the tagged build rather
 //     than being discovered the day someone tries to switch.
+//
+// The behavioural contract both implementations must satisfy — EngineContractSuite — is NOT
+// here. It lives in [github.com/udaykishore-resu/payments-platform/internal/workflows/engine/enginetest],
+// which is where it always belonged: a contract that lives inside one implementation is not a
+// contract, and this one had to move out anyway before the module boundary was possible, because
+// a nested module cannot be imported by its parent and engine/postgres imports the suite.
 package temporal

@@ -91,7 +91,43 @@ info "starting containers"
 # A container with no healthcheck reports "" from the inspect below. Treating that as
 # healthy would silently exempt any service someone forgets to give a probe, so the list of
 # services expected to have one is explicit.
-HEALTH_GATED=(postgres redis redpanda gateway-simulator dev-issuer otel-collector prometheus)
+# Services gated on the container's own healthcheck.
+HEALTH_GATED=(postgres redis redpanda prometheus)
+
+# Services gated on an HTTP probe from the host, as "name|url".
+#
+# These three run from shell-less images — two distroless Go binaries of ours and the upstream
+# OTel collector — so `CMD-SHELL` cannot execute inside them and there is no wget or curl to
+# exec. A compose healthcheck that cannot run does not report "unknown": it reports *unhealthy*,
+# forever, while the service serves traffic perfectly well. That is a worse failure than having
+# no healthcheck, because it is indistinguishable from a real outage.
+#
+# Probing from the host is honest about what is being checked — the port a developer will
+# actually call — and it works for images we do not build. For the two binaries we do build, a
+# `-healthcheck` self-probe flag would let the check move back inside the container; that is the
+# better end state and it is not written yet.
+HTTP_GATED=(
+  # Two things about this URL are easy to get wrong, and both fail as "dead process":
+  # the probes are on the admin listener, not the API port, and health.Registry mounts
+  # /livez, /readyz and /startupz — there is no /healthz. Readiness is the right gate:
+  # it is the one that means "usable", which is what this script promises.
+  "gateway-simulator|http://localhost:${PP_DEV_SIMULATOR_ADMIN_PORT:-8091}/readyz"
+  "dev-issuer|http://localhost:${PP_DEV_ISSUER_PORT:-8088}/healthz"
+  "otel-collector|http://localhost:13133/"
+)
+
+# http_ok probes one URL. curl is present on macOS and on every CI image we use; wget is the
+# fallback for a minimal Linux box that has one and not the other.
+http_ok() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 3 -o /dev/null "$url" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 3 -O /dev/null "$url" 2>/dev/null
+  else
+    return 0   # nothing to probe with; do not fail the stack over a missing client
+  fi
+}
 
 container_health() {
   local svc="$1" cid
@@ -103,28 +139,47 @@ container_health() {
 
 info "waiting up to ${TIMEOUT}s for readiness"
 deadline=$((SECONDS + TIMEOUT))
-declare -A reported=()
+# The set of services already reported, as a space-delimited string rather than an associative
+# array. `declare -A` is bash 4; macOS ships bash 3.2 as /bin/bash and `#!/usr/bin/env bash`
+# finds it unless the developer has installed a newer one and put it first on PATH. A
+# development script that only runs on a laptop with a hand-upgraded shell is a script that
+# greets a new joiner with a syntax error.
+reported=" "
 while :; do
   pending=()
   for svc in "${HEALTH_GATED[@]}"; do
     st="$(container_health "$svc")"
     case "$st" in
       healthy)
-        if [[ -z "${reported[$svc]:-}" ]]; then ok "$svc healthy"; reported[$svc]=1; fi
+        if [[ "$reported" != *" $svc "* ]]; then ok "$svc healthy"; reported+="$svc "; fi
         ;;
       nohealthcheck)
         # Not a pass. A service in HEALTH_GATED without a probe means the compose file and
         # this script disagree, and the honest report is that the gate is not being
         # enforced for it.
-        if [[ -z "${reported[$svc]:-}" ]]; then
+        if [[ "$reported" != *" $svc "* ]]; then
           warn "$svc has no healthcheck in $COMPOSE_FILE — readiness is not gated for it"
-          reported[$svc]=1
+          reported+="$svc "
         fi
         ;;
       *)
         pending+=("$svc:$st")
         ;;
     esac
+  done
+
+  for entry in "${HTTP_GATED[@]}"; do
+    svc="${entry%%|*}"; url="${entry#*|}"
+    # A container that is not running at all is a different failure from one that is running
+    # and not answering, and the report should say which.
+    st="$(container_health "$svc")"
+    if [[ "$st" == "missing" ]]; then
+      pending+=("$svc:not-started")
+    elif http_ok "$url"; then
+      if [[ "$reported" != *" $svc "* ]]; then ok "$svc healthy"; reported+="$svc "; fi
+    else
+      pending+=("$svc:no-http-response")
+    fi
   done
 
   [[ ${#pending[@]} -eq 0 ]] && break

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kgo"
+
 	"github.com/udaykishore-resu/payments-platform/internal/platform/secret"
 	"github.com/udaykishore-resu/payments-platform/pkg/apierror"
 )
@@ -56,8 +58,8 @@ func TestValidateRejects(t *testing.T) {
 	}
 }
 
-// TestLocalEnvironmentMayUsePlaintext: the guards are environment-gated, not absolute, so a
-// developer's docker-compose broker still works.
+// TestLocalEnvironmentMayUsePlaintext: the guards are gated on where the brokers are, not
+// absolute, so a developer's docker-compose broker reached on a published port still works.
 func TestLocalEnvironmentMayUsePlaintext(t *testing.T) {
 	t.Parallel()
 	c := DefaultConfig()
@@ -66,6 +68,113 @@ func TestLocalEnvironmentMayUsePlaintext(t *testing.T) {
 	c.Environment = "local"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("a local plaintext broker was rejected: %v", err)
+	}
+}
+
+// TestPlaintextIsPermittedByBrokerAddressNotByEnvironmentName is the counterpart of the Redis
+// test of the same shape, and for the same defect: the predicate compared Config.Environment
+// against names runtime.ParseEnvironment cannot produce, so `-tags` aside there was no startable
+// configuration in which outbox-relay and event-consumer could reach a local Redpanda.
+func TestPlaintextIsPermittedByBrokerAddressNotByEnvironmentName(t *testing.T) {
+	t.Parallel()
+	c := DefaultConfig()
+	c.Brokers = []string{"localhost:19092", "127.0.0.1:19093"}
+	c.Protocol = ProtocolPlaintext
+	c.Environment = "sandbox" // what runtime.ParseEnvironment actually produces
+	if err := c.Validate(); err != nil {
+		t.Fatalf("plaintext to loopback brokers was rejected in sandbox: %v", err)
+	}
+}
+
+// TestPlaintextIsRefusedOffHost pins that the new rule is tighter than the one it replaced.
+func TestPlaintextIsRefusedOffHost(t *testing.T) {
+	t.Parallel()
+	cases := map[string]func(*Config){
+		"remote broker in sandbox": func(c *Config) {
+			c.Environment = "sandbox"
+			c.Brokers = []string{"kafka.internal:9092"}
+		},
+		"remote broker in an environment named dev": func(c *Config) {
+			c.Environment = "dev"
+			c.Brokers = []string{"kafka.internal:9092"}
+		},
+		// One remote broker in the seed list means the connection leaves this host. A rule that
+		// looked only at the first entry would be trivially bypassed by ordering.
+		"one remote broker among loopback ones": func(c *Config) {
+			c.Environment = "sandbox"
+			c.Brokers = []string{"localhost:19092", "kafka.internal:9092"}
+		},
+		"loopback in production": func(c *Config) {
+			c.Environment = "production"
+			c.Brokers = []string{"127.0.0.1:9092"}
+		},
+		// "No brokers" must never be the thing that unlocks plaintext: an empty list is a
+		// misconfiguration, and a misconfiguration that relaxes a security control is the worst
+		// kind. It is rejected for the missing brokers too — this asserts it is not accepted.
+		"no brokers at all": func(c *Config) {
+			c.Environment = "sandbox"
+			c.Brokers = nil
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := DefaultConfig()
+			c.Protocol = ProtocolPlaintext
+			mutate(&c)
+			c.ClientID = "test"
+			if err := c.Validate(); err == nil {
+				t.Fatalf("Validate accepted plaintext for %s", name)
+			}
+		})
+	}
+}
+
+// TestClientOptionsProduceAConstructibleClient is the test whose absence let a production-only
+// defect sit in the tree behind a comment in .env.dev.
+//
+// Validate() passing says the configuration is coherent; it says nothing about whether franz-go
+// will accept the options built from it. ClientOptions set both kgo.Dialer and kgo.DialTLSConfig,
+// which franz-go refuses at construction — so every TLS-using protocol, meaning every production
+// configuration, failed at "creating producer client" while every unit test passed. Building a
+// real client is the only assertion that covers the gap, and it is cheap: kgo.NewClient does not
+// dial, it validates and returns.
+func TestClientOptionsProduceAConstructibleClient(t *testing.T) {
+	t.Parallel()
+	cases := map[string]func(*Config){
+		"SASL_SSL (production)": func(c *Config) { c.Protocol = ProtocolSASLSSL },
+		"SSL (mutual TLS)": func(c *Config) {
+			c.Protocol = ProtocolSSL
+			c.Username, c.Password = "", secret.New("")
+		},
+		"PLAINTEXT (loopback broker)": func(c *Config) {
+			c.Protocol = ProtocolPlaintext
+			c.Environment = "sandbox"
+			c.Brokers = []string{"localhost:19092"}
+			c.Username, c.Password = "", secret.New("")
+		},
+		"SASL_PLAINTEXT (loopback broker)": func(c *Config) {
+			c.Protocol = ProtocolSASLPlaintext
+			c.Mechanism = MechanismScramSHA512
+			c.Environment = "sandbox"
+			c.Brokers = []string{"localhost:19092"}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := prodConfig()
+			mutate(&c)
+			opts, err := c.ClientOptions()
+			if err != nil {
+				t.Fatalf("ClientOptions: %v", err)
+			}
+			client, err := kgo.NewClient(opts...)
+			if err != nil {
+				t.Fatalf("franz-go refused the options: %v", err)
+			}
+			client.Close()
+		})
 	}
 }
 

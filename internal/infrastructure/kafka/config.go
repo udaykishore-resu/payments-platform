@@ -232,7 +232,8 @@ func (c Config) Validate() error {
 	case ProtocolSASLSSL, ProtocolSSL:
 	case ProtocolPlaintext, ProtocolSASLPlaintext:
 		if !local {
-			bad(EnvProtocol, string(c.Protocol)+" is only permitted in a local environment; production is SASL_SSL")
+			bad(EnvProtocol, string(c.Protocol)+" is only permitted when every broker is on this host; "+
+				"anything reachable over a network is SASL_SSL")
 		}
 	default:
 		bad(EnvProtocol, "must be one of PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL")
@@ -258,7 +259,7 @@ func (c Config) Validate() error {
 	}
 
 	if c.InsecureSkipVerify && !local {
-		bad(EnvInsecure, "certificate verification may not be disabled outside a local environment")
+		bad(EnvInsecure, "certificate verification may not be disabled for a broker reachable over a network")
 	}
 	if c.DialTimeout <= 0 || c.RequestTimeout <= 0 || c.RetryTimeout <= 0 {
 		bad(EnvRequestTimeout, "timeouts must be positive; an unbounded broker call wedges the relay")
@@ -274,9 +275,55 @@ func (c Config) Validate() error {
 		WithDetails(details...)
 }
 
+// isLocal reports whether every broker in this configuration is on this host, which is the only
+// condition under which PLAINTEXT, SASL_PLAINTEXT and a skipped certificate check are permitted.
+//
+// This function had the same defect as its counterpart in internal/infrastructure/redis, and the
+// two must stay in step. It compared the environment's *name* against "local", "test",
+// "development" and "dev", none of which runtime.ParseEnvironment can produce — it accepts only
+// "sandbox" and "production", and runtime.KafkaConfig assigns that straight onto
+// Config.Environment. So the branch was unreachable on any running service, and a developer
+// pointing a service at a plaintext Redpanda on their laptop was told PLAINTEXT is "only
+// permitted in a local environment" with no way to be in one.
+//
+// The rule now tests what the control is for: credentials and event payloads must not cross a
+// network in the clear. A broker on a loopback address is not on a network. Every broker must
+// qualify — one remote broker in the list means the connection leaves the host, and a list that
+// is empty is not local, because "no brokers" must never be the thing that unlocks plaintext.
+//
+// Production is refused whatever the addresses are, for the same reason as in the Redis adapter:
+// a loopback broker in production is an architecture decision, not a validator's to make.
 func (c Config) isLocal() bool {
-	e := strings.ToLower(c.Environment)
-	return e == "local" || e == "test" || e == "development" || e == "dev"
+	if strings.EqualFold(strings.TrimSpace(c.Environment), "production") {
+		return false
+	}
+	if len(c.Brokers) == 0 {
+		return false
+	}
+	for _, b := range c.Brokers {
+		if !brokerIsLoopback(b) {
+			return false
+		}
+	}
+	return true
+}
+
+// brokerIsLoopback reports whether a host:port names this machine.
+//
+// A hostname other than "localhost" is not resolved, deliberately. Resolving would make the
+// answer depend on DNS at validation time, so a name pointing at 127.0.0.1 on a laptop and at a
+// shared broker in a cluster would validate identically — and this is a control deciding whether
+// credentials may cross a network in the clear.
+func brokerIsLoopback(broker string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(broker))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func (c Config) usesSASL() bool {
@@ -364,7 +411,20 @@ func (c Config) ClientOptions() ([]kgo.Opt, error) {
 		kgo.ClientID(c.ClientID),
 		kgo.RequestTimeoutOverhead(c.RequestTimeout),
 		kgo.RetryTimeout(c.RetryTimeout),
-		kgo.Dialer((&net.Dialer{Timeout: c.DialTimeout}).DialContext),
+		// DialTimeout, not Dialer.
+		//
+		// The obvious spelling — kgo.Dialer with a net.Dialer carrying the timeout — cannot be
+		// combined with DialTLSConfig: franz-go's own validation refuses a client that sets both
+		// ("cannot set both Dialer and DialTLSConfig"), and it refuses it at construction, so the
+		// failure is "creating producer client" with no mention of dialers. This code did set
+		// both, on the belief that the later option replaced the earlier one. It does not; they
+		// are separate fields and setting each is what trips the check. The effect was that every
+		// TLS-using protocol — SSL and SASL_SSL, which is to say every production configuration —
+		// could not construct a client at all.
+		//
+		// DialTimeout is the option franz-go documents as the companion to DialTLSConfig, and it
+		// applies equally to the plaintext path, so there is one spelling for both.
+		kgo.DialTimeout(c.DialTimeout),
 	}
 
 	if c.usesTLS() {
@@ -372,7 +432,6 @@ func (c Config) ClientOptions() ([]kgo.Opt, error) {
 		if err != nil {
 			return nil, err
 		}
-		// DialTLSConfig replaces the plain dialer, so it must come after it.
 		opts = append(opts, kgo.DialTLSConfig(t))
 	}
 

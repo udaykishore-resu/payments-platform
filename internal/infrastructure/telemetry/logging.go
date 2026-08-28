@@ -361,6 +361,29 @@ func newAllowlistHandler(next slog.Handler, keys []string, m LogAccounting) *all
 			allowed[alias] = k
 		}
 	}
+
+	// `error` and `err` are canonicalized onto error.message rather than rejected.
+	//
+	// They are what a Go call site writes — `log.Error("x failed", "error", err)` is the spelling
+	// in the standard library's own examples — and rejecting them produced exactly the outcome
+	// the comment above this function warns about. Twenty-two ERROR call sites in the workflow
+	// engine passed the failure as "error"; every one of them emitted an ERROR line with no
+	// failure in it, and a worker unable to acquire a lease logged that fact twice a second for
+	// as long as anyone cared to watch, saying nothing about why.
+	//
+	// Silently dropping a field is defensible for one a caller invented. It is not defensible for
+	// the conventional name of the single most important field an ERROR line carries: the cost of
+	// a mistake there is paid at 4am by someone who cannot see the error. So the allowlist keeps
+	// its shape — a caller still cannot introduce a new dimension — and the two spellings of the
+	// dimension it already has both arrive.
+	//
+	// A group named `error` is unaffected: filter handles KindGroup before it reaches this map,
+	// so slog.Group("error", slog.String("code", …)) still resolves to error.code.
+	if _, ok := allowed[KeyErrorMessage]; ok {
+		allowed["error"] = KeyErrorMessage
+		allowed["err"] = KeyErrorMessage
+	}
+
 	return &allowlistHandler{next: next, allowed: allowed, metrics: m}
 }
 

@@ -1,35 +1,43 @@
 // Package grpcapi is the platform's internal gRPC surface: the same use cases the REST edge
 // exposes, offered to callers inside the mesh over a binary protocol with mTLS peer identity.
 //
-// # The generated code is not in this repository, and this package is built without it
+// # The generated code is committed, and this package is split around it
 //
 // api/proto/payments/v1/*.proto declares the services. The Go bindings — `paymentsv1.
-// PaymentServiceServer` and its siblings — are produced by `buf generate` and are deliberately
-// not committed:
+// PaymentServiceServer` and its siblings — are produced by `buf generate` and are committed
+// alongside the .proto files:
 //
 //	buf generate --template api/proto/buf.gen.yaml api/proto
 //
-// The protoc plugins are not available in every environment where this repository is built, and a
-// package whose default build depends on them is a package that fails `go build ./...` on a
-// developer laptop for reasons unrelated to the change being made. So the split is:
+// Committing them was not the original plan, and the reason for the change is worth recording.
+// The protoc plugins are not available in every environment where this repository is built, so
+// the bindings were left out of the tree and this package was split:
 //
 //   - [server.go] — no build tag. The harness: interceptor chain, error mapping, health service,
 //     keepalive, reflection, graceful stop. It compiles against grpc-go alone and is therefore
 //     always built, always vetted and always covered by the race detector.
 //   - [services.go] — `//go:build grpc`. The service implementations, written against the
-//     generated types as they will be named. It compiles only after codegen has run.
+//     generated types. It requires the bindings.
 //
-// CI runs codegen and then builds this package with `-tags grpc`, so the tagged file is not
-// exempt from the build — it is exempt only from the *default* build:
+// The split is sound and remains. Leaving the bindings *uncommitted* was not, for two reasons
+// that only showed up in use:
+//
+//   - `go mod tidy` loads every package in the module regardless of build tags. A tagged file
+//     importing a package that does not exist on disk makes `tidy` fail for every developer,
+//     including ones who will never build with `-tags grpc`. `go build ./...` and
+//     `go test ./...` do respect build tags, so nothing else catches it.
+//   - A tagged file nobody can compile locally drifts from the schema silently. This one had,
+//     in eight places: it returned bare resources where the .proto declares response wrappers,
+//     and read an `idempotency_key` field that the .proto carries inside `IdempotencyOptions`.
+//
+// The cost of committing generated code is real — a large diff on every regeneration, in which a
+// hand-edit is hard to spot. That is paid for by CI, which regenerates and fails if the working
+// tree changes, making a hand-edit a build failure rather than a review burden:
 //
 //	buf generate --template api/proto/buf.gen.yaml api/proto
+//	git diff --exit-code api/proto
 //	go build -tags grpc ./internal/transport/grpcapi/...
 //	go vet   -tags grpc ./internal/transport/grpcapi/...
-//
-// The tagged file being unbuildable locally is a real cost. It is paid because the alternative —
-// committing generated code — makes every regeneration a large, unreviewable diff in which a
-// hand-edit is invisible, and makes the checked-in bindings drift from the .proto whenever
-// somebody edits one and not the other.
 //
 // # Why a gRPC surface at all, when REST already exists
 //
