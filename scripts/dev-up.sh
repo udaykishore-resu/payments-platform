@@ -227,13 +227,36 @@ if [[ $DO_SEED -eq 1 && $DO_MIGRATE -eq 1 ]]; then
   hdr "seed data"
   info "profile=${SEED_PROFILE} scale=${SEED_SCALE} (synthetic; never production data — deployment.md §6.1)"
   SEED_OUT="$(mktemp)"
-  if "${DC[@]}" run --rm migrate seed --profile="$SEED_PROFILE" --scale="$SEED_SCALE" | tee "$SEED_OUT"; then
+  # The seeded gateway catalogue has to point at an address the *host* can reach, because the
+  # application services run on the host and the simulator's port is published. Without this the
+  # catalogue keeps platformctl's default of 127.0.0.1:9090 — which, inside the migrate container,
+  # is the migrate container, and on the host is nothing at all. The stack then comes up healthy
+  # and every payment fails at dispatch, which is a confusing afternoon.
+  SEED_GATEWAY_URL="${PP_SEED_GATEWAY_URL:-http://localhost:${PP_DEV_SIMULATOR_PORT:-8090}}"
+  if "${DC[@]}" run --rm -e PP_SEED_GATEWAY_URL="$SEED_GATEWAY_URL" \
+       migrate seed --profile="$SEED_PROFILE" --scale="$SEED_SCALE" | tee "$SEED_OUT"; then
     ok "seeded"
     # The ids are captured rather than left in the scrollback: a token scoped to a tenant that
     # does not exist authenticates and then fails every authorization check, which is a
     # confusing way to spend an afternoon.
     SEEDED_TENANT="$(grep -oE 'ten_[0-9A-HJKMNP-TV-Z]{26}' "$SEED_OUT" | head -1 || true)"
     SEEDED_MERCHANT="$(grep -oE 'mrc_[0-9A-HJKMNP-TV-Z]{26}' "$SEED_OUT" | head -1 || true)"
+    # The seeded connections carry credential references, and a reference nothing can resolve
+    # fails every dispatch with GATEWAY_AUTHENTICATION_FAILED. platformctl prints the references
+    # precisely so they can be written into a local secrets document; this writes it. The values
+    # are the simulator's own fixture key, not a credential.
+    mkdir -p "$REPO_ROOT/.dev"
+    SIM_API_KEY="${PP_SIMULATOR_API_KEY:-dev-simulator-not-a-real-key}"
+    {
+      echo "# Written by scripts/dev-up.sh at $(date -u +%FT%TZ). Local fixture values."
+      echo "# Point a service at it with PP_SECRETS_FILE=.dev/secrets.yaml (make run does)."
+      grep -oE 'secret://[^[:space:]]+' "$SEED_OUT" | sort -u | while read -r ref; do
+        printf '%s:\n  api_key: %s\n  webhook_secret: %s\n' \
+          "$ref" "$SIM_API_KEY" "0123456789abcdef0123456789abcdef"
+      done
+    } > "$REPO_ROOT/.dev/secrets.yaml"
+    chmod 600 "$REPO_ROOT/.dev/secrets.yaml"
+    ok "wrote .dev/secrets.yaml ($(grep -c '^secret://' "$REPO_ROOT/.dev/secrets.yaml" || echo 0) references)"
   else
     warn "seeding failed; the stack is usable but empty (run scripts/seed.sh to retry)"
   fi
@@ -310,8 +333,9 @@ if TOKEN="$("$REPO_ROOT/scripts/dev-token.sh" 2>/dev/null)"; then
             "captureMode": "AUTOMATIC"
           }'
 
-    Note: nothing above starts an application service. \`make run-payment-api\` runs one against
-    this stack; the compose file provides the dependencies, not the platform.
+    Note: nothing above starts an application service. The compose file provides the
+    dependencies, not the platform. \`make run\` does the whole thing in one command;
+    \`make run-payment-api\` runs a single service against this stack.
 
     Next:  make run-payment-api      # :8080, admin :8081
            make test-integration     # testcontainers-backed suite

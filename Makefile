@@ -258,6 +258,96 @@ define run_service
   exec $(GO) run ./cmd/$(1)
 endef
 
+# ---------------------------------------------------------------------------
+# One command
+# ---------------------------------------------------------------------------
+# `make run` is the whole local path in one target: infrastructure, schema,
+# synthetic data, credentials, the payment API, and a payment taken through it.
+# It composes the pieces that already exist — dev-up.sh, dev-token.sh, the
+# run_service macro — rather than reimplementing them, so there is one way for
+# the local stack to be wrong instead of two.
+#
+# Everything it starts is synthetic: the gateway is the simulator, the issuer is
+# the local dev issuer, the data is generated, and the credential is a fixture.
+
+.PHONY: run
+run: ## Clean clone to a live payment API on :8080, then take a payment through it
+	@command -v docker >/dev/null 2>&1 || { echo "docker is required: https://docs.docker.com/get-docker/"; exit 1; }
+	@command -v $(GO) >/dev/null 2>&1 || { echo "go is required: https://go.dev/dl/"; exit 1; }
+	@command -v curl >/dev/null 2>&1 || { echo "curl is required"; exit 1; }
+	@test -f $(ENV_FILE) || { printf '\033[31m✗\033[0m missing $(ENV_FILE) — it is committed; check your checkout\n'; exit 2; }
+	./scripts/dev-up.sh
+	@mkdir -p .dev
+	@printf '  \033[36mpayment-api\033[0m using $(ENV_FILE) and .dev/secrets.yaml\n'
+	@set -a; PP_SERVICE_NAME=payment-api; PP_SECRETS_FILE="$$PWD/.dev/secrets.yaml"; . ./$(ENV_FILE); set +a; \
+		$(GO) run ./cmd/payment-api > .dev/payment-api.log 2>&1 & \
+		api=$$!; \
+		trap "kill $$api 2>/dev/null; exit 0" INT TERM; \
+		trap "kill $$api 2>/dev/null" EXIT; \
+		n=0; ready=""; \
+		while [ $$n -lt 120 ]; do \
+			if curl -sf -o /dev/null http://localhost:8081/readyz 2>/dev/null; then ready=yes; break; fi; \
+			if ! kill -0 $$api 2>/dev/null; then break; fi; \
+			n=$$((n+1)); sleep 0.5; \
+		done; \
+		if [ -z "$$ready" ]; then \
+			echo; echo "  payment-api did not become ready. Last lines of .dev/payment-api.log:"; \
+			tail -20 .dev/payment-api.log; exit 1; \
+		fi; \
+		$(MAKE) --no-print-directory demo; \
+		echo "  payment-api is still running:"; \
+		echo "    http://localhost:8080   /v1/payments, /healthz, /readyz"; \
+		echo "    http://localhost:8081   admin: /livez /readyz /startupz /metrics"; \
+		echo "    http://localhost:16686  traces        http://localhost:3000  dashboards"; \
+		echo; \
+		echo "    make demo             # take another payment"; \
+		echo "    make dev-token        # mint a bearer token"; \
+		echo "    make run-control-plane-api / run-webhook-ingress / run-workflow-worker"; \
+		echo "    make dev-down         # stop the stack and remove its volumes"; \
+		echo; \
+		echo "  logs: .dev/payment-api.log"; \
+		echo "  ctrl-c stops payment-api; the compose stack keeps running."; \
+		echo; \
+		wait $$api
+
+.PHONY: demo
+demo: ## Take one payment through a running stack and show what came back
+	@command -v curl >/dev/null 2>&1 || { echo "curl is required"; exit 1; }
+	@curl -sf -o /dev/null http://localhost:8080/healthz 2>/dev/null || { \
+		echo "nothing on :8080 — run 'make run' first"; exit 1; }
+	@test -f .dev/dev-env.sh || { echo "no .dev/dev-env.sh — run 'make run' or ./scripts/dev-up.sh first"; exit 1; }
+	@. ./.dev/dev-env.sh; \
+		token="$$(./scripts/dev-token.sh)"; \
+		echo; \
+		echo "1. the payment API is up and authenticating against the local issuer"; \
+		printf '   GET /v1/payments -> HTTP '; \
+		curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/v1/payments \
+			-H "Authorization: Bearer $$token" -H 'Accept: application/json'; \
+		echo; \
+		echo "2. one payment, authorized and captured through the gateway simulator"; \
+		key="$$(uuidgen 2>/dev/null || date +%s%N)"; \
+		curl -s -o .dev/last-payment.json -w '   POST /v1/payments -> HTTP %{http_code}\n' \
+			-X POST http://localhost:8080/v1/payments \
+			-H "Authorization: Bearer $$token" \
+			-H 'Content-Type: application/json' \
+			-H "Idempotency-Key: $$key" \
+			-d "{\"merchantId\":\"$$PP_TEST_MERCHANT_ID\",\"amount\":{\"amount\":1050,\"currency\":\"EUR\"},\"paymentMethod\":\"CARD\",\"paymentMethodReference\":{\"type\":\"GATEWAY_TOKEN\",\"gatewayCode\":\"simulator\",\"token\":\"tok_dev_visa\",\"brand\":\"VISA\",\"last4\":\"4242\",\"expiryMonth\":12,\"expiryYear\":2030},\"captureMode\":\"AUTOMATIC\"}"; \
+		printf '   '; cat .dev/last-payment.json; echo; \
+		echo; \
+		echo "3. the same Idempotency-Key again returns the same payment, not a second one"; \
+		curl -s -o .dev/last-payment-replay.json -w '   POST /v1/payments -> HTTP %{http_code}\n' \
+			-X POST http://localhost:8080/v1/payments \
+			-H "Authorization: Bearer $$token" \
+			-H 'Content-Type: application/json' \
+			-H "Idempotency-Key: $$key" \
+			-d "{\"merchantId\":\"$$PP_TEST_MERCHANT_ID\",\"amount\":{\"amount\":1050,\"currency\":\"EUR\"},\"paymentMethod\":\"CARD\",\"paymentMethodReference\":{\"type\":\"GATEWAY_TOKEN\",\"gatewayCode\":\"simulator\",\"token\":\"tok_dev_visa\",\"brand\":\"VISA\",\"last4\":\"4242\",\"expiryMonth\":12,\"expiryYear\":2030},\"captureMode\":\"AUTOMATIC\"}"; \
+		if cmp -s .dev/last-payment.json .dev/last-payment-replay.json; then \
+			echo "   identical response — the idempotency record was replayed"; \
+		else \
+			echo "   responses differ; see .dev/last-payment.json and .dev/last-payment-replay.json"; \
+		fi; \
+		echo
+
 .PHONY: run-payment-api
 run-payment-api: ## Run payment-api against the local stack (:8080, admin :8081)
 	$(call run_service,payment-api)
