@@ -1,0 +1,99 @@
+==> traceability — baseline §26
+COUNT	defined=190 tested=146 orphans=44
+    PASS  wrote docs/spec/09-traceability.md
+    FAIL  [T3] FR-2 is referenced (_superseded/services/payments-api/internal/api/handlers.go, _superseded/services/payments-api/internal/repository/postgres.go) but no such requirement is defined — a typo here silently un-traces the requirement it meant
+    FAIL  [T3] FR-6 is referenced (ADR-004-idempotency-ledger.md) but no such requirement is defined — a typo here silently un-traces the requirement it meant
+    FAIL  [T1] BR-03 (Merchant registration under a tenant) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// BR-03` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] BR-18 (Production activation with explicit guards) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// BR-18` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] BR-38 (Metering for billing) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// BR-38` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-12 (Activate a merchant under explicit guards) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-12` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-18 (Correct and resubmit a failed validation) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-18` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-19 (Submit KYC/KYB to the vendor idempotently) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-19` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-37 (Operator health override with mandatory expiry) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-37` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-42 (Detect and reconcile provisioning drift) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-42` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-72 (Read and list payments with read-your-writes) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-72` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-73 (Asynchronous payment methods) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-73` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-86 (Handle a dispute lifecycle notification) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-86` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-87 (Produce the billing meter projection) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-87` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] FR-90 (Export a tenant-scoped audit and compliance report) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// FR-90` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-09 (Webhook ingestion throughput) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-09` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-10 (Event pipeline throughput) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-10` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-11 (Routing decision throughput) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-11` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-13 (Horizontal scalability of stateless services) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-13` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-14 (Vertical and storage scaling of the primary datastore) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-14` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-16 (Index strategy) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-16` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-17 (Data growth budget) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-17` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-18 (Event-stream growth budget) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-18` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-19 (Data-plane availability) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-19` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-20 (Control-plane availability) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-20` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-21 (Defined SLI set) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-21` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-23 (Error-budget policy) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-23` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-25 (RPO) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-25` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-26 (RTO) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-26` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-27 (Backup and restore) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-27` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-35 (Supply chain and vulnerability management) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-35` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-47 (Runbook coverage) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-47` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-48 (Deployment cadence and safety) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-48` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-49 (Rollback time) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-49` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-50 (Toil budget) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-50` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-51 (Capacity planning cadence) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-51` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-52 (Test coverage gates) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-52` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-53 (Architecture fitness functions) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-53` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-54 (Contract stability and versioning) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-54` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-55 (Code health and dependency hygiene) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-55` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-56 (12-factor conformance) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-56` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-57 (Substitutability of infrastructure and vendors) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-57` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-58 (Unit infrastructure cost per 1 000 payments) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-58` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-59 (Cost attribution and tenant-level unit economics) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-59` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-60 (WCAG 2.1 AA for admin and operator surfaces) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-60` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T1] NFR-61 (API ergonomics as an accessibility concern) has no test — §26 requires ≥ 1 test per requirement. Name a test after it, add a `// NFR-61` comment to the test that covers it, or list it under `requirements:` in tests/critical_paths.yaml
+    FAIL  [T2] BR-03 (Merchant registration under a tenant) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] BR-18 (Production activation with explicit guards) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-12 (Activate a merchant under explicit guards) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-18 (Correct and resubmit a failed validation) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-19 (Submit KYC/KYB to the vendor idempotently) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-37 (Operator health override with mandatory expiry) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-42 (Detect and reconcile provisioning drift) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-73 (Asynchronous payment methods) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-86 (Handle a dispute lifecycle notification) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-87 (Produce the billing meter projection) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] FR-90 (Export a tenant-scoped audit and compliance report) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-02 (Per-stage latency budgets are individually enforced) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-03 (End-to-end payment latency including gateway) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-04 (Gateway call isolation) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-05 (Webhook ingress accept latency) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-06 (Control-plane latency) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-07 (Sustained payment throughput) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-08 (Onboarding throughput) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-09 (Webhook ingestion throughput) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-10 (Event pipeline throughput) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-11 (Routing decision throughput) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-13 (Horizontal scalability of stateless services) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-14 (Vertical and storage scaling of the primary datastore) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-16 (Index strategy) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-17 (Data growth budget) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-18 (Event-stream growth budget) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-19 (Data-plane availability) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-20 (Control-plane availability) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-21 (Defined SLI set) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-23 (Error-budget policy) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-24 (Durability of committed money state) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-25 (RPO) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-26 (RTO) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-27 (Backup and restore) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-35 (Supply chain and vulnerability management) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-47 (Runbook coverage) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-48 (Deployment cadence and safety) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-49 (Rollback time) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-50 (Toil budget) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-51 (Capacity planning cadence) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-52 (Test coverage gates) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-53 (Architecture fitness functions) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-54 (Contract stability and versioning) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-55 (Code health and dependency hygiene) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-56 (12-factor conformance) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-57 (Substitutability of infrastructure and vendors) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-58 (Unit infrastructure cost per 1 000 payments) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-59 (Cost attribution and tenant-level unit economics) is referenced by no source file and no design document — 'which code implements this' has no answer
+    FAIL  [T2] NFR-60 (WCAG 2.1 AA for admin and operator surfaces) is referenced by no source file and no design document — 'which code implements this' has no answer
+✗ traceability: 95 violation(s)
