@@ -193,7 +193,7 @@ jobs:
           echo "SBOM components: $n"
 
       - name: Scan the pushed image (stage 15)
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_REPO }}/${{ matrix.service }}@${{ steps.build.outputs.digest }}
           severity: HIGH,CRITICAL

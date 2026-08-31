@@ -882,7 +882,7 @@ jobs:
         run: docker load -i /tmp/image-${{ matrix.service }}.tar
 
       - name: trivy (stage 15)
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_REPO }}/${{ matrix.service }}:${{ needs.prepare.outputs.commit }}
           format: sarif
