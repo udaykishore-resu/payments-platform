@@ -28,8 +28,8 @@ const (
 	// tenantAlpha and tenantBravo are two tenants used by every isolation test. They are
 	// constants rather than generated so that a failure message names a tenant a human can grep
 	// the logs for.
-	tenantAlpha = shared.TenantID("ten_01JB8Z9K2QW3E4R5T6Y7U8I9O0")
-	tenantBravo = shared.TenantID("ten_01JB8Z9K2QW3E4R5T6Y7U8I9O1")
+	tenantAlpha = shared.TenantID("ten_01JB8Z9K2QW3E4R5T6Y7W8X9Z0")
+	tenantBravo = shared.TenantID("ten_01JB8Z9K2QW3E4R5T6Y7W8X9Z1")
 )
 
 // testPool opens a pool as pp_app and applies the migrations if the schema is not current.

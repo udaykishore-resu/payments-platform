@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"golang.org/x/net/http2"
-
 	"github.com/udaykishore-resu/payments-platform/internal/infrastructure/telemetry"
 	"github.com/udaykishore-resu/payments-platform/pkg/apierror"
 )
@@ -147,21 +145,26 @@ func NewServer(cfg ServerConfig, h http.Handler) *Server {
 		// "never abort a gateway call at shutdown".
 		ErrorLog: slog.NewLogLogger(cfg.Logger.Handler(), slog.LevelWarn),
 	}
+	// Protocols is set explicitly in both branches so that DisableHTTP2 actually disables it:
+	// net/http's default is HTTP/1 plus HTTP/2-over-TLS, so leaving the field nil would keep
+	// h2 on regardless of the flag.
+	//
+	// h2c (UnencryptedHTTP2) is deliberately *not* enabled: cleartext HTTP/2 upgrade on a public
+	// listener has a long history of request-smuggling differentials between the upgrade path
+	// and the proxy in front of it. Inside the mesh the sidecar terminates TLS and h2 is
+	// negotiated over ALPN, which is the configured path here.
+	srv.Protocols = new(http.Protocols)
+	srv.Protocols.SetHTTP1(true)
 	if !cfg.DisableHTTP2 {
-		// h2c is deliberately *not* enabled: cleartext HTTP/2 upgrade on a public listener has
-		// a long history of request-smuggling differentials between the upgrade path and the
-		// proxy in front of it. Inside the mesh the sidecar terminates TLS and h2 is negotiated
-		// over ALPN, which is the configured path here.
-		_ = http2.ConfigureServer(srv, &http2.Server{
-			// IdleTimeout on the h2 server bounds a connection with no open streams. Without
-			// it, h2's own idle handling is independent of http.Server.IdleTimeout and a
-			// connection can outlive the setting an operator thought they had changed.
-			IdleTimeout: cfg.IdleTimeout,
+		srv.Protocols.SetHTTP2(true)
+		// The bundled h2 server honours http.Server.IdleTimeout for a connection with no open
+		// streams, so a single setting governs both protocols.
+		srv.HTTP2 = &http.HTTP2Config{
 			// MaxConcurrentStreams bounds per-connection multiplexing. Unbounded, one client's
 			// single connection can occupy every worker in the process, which is a
 			// denial-of-service with no packets to rate limit.
 			MaxConcurrentStreams: 250,
-		})
+		}
 	}
 	return &Server{cfg: cfg, srv: srv, done: make(chan struct{})}
 }

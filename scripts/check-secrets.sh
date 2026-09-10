@@ -173,9 +173,11 @@ GENERIC = re.compile(
 # `not_a_real_password`, `REDACTED` and `${...}` are included because the local development
 # stack, the CI service containers and this repository's own scripts all carry a DSN with a
 # deliberately-obvious password in it, and reporting those trains everyone to skip S2's
-# output — which is where the real provider tokens are reported.
+# output — which is where the real provider tokens are reported. `$(...)` (and make's
+# `$$(...)`) is a shell command substitution: the value is computed at run time and the
+# literal in the file is the command, not a credential.
 PLACEHOLDER = re.compile(
-    r"(?i)^(?:\$\{|\{\{|<|xxx|placeholder|example|changeme|redacted|dummy|fake|sample|"
+    r"(?i)^(?:\$\{|\$\$?\(|\{\{|<|xxx|placeholder|example|changeme|redacted|dummy|fake|sample|"
     r"your[_-]|test[_-]?only|replace[_-]?me|todo|n/?a$|\*+$)"
     r"|(?:^[Xx]+$)|(?:^0+$)|(?:^(?:secret|password|token|value)$)"
     r"|env:|vault:|aws-secrets:|sops:|file://|arn:aws:"

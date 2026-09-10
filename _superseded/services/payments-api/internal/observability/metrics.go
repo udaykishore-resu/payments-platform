@@ -6,8 +6,8 @@ package observability
 import "github.com/prometheus/client_golang/prometheus"
 
 type Metrics struct {
-	HTTPRequestsTotal    *prometheus.CounterVec
-	HTTPRequestDuration  *prometheus.HistogramVec
+	HTTPRequestsTotal   *prometheus.CounterVec
+	HTTPRequestDuration *prometheus.HistogramVec
 
 	PaymentsCreatedTotal            *prometheus.CounterVec
 	LedgerBalanceCheckFailuresTotal prometheus.Counter

@@ -70,7 +70,7 @@
 # Pinned to the toolchain in go.mod. The digest is not pinned here because the CI job
 # resolves and records it in the SBOM; pinning it in the file means a security update to
 # the builder is a code change in nine PRs' worth of conflict.
-ARG GO_VERSION=1.24.7
+ARG GO_VERSION=1.26.8
 ARG ALPINE_VERSION=3.21
 
 # ---------------------------------------------------------------------------------------

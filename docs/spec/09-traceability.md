@@ -11,7 +11,7 @@ and the tests that prove it. A `—` in the **Tests** column fails the build.
 
 | Requirement | Title | Design | Code | Tests |
 |---|---|---|---|---|
-| `BR-01` | Tenant registration and tier assignment | **—** | `internal/domain/tenant/tenant.go` | `internal/domain/tenant/tenant_test.go::TestNewTenantValidation`, `internal/domain/tenant/tenant_test.go::TestPermitsIsTheTenantCeiling` |
+| `BR-01` | Tenant registration and tier assignment | `README.md` | `internal/domain/tenant/tenant.go` | `internal/domain/tenant/tenant_test.go::TestNewTenantValidation`, `internal/domain/tenant/tenant_test.go::TestPermitsIsTheTenantCeiling` |
 | `BR-02` | API client credentials with least-privilege scopes | **—** | `internal/domain/tenant/apiclient.go` | `internal/domain/tenant/tenant_test.go::TestNewAPIClientValidation` |
 | `BR-03` | Merchant registration under a tenant | **—** | **—** | **—** |
 | `BR-04` | Structured onboarding submission | **—** | `internal/application/onboarding/service.go`, `internal/workflows/onboarding/definition.go` | `internal/application/onboarding/service_test.go::TestStartIsIdempotentOnTheMerchant`, `internal/workflows/onboarding/onboarding_test.go::TestOnboardingHappyPath` |
@@ -48,8 +48,8 @@ and the tests that prove it. A `—` in the **Tests** column fails the build.
 | `BR-35` | Gateway health visibility and operator control | **—** | `internal/domain/gateway/health.go` | `internal/domain/gateway/health_test.go::TestCooldownProbeAndClose` |
 | `BR-36` | Data residency enforcement | **—** | `internal/domain/tenant/tenant.go` | `internal/domain/tenant/tenant_test.go::TestResidencyPermitsGatewayRegion` |
 | `BR-37` | Audit trail and compliance reporting | **—** | `internal/domain/audit/record.go` | `internal/domain/audit/record_test.go::TestChainVerifiesIntactChain` |
-| `BR-38` | Metering for billing | **—** | **—** | **—** |
-| `FR-01` | Register a tenant | **—** | `internal/domain/tenant/tenant.go` | `internal/domain/tenant/tenant_test.go::TestNewTenantValidation` |
+| `BR-38` | Metering for billing | `README.md` | **—** | **—** |
+| `FR-01` | Register a tenant | `README.md` | `internal/domain/tenant/tenant.go` | `internal/domain/tenant/tenant_test.go::TestNewTenantValidation` |
 | `FR-02` | Provision isolation resources for a siloed tenant | **—** | `internal/domain/tenant/tenant.go` | `internal/domain/tenant/tenant_test.go::TestNewTenantValidation` |
 | `FR-03` | Issue an API client with least-privilege scopes | **—** | `internal/domain/tenant/apiclient.go` | `internal/domain/tenant/tenant_test.go::TestNewAPIClientValidation` |
 | `FR-04` | Authenticate a request | **—** | `internal/platform/authn/jwt.go` | `internal/platform/authn/apikey_test.go::TestAPIKeyHappyPath`, `internal/platform/authn/jwt_test.go::TestAttackMatrix`, `internal/platform/authn/jwt_test.go::TestValidateHappyPath` |
@@ -57,12 +57,12 @@ and the tests that prove it. A `—` in the **Tests** column fails the build.
 | `FR-06` | Resolve the tenant and enforce the isolation guard | **—** | `internal/infrastructure/postgres/tenant.go`, `internal/platform/tenantctx/tenantctx.go` | `internal/application/payment/service_test.go::TestCreateAssertsTenantContext`, `internal/infrastructure/postgres/rls_integration_test.go::TestCrossTenantAccessIsImpossible`, `internal/infrastructure/postgres/tenant_guard_test.go::TestRepositoriesRefuseToQueryWithoutATenant`, `internal/platform/tenantctx/tenantctx_test.go::TestAssertTenant`, +1 more |
 | `FR-07` | Enforce the tenant data-residency policy | **—** | `internal/domain/tenant/tenant.go` | `internal/domain/tenant/tenant_test.go::TestResidencyPermitsGatewayRegion` |
 | `FR-08` | Rotate and revoke API client credentials with overlap | **—** | `internal/domain/tenant/apiclient.go`, `internal/platform/authn/apikey.go` | `internal/domain/tenant/tenant_test.go::TestRotationOverlap`, `internal/platform/authn/apikey_test.go::TestAPIKeyRotationOverlap` |
-| `FR-09` | Register a merchant | **—** | `internal/application/merchant/service.go`, `internal/domain/merchant/merchant.go` | `internal/application/merchant/service_test.go::TestCreateWritesTheStateChangeAndTheAuditRecordTogether` |
+| `FR-09` | Register a merchant | **—** | `internal/application/merchant/service.go`, `internal/domain/merchant/merchant.go` | `internal/application/merchant/service_test.go::TestCreateWritesTheStateChangeAndTheAuditRecordTogether`, `internal/domain/merchant/merchant_test.go::TestAddPrincipal`, `internal/domain/merchant/merchant_test.go::TestNewMerchantValidation`, `internal/domain/merchant/merchant_test.go::TestOnboardingHappyPath` |
 | `FR-10` | Update a merchant profile with optimistic concurrency | **—** | `internal/application/merchant/service.go` | `internal/application/merchant/service_test.go::TestUpdateRequiresAndHonoursIfMatch` |
 | `FR-11` | List and read merchants | **—** | `internal/application/merchant/service.go` | `internal/application/merchant/service_test.go::TestGetRefusesAMerchantFromAnotherTenantAsNotFound` |
 | `FR-12` | Activate a merchant under explicit guards | **—** | **—** | **—** |
-| `FR-13` | Suspend and unsuspend a merchant | **—** | `internal/application/merchant/service.go`, `internal/domain/merchant/merchant.go` | `internal/application/merchant/service_test.go::TestSuspendAndReinstate` |
-| `FR-14` | Terminate a merchant | **—** | `internal/application/merchant/service.go`, `internal/domain/merchant/merchant.go` | `internal/application/merchant/service_test.go::TestTerminateIsRefusedWhilePaymentsAreOpen` |
+| `FR-13` | Suspend and unsuspend a merchant | **—** | `internal/application/merchant/service.go`, `internal/domain/merchant/merchant.go` | `internal/application/merchant/service_test.go::TestSuspendAndReinstate`, `internal/domain/merchant/merchant_test.go::TestApproveKYCRequiresAProviderReferenceAndAFutureExpiry`, `internal/domain/merchant/merchant_test.go::TestCanAcceptPaymentsCombinesStatusWithKYCFreshness`, `internal/domain/merchant/merchant_test.go::TestOnboardingHappyPath` |
+| `FR-14` | Terminate a merchant | **—** | `internal/application/merchant/service.go`, `internal/domain/merchant/merchant.go` | `internal/application/merchant/service_test.go::TestTerminateIsRefusedWhilePaymentsAreOpen`, `internal/domain/merchant/merchant_test.go::TestSuspendAndReinstate`, `internal/domain/merchant/merchant_test.go::TestTerminate` |
 | `FR-15` | Right-to-erasure by crypto-shredding | **—** | `internal/domain/compliance/retention.go` | `internal/domain/compliance/retention_test.go::TestErasureCarveOut` |
 | `FR-16` | Submit the onboarding package with batch validation | **—** | `internal/workflows/onboarding/validation.go` | `internal/workflows/onboarding/onboarding_test.go::TestDefaultValidatorReportsEveryFailureAtOnce` |
 | `FR-17` | Start the onboarding workflow under a business key | **—** | `internal/application/onboarding/service.go` | `internal/application/onboarding/service_test.go::TestStartIsIdempotentOnTheMerchant` |
@@ -101,7 +101,7 @@ and the tests that prove it. A `—` in the **Tests** column fails the build.
 | `FR-50` | Configure the routing policy | **—** | `internal/domain/routing/policy.go` | `internal/domain/routing/policy_test.go::TestPolicyValidate` |
 | `FR-51` | Configure limits, risk policy and SCA thresholds | **—** | `internal/domain/config/config.go` | `internal/validation/rules/l4config/rules_test.go::TestL4Rules` |
 | `FR-52` | Configure webhook endpoints and settlement preferences | **—** | `internal/domain/config/config.go` | `internal/validation/rules/l4config/rules_test.go::TestL4Rules` |
-| `FR-53` | Create a payment (main flow) | **—** | `internal/application/payment/service.go`, `internal/domain/payment/payment.go` | `internal/application/payment/service_test.go::TestCreateHappyPath`, `internal/infrastructure/postgres/invariants_integration_test.go::TestDatabaseRefusesAnIllegalStateTransition` |
+| `FR-53` | Create a payment (main flow) | **—** | `internal/application/payment/service.go`, `internal/domain/payment/payment.go` | `internal/application/payment/service_test.go::TestCreateHappyPath`, `internal/domain/payment/payment_test.go::TestNewPaymentValidation`, `internal/infrastructure/postgres/invariants_integration_test.go::TestDatabaseRefusesAnIllegalStateTransition` |
 | `FR-54` | Claim idempotency | **—** | `internal/platform/idempotency/manager.go` | `internal/platform/idempotency/manager_test.go::TestBeginRejectsUnusableKeys`, `internal/platform/idempotency/manager_test.go::TestOutcomeMatrix` |
 | `FR-55` | Concurrent duplicate idempotent request | **—** | `internal/platform/idempotency/manager.go` | `internal/application/payment/service_test.go::TestTwoConcurrentCreatesWithOneIdempotencyKeyProduceOnePayment`, `internal/infrastructure/postgres/concurrency_integration_test.go::TestConcurrentIdempotencyClaimsYieldExactlyOneNew`, `internal/platform/idempotency/manager_test.go::TestConcurrentBeginYieldsExactlyOneNew` |
 | `FR-56` | Idempotency key reused with a different body | **—** | `internal/platform/idempotency/manager.go` | `internal/application/payment/service_test.go::TestIdempotencyKeyReusedWithADifferentBodyIsRejected`, `internal/platform/idempotency/manager_test.go::TestFingerprintIsInsensitiveToSerialization` |
@@ -122,8 +122,8 @@ and the tests that prove it. A `—` in the **Tests** column fails the build.
 | `FR-71` | Void an uncaptured authorization | **—** | `internal/application/payment/service.go`, `internal/domain/payment/payment.go` | `internal/application/payment/service_test.go::TestVoidReleasesTheHoldAtTheAuthorizingGateway` |
 | `FR-72` | Read and list payments with read-your-writes | **—** | `internal/application/payment/service.go` | **—** |
 | `FR-73` | Asynchronous payment methods | **—** | **—** | **—** |
-| `FR-74` | Accept and persist an inbound webhook | **—** | `internal/application/webhook/ingest.go` | `internal/application/webhook/webhook_test.go::TestIngestVerifiesBeforeStoringAnything` |
-| `FR-75` | Verify the webhook signature | **—** | `internal/application/webhook/ingest.go` | `internal/application/webhook/webhook_test.go::TestIngestVerifiesBeforeStoringAnything`, `internal/application/webhook/webhook_test.go::TestIngestVerifiesOverTheRawBytes` |
+| `FR-74` | Accept and persist an inbound webhook | **—** | `internal/application/webhook/ingest.go`, `internal/infrastructure/postgres/webhook_ingest.go` | `internal/application/webhook/webhook_test.go::TestIngestVerifiesBeforeStoringAnything` |
+| `FR-75` | Verify the webhook signature | **—** | `internal/application/webhook/ingest.go`, `internal/infrastructure/postgres/webhook_ingest.go` | `internal/application/webhook/webhook_test.go::TestIngestVerifiesBeforeStoringAnything`, `internal/application/webhook/webhook_test.go::TestIngestVerifiesOverTheRawBytes` |
 | `FR-76` | Reject a replayed webhook | **—** | `internal/application/webhook/ingest.go` | `internal/application/webhook/webhook_test.go::TestSignatureCoversTheTimestampAndTheBody` |
 | `FR-77` | Deduplicate a duplicate webhook | **—** | `internal/application/webhook/ingest.go` | `internal/application/webhook/webhook_test.go::TestIngestDeduplicatesAtTheStorageLayer` |
 | `FR-78` | Process a webhook into a domain state transition | **—** | `internal/application/webhook/process.go` | `internal/application/webhook/webhook_test.go::TestProcessAppliesTheTransitionAndPostsTheLedger` |
@@ -139,8 +139,8 @@ and the tests that prove it. A `—` in the **Tests** column fails the build.
 | `FR-88` | Write a hash-chained audit record | **—** | `internal/domain/audit/record.go` | `internal/application/merchant/service_test.go::TestCreateWritesTheStateChangeAndTheAuditRecordTogether`, `internal/domain/audit/record_test.go::TestNewRecordValidation`, `internal/infrastructure/postgres/invariants_integration_test.go::TestLedgerAndAuditAreAppendOnly` |
 | `FR-89` | Verify the audit chain | **—** | `internal/domain/audit/record.go` | `internal/domain/audit/record_test.go::TestChainVerifiesIntactChain`, `internal/domain/audit/record_test.go::TestVerifyFindsTheTamperedRecord` |
 | `FR-90` | Export a tenant-scoped audit and compliance report | **—** | **—** | **—** |
-| `FR-91` | Raise a security event on an isolation or data-boundary violation | **—** | `internal/platform/secret/pan.go` | `internal/platform/secret/pan_test.go::TestPANDetectorNeverLogsTheValue` |
-| `NFR-01` | Payment API server-side latency | **—** | **—** | `tests/load/soak.js`, `tests/load/steady-state.js` |
+| `FR-91` | Raise a security event on an isolation or data-boundary violation | `README.md` | `internal/platform/secret/pan.go` | `internal/platform/secret/pan_test.go::TestPANDetectorNeverLogsTheValue` |
+| `NFR-01` | Payment API server-side latency | `README.md` | **—** | `tests/load/soak.js`, `tests/load/steady-state.js` |
 | `NFR-02` | Per-stage latency budgets are individually enforced | **—** | **—** | `tests/load/ramp.js`, `tests/load/steady-state.js` |
 | `NFR-03` | End-to-end payment latency including gateway | **—** | **—** | `tests/load/steady-state.js` |
 | `NFR-04` | Gateway call isolation | **—** | **—** | `tests/load/ramp.js` |
@@ -200,16 +200,16 @@ and the tests that prove it. A `—` in the **Tests** column fails the build.
 | `NFR-58` | Unit infrastructure cost per 1 000 payments | **—** | **—** | **—** |
 | `NFR-59` | Cost attribution and tenant-level unit economics | **—** | **—** | **—** |
 | `NFR-60` | WCAG 2.1 AA for admin and operator surfaces | **—** | **—** | **—** |
-| `NFR-61` | API ergonomics as an accessibility concern | **—** | **—** | **—** |
+| `NFR-61` | API ergonomics as an accessibility concern | `README.md` | **—** | **—** |
 
 ## Coverage summary
 
 | Class | Defined | With a test | With code or design | Orphans |
 |---|---|---|---|---|
-| BR | 38 | 35 | 35 | 3 |
+| BR | 38 | 35 | 36 | 3 |
 | FR | 91 | 81 | 82 | 10 |
-| NFR | 61 | 30 | 21 | 31 |
-| **Total** | **190** | **146** | **138** | **44**  |
+| NFR | 61 | 30 | 23 | 31 |
+| **Total** | **190** | **146** | **141** | **44**  |
 
 <!-- generated by scripts/traceability.sh; the date is deliberately omitted so
      that a regeneration with no substantive change produces no diff -->

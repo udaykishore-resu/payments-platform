@@ -134,9 +134,10 @@ updates:
   # Redpanda, Grafana and Jaeger in deploy/. A CVE here is a laptop, not a payment path,
   # so they are batched monthly.
   # =======================================================================================
-  # `docker`, not `docker-compose`: Dependabot's ecosystem for image references is
-  # `docker`, and it reads both Dockerfiles and compose files under the given directory.
-  - package-ecosystem: docker
+  # `docker-compose`, not `docker`: the `docker` ecosystem only reads Dockerfiles, and
+  # deploy/ holds none — pointing it here makes every run fail with "no Dockerfile found".
+  # The compose ecosystem is the one that reads `image:` references in compose files.
+  - package-ecosystem: docker-compose
     directory: "/deploy"
     schedule:
       interval: monthly

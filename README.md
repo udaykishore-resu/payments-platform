@@ -18,7 +18,7 @@ defect. Read the [status and limitations](#status-and-limitations) section befor
 conclusions about production readiness — this is a reference implementation, not a system that has
 processed real money.
 
-Go 1.24.7 · one module · nine deployables · no copyleft in the dependency graph (CI-enforced)
+Go 1.26.8 · one module · nine deployables · no copyleft in the dependency graph (CI-enforced)
 
 ---
 
@@ -346,11 +346,11 @@ imports nothing forbidden, and that no *other* package under `internal/adapters/
 
 | Tool | Version | Needed for |
 |---|---|---|
-| Go | 1.24.7 or newer (`go.mod` declares 1.24.7) | everything |
+| Go | 1.26.8 or newer (`go.mod` declares 1.26.8) | everything |
 | Docker + Compose v2 | any current | `make dev-up`; `docker-compose` v1 is detected as a fallback |
 | GNU make, bash | — | the targets below |
 | python3 with `pyyaml`, `jsonschema` | — | `check-openapi.sh`, `check-events.sh`, `check-error-catalog.sh` |
-| golangci-lint | v2.5.0 | `make lint`; falls back to `go run …@v2.5.0` if absent |
+| golangci-lint | v2.13.2 | `make lint`; falls back to `go run …@v2.13.2` if absent |
 | govulncheck, syft, k6, terraform | optional | `make vuln`, `make sbom`, `make loadtest`, terraform validation |
 
 `make` with no target prints the full target list — 45 of them, each with a description parsed from
@@ -363,7 +363,8 @@ make dev-up
 ```
 
 `scripts/dev-up.sh` starts Postgres 16.6, Redis 7.4, Redpanda (Kafka), the gateway simulator, the
-OTel collector, Jaeger, Prometheus and Grafana; **waits for every container's own healthcheck**
+local OIDC issuer, LocalStack (Secrets Manager, S3, KMS), the OTel collector, Jaeger, Prometheus and
+Grafana; **waits for every container's own healthcheck**
 rather than sleeping; then runs migrations to completion and seeds the `dev` profile at scale 25.
 It prints the endpoints when the stack is *usable*, not merely started:
 
@@ -376,10 +377,34 @@ OTLP        localhost:4317 (grpc) / 4318 (http)
 Prometheus  http://localhost:9090
 Grafana     http://localhost:3000   (anonymous admin)
 Jaeger      http://localhost:16686
+OIDC issuer http://localhost:8088    (JWKS at /.well-known/jwks.json)
+LocalStack  http://localhost:4566    (Secrets Manager, S3, KMS; creds test/test, us-east-1)
 ```
 
 Useful flags: `scripts/dev-up.sh --no-seed`, `--no-migrate`, `--rebuild`, `--timeout 300`.
 Tear down with `make dev-down` (removes volumes).
+
+**LocalStack.** The seeded credential references are written both to `.dev/secrets.yaml` (the
+file backend, the default) and to LocalStack's Secrets Manager under the same path-form ids that
+`Reference.SecretID` renders (`/sandbox/{tenant}/{merchant}/{gateway}/{purpose}`). Running a
+service with `PP_SECRETS_BACKEND=aws` therefore exercises the hand-written SigV4 client in
+`internal/infrastructure/secrets/awssm.go` end to end. `.dev/dev-env.sh` exports
+`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test` and
+`AWS_DEFAULT_REGION=us-east-1`, which the AWS CLI v2 honours directly:
+
+```bash
+source .dev/dev-env.sh
+aws secretsmanager list-secrets --query 'SecretList[].Name'
+aws s3 ls s3://pp-dev-dr-evidence
+aws kms describe-key --key-id alias/pp-dev-drill
+```
+
+Nothing needs installing on the host beyond Docker: `dev-up.sh` seeds secrets by running
+`awslocal` inside the container. The image is pinned to `4.14.0`, the last release that starts
+without a LocalStack account (from `2026.3.0` an auth token is mandatory); to use a newer image,
+export `PP_DEV_LOCALSTACK_IMAGE` and `LOCALSTACK_AUTH_TOKEN` in your shell before `make dev-up`. The static resources (the evidence bucket, the drill key) come
+from the ready hook in `deploy/localstack/init/`. Tests reach it through
+`testenv.AWSEndpoint(t)` (`PP_TEST_AWS_ENDPOINT`) and skip cleanly when it is absent.
 
 ### 2. Migrations
 

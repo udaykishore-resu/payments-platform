@@ -63,21 +63,51 @@ func TestAggregateRoundTripFidelity(t *testing.T) {
 		if err := a2.Succeed("adyen-ref-1", "Authorised", clock.Now()); err != nil {
 			return err
 		}
-		expiry := clock.Now().Add(7 * 24 * time.Hour)
-		if err := loaded.MarkAuthorized(money.MustNew(12_345, "USD"), &expiry, clock); err != nil {
-			return err
-		}
-		if err := loaded.MarkCaptured(money.MustNew(12_345, "USD"), clock); err != nil {
-			return err
-		}
-		if _, err := loaded.AddRefund(money.MustNew(2_345, "USD"),
-			payment.RefundReasonRequestedByCustomer, "refund-key-1", clock); err != nil {
+		if err := loaded.MarkProcessing(clock); err != nil {
 			return err
 		}
 		return r.Payments.Save(ctx, loaded)
 	}); err != nil {
 		t.Fatalf("lifecycle: %v", err)
 	}
+
+	// The remaining hops are one transaction each: the database's transition guard
+	// (0013_state_guards) checks every UPDATE against the legal edge list, so a single save that
+	// jumps PROCESSING -> PARTIALLY_REFUNDED is refused even though the aggregate walked each
+	// edge in memory. This is also how the application layer drives the aggregate.
+	step := func(name string, fn func(*payment.Payment) error) {
+		t.Helper()
+		if err := uow.Within(ctx, func(ctx context.Context, r ports.Repositories) error {
+			loaded, err := r.Payments.GetForUpdate(ctx, p.ID())
+			if err != nil {
+				return err
+			}
+			if err := fn(loaded); err != nil {
+				return err
+			}
+			return r.Payments.Save(ctx, loaded)
+		}); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	expiry := clock.Now().Add(7 * 24 * time.Hour)
+	step("authorize", func(loaded *payment.Payment) error {
+		return loaded.MarkAuthorized(money.MustNew(12_345, "USD"), &expiry, clock)
+	})
+	step("capture", func(loaded *payment.Payment) error {
+		return loaded.MarkCaptured(money.MustNew(12_345, "USD"), clock)
+	})
+	step("refund", func(loaded *payment.Payment) error {
+		ref, err := loaded.AddRefund(money.MustNew(2_345, "USD"),
+			payment.RefundReasonRequestedByCustomer, "refund-key-"+p.ID().String(), clock)
+		if err != nil {
+			return err
+		}
+		if err := ref.MarkSubmitted("adyen-refund-1", clock.Now()); err != nil {
+			return err
+		}
+		return loaded.ConfirmRefund(ref.ID(), "adyen-refund-1", clock)
+	})
 
 	var got *payment.Payment
 	if err := uow.Within(ctx, func(ctx context.Context, r ports.Repositories) error {

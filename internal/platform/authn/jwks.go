@@ -455,12 +455,23 @@ func (e jwkEntry) publicKey() (crypto.PublicKey, error) {
 			return nil, err
 		}
 		curve := elliptic.P256()
-		// Reject a point that is not on the curve. An off-curve point is the entry point for
-		// invalid-curve attacks, and the check costs one field operation.
-		if !curve.IsOnCurve(x, y) {
+		size := (curve.Params().BitSize + 7) / 8
+		if x.BitLen() > size*8 || y.BitLen() > size*8 {
+			return nil, errors.New("authn: EC coordinate is wider than P-256")
+		}
+		// The coordinates are re-encoded as an uncompressed point and parsed by the crypto
+		// library, which rejects a point that is not on the curve. An off-curve point is the
+		// entry point for invalid-curve attacks, so the check is not optional — and building
+		// the key from raw big.Int coordinates is deprecated precisely because it skips it.
+		point := make([]byte, 1+2*size)
+		point[0] = 4
+		x.FillBytes(point[1 : 1+size])
+		y.FillBytes(point[1+size:])
+		pub, err := ecdsa.ParseUncompressedPublicKey(curve, point)
+		if err != nil {
 			return nil, errors.New("authn: EC point is not on P-256")
 		}
-		return &ecdsa.PublicKey{Curve: curve, X: x, Y: y}, nil
+		return pub, nil
 	default:
 		return nil, fmt.Errorf("authn: unsupported key type %q", e.Kty)
 	}

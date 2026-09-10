@@ -107,7 +107,11 @@ design = {}     # id -> set of "doc §section"
 def note(store, rid, where):
     store.setdefault(rid, set()).add(where)
 
-SKIP_DIRS = {".git", "vendor", "node_modules", "testdata", ".terraform"}
+# `_superseded` holds the retired first-generation tree. The Go toolchain ignores every
+# directory whose name starts with `_`, so nothing there is built or tested, and its
+# requirement references belong to the archived numbering in docs/archive rather than to
+# the spec this matrix is derived from.
+SKIP_DIRS = {".git", "vendor", "node_modules", "testdata", ".terraform", "_superseded"}
 
 # Go sources. A test file's references count as test coverage; a non-test file's count as
 # implementation. The distinction is what separates "we wrote code for it" from "we proved

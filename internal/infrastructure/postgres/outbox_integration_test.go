@@ -118,10 +118,21 @@ func TestOutboxClaimUnderTwoRelaysPreservesPerKeyOrder(t *testing.T) {
 	// Every event for one partition key must have been claimed by exactly one relay. If two
 	// relays hold events for the same key, ordering is no longer guaranteed no matter what each
 	// of them does next.
+	//
+	// Only this test's keys are asserted on. The tenant is shared with the rest of the package,
+	// and a relay legitimately drains whatever unpublished backlog other tests left behind;
+	// those rows are foreign to the property under test and are simply ignored.
+	mine := map[string]bool{}
+	for _, key := range keys {
+		mine[key] = true
+	}
 	owner := map[string]int{}
 	order := map[string][]string{}
 	for _, res := range results {
 		for _, m := range res.msgs {
+			if !mine[m.PartitionKey] {
+				continue
+			}
 			if prev, seen := owner[m.PartitionKey]; seen && prev != res.shard {
 				t.Fatalf("partition key %s was claimed by relay %d and relay %d; per-aggregate "+
 					"ordering is not preserved and events for this payment can be published "+
@@ -145,7 +156,11 @@ func TestOutboxClaimUnderTwoRelaysPreservesPerKeyOrder(t *testing.T) {
 
 	total := 0
 	for _, res := range results {
-		total += len(res.msgs)
+		for _, m := range res.msgs {
+			if mine[m.PartitionKey] {
+				total++
+			}
+		}
 	}
 	if total != payments*eventsPerAggreg {
 		t.Fatalf("the two relays claimed %d of %d events between them", total, payments*eventsPerAggreg)

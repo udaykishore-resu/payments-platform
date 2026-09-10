@@ -50,7 +50,8 @@ answer (used at Stripe, Shopify, and others) to the dual-write problem.
 
 ## Tradeoffs
 - Outbox polling adds a small, tunable latency (target: sub-second p99) between commit and
-  external event delivery — acceptable per FR-6 (async settlement is explicitly allowed to be
+  external event delivery — acceptable per the original asynchronous-settlement requirement
+  (row 6 of `docs/archive/01-requirements.md`: async settlement is explicitly allowed to be
   eventually consistent).
 - Extra table and extra background worker to operate versus "just call SQS" — accepted
   complexity in exchange for correctness guarantees that are non-negotiable for a ledger.

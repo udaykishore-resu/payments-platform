@@ -252,6 +252,66 @@ services:
     # No healthcheck: same distroless image, same absent shell. /healthz exists and answers —
     # it is the probe that could not run, not the endpoint. Gated from the host in dev-up.sh.
 
+  # --- the fake cloud ------------------------------------------------------------------------------
+
+  localstack:
+    # LocalStack stands in for the AWS services the platform touches from a laptop: Secrets
+    # Manager (internal/infrastructure/secrets/awssm.go, selected with PP_SECRETS_BACKEND=aws),
+    # S3 (the DR-drill evidence bucket, scripts/dr-drill.sh) and KMS (the drill's key). It is
+    # deliberately *not* the default secrets backend — .env.dev keeps the file provider, which
+    # needs nothing running — but it is the only way to exercise the hand-written SigV4 client
+    # and its retry/stage logic against something that behaves like the real API rather than
+    # the httptest fake in awssm_test.go.
+    #
+    # Only the three services above are enabled. LocalStack starts every service it is asked
+    # for lazily, but naming them keeps the container's footprint predictable and makes a test
+    # that reaches for, say, SQS fail loudly here rather than pass against an emulator nobody
+    # decided to depend on.
+    #
+    # 4.14.0 is the last image that starts without a LocalStack account. On 2026-03-23 the
+    # community and Pro images were merged, and from 2026.3.0 every start requires
+    # LOCALSTACK_AUTH_TOKEN — the free Hobby plan covers what this stack uses, but a local
+    # stack that fails until a new joiner signs up for something is exactly the first-hour
+    # cost this file exists to avoid. Secrets Manager, S3 and KMS are all in 4.14.0.
+    #
+    # To run a newer image, set both: PP_DEV_LOCALSTACK_IMAGE=localstack/localstack:2026.05.0
+    # and LOCALSTACK_AUTH_TOKEN=<your token> in the *shell* — never in this file or .env.dev.
+    image: ${PP_DEV_LOCALSTACK_IMAGE:-localstack/localstack:4.14.0}
+    container_name: pp-dev-localstack
+    labels: *pp-labels
+    logging: *default-logging
+    environment:
+      SERVICES: secretsmanager,s3,kms
+      DEBUG: "0"
+      # Empty for the pinned 4.14.0 image; passed through from the shell for a licensed one.
+      LOCALSTACK_AUTH_TOKEN: "${LOCALSTACK_AUTH_TOKEN:-}"
+      # No persistence: it is a Pro feature anyway, and a local stack is disposable by
+      # definition (see the tmpfs note at the top). dev-up.sh re-creates the bucket, the key
+      # and every seeded secret on each start, which is what makes the stack reproducible.
+      EAGER_SERVICE_LOADING: "1"
+      # The region every seeded resource lives in. It has to agree with PP_AWS_REGION in
+      # .env.dev: SigV4 signs the region into the request, and LocalStack scopes resources
+      # by region, so a secret created in us-east-1 is not found by a client signing for
+      # eu-west-1.
+      DEFAULT_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      # Ready hooks run once the emulator answers /_localstack/health. The bucket and the key
+      # are created here because they are static; the seeded secrets are written by dev-up.sh
+      # because their names are only known after `platformctl seed` has run.
+      - ./localstack/init:/etc/localstack/init/ready.d:ro
+    ports:
+      - "${PP_DEV_LOCALSTACK_PORT:-4566}:4566"
+    healthcheck:
+      # /_localstack/health reports per-service state; "available" (lazy) or "running" both
+      # mean the service will answer, so the probe accepts either for the one service the
+      # platform's own client depends on.
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -Eq '\"secretsmanager\": *\"(available|running)\"'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
   # --- observability ---------------------------------------------------------------------------
 
   otel-collector:

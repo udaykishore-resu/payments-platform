@@ -50,6 +50,11 @@ const (
 	// it drives the system from outside, and outside, tenancy comes from the token.
 	EnvTenantID = "PP_TEST_TENANT_ID"
 
+	// EnvAWSEndpoint is the base URL of an AWS-compatible endpoint — LocalStack on the local
+	// stack — for the suites that drive the Secrets Manager client, the evidence bucket or the
+	// drill key against something that speaks the real wire protocol.
+	EnvAWSEndpoint = "PP_TEST_AWS_ENDPOINT"
+
 	// EnvChaosInfra opts the chaos suite into the scenarios that need real infrastructure to be
 	// stopped and started. Without it the infrastructure scenarios skip and only the
 	// in-process port-decorator scenarios run, which is the right default: a nightly job may
@@ -178,6 +183,21 @@ func TenantID(t testing.TB) string {
 	}
 	Skip(t, EnvTenantID, "the tenant id the "+EnvAuthToken+" token is scoped to",
 		"Export the tenant id printed by scripts/dev-up.sh.")
+	return ""
+}
+
+// AWSEndpoint returns the AWS-compatible endpoint base URL or skips.
+//
+// It returns only the endpoint. Region and credentials are read by the code under test from the
+// standard AWS_* variables, which scripts/dev-up.sh exports alongside this one; a harness that
+// also returned them would be a second place for the same values to disagree.
+func AWSEndpoint(t testing.TB) string {
+	t.Helper()
+	if v, ok := lookup(EnvAWSEndpoint); ok {
+		return strings.TrimRight(v, "/")
+	}
+	Skip(t, EnvAWSEndpoint, "an AWS-compatible endpoint (LocalStack) for Secrets Manager, S3 and KMS",
+		howLocalStack)
 	return ""
 }
 

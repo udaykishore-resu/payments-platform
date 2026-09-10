@@ -4,7 +4,8 @@
 #
 # WHAT IT DOES
 #   Starts deploy/docker-compose.dev.yml (Postgres, Redis, Redpanda, the gateway
-#   simulator, the local OIDC issuer, the OTel collector, Prometheus, Grafana, Jaeger),
+#   simulator, the local OIDC issuer, LocalStack for Secrets Manager/S3/KMS, the OTel
+#   collector, Prometheus, Grafana, Jaeger),
 #   runs the migrations to completion, seeds a deterministic dataset, and does not return
 #   until every dependency reports healthy.
 #
@@ -81,6 +82,14 @@ if [[ $REBUILD -eq 1 ]]; then
   "${DC[@]}" build --pull gateway-simulator migrate
 fi
 
+# .dev/ is bind-mounted into the dev-issuer container, which runs as the distroless nonroot
+# user (uid 65532) and persists its signing key there. If the directory does not exist yet,
+# Docker creates it root-owned and the issuer cannot write its key, exits, and the readiness
+# gate below times out on it — which is exactly what happens on a fresh checkout in CI.
+# Create it first, writable for the container's uid; the key itself is written 0600.
+mkdir -p "$REPO_ROOT/.dev"
+chmod 1777 "$REPO_ROOT/.dev" 2>/dev/null || true
+
 info "starting containers"
 # The migrate service is a one-shot job. Starting it with the rest and then waiting on its
 # exit status separately keeps the dependency ordering in the compose file (where it is
@@ -92,7 +101,7 @@ info "starting containers"
 # healthy would silently exempt any service someone forgets to give a probe, so the list of
 # services expected to have one is explicit.
 # Services gated on the container's own healthcheck.
-HEALTH_GATED=(postgres redis redpanda prometheus)
+HEALTH_GATED=(postgres redis redpanda prometheus localstack)
 
 # Services gated on an HTTP probe from the host, as "name|url".
 #
@@ -131,9 +140,12 @@ http_ok() {
 
 container_health() {
   local svc="$1" cid
-  cid="$("${DC[@]}" ps -q "$svc" 2>/dev/null | head -1)"
+  # -a, because `compose ps` hides stopped containers by default and a container that started
+  # and then died must be reported as "exited", not as "missing" — the two need different
+  # log lines to diagnose, and only one of them is worth waiting for.
+  cid="$("${DC[@]}" ps -aq "$svc" 2>/dev/null | head -1)"
   [[ -z "$cid" ]] && { echo "missing"; return; }
-  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}nohealthcheck{{end}}' \
+  docker inspect -f '{{if eq .State.Status "exited"}}exited:{{.State.ExitCode}}{{else if .State.Health}}{{.State.Health.Status}}{{else}}nohealthcheck{{end}}' \
     "$cid" 2>/dev/null || echo "missing"
 }
 
@@ -161,6 +173,15 @@ while :; do
           warn "$svc has no healthcheck in $COMPOSE_FILE — readiness is not gated for it"
           reported+="$svc "
         fi
+        ;;
+      exited:*)
+        # No amount of waiting brings back a process that has already quit. Fail now, with its
+        # logs, rather than after the full timeout.
+        fail "$svc exited (code ${st#exited:}) before becoming healthy"
+        echo
+        hdr "last 40 log lines from $svc"
+        "${DC[@]}" logs --tail 40 "$svc" || true
+        exit 1
         ;;
       *)
         pending+=("$svc:$st")
@@ -257,6 +278,42 @@ if [[ $DO_SEED -eq 1 && $DO_MIGRATE -eq 1 ]]; then
     } > "$REPO_ROOT/.dev/secrets.yaml"
     chmod 600 "$REPO_ROOT/.dev/secrets.yaml"
     ok "wrote .dev/secrets.yaml ($(grep -c '^secret://' "$REPO_ROOT/.dev/secrets.yaml" || echo 0) references)"
+    # The same references, mirrored into LocalStack's Secrets Manager so that a service started
+    # with PP_SECRETS_BACKEND=aws resolves them through the real client (awssm.go) rather than
+    # the file provider. The secret id is the reference's path form — `/sandbox/{tenant}/
+    # {merchant}/{gateway}/{purpose}`, exactly what Reference.SecretID renders — and the value is
+    # the same JSON object the file provider would hand back. The first version is labelled
+    # `v1` alongside AWSCURRENT, matching the platform's own rotation convention so that
+    # Material.Version reports "v1" here as it would after a real rotation.
+    #
+    # `awslocal` runs *inside* the container: nothing has to be installed on the host for this
+    # to work, and the host's AWS profile (if any) is never consulted.
+    if [[ "$(container_health localstack)" == "healthy" ]]; then
+      SEEDED_SECRETS=0
+      while read -r ref; do
+        [[ -z "$ref" ]] && continue
+        sid="/${ref#secret://}"
+        payload="$(printf '{"api_key":"%s","webhook_secret":"%s"}' "$SIM_API_KEY" "0123456789abcdef0123456789abcdef")"
+        if vid="$("${DC[@]}" exec -T localstack awslocal secretsmanager create-secret \
+              --name "$sid" --secret-string "$payload" \
+              --description 'local dev fixture written by scripts/dev-up.sh' \
+              --query VersionId --output text 2>/dev/null)"; then
+          "${DC[@]}" exec -T localstack awslocal secretsmanager update-secret-version-stage \
+            --secret-id "$sid" --version-stage v1 --move-to-version-id "$vid" >/dev/null 2>&1 || true
+          SEEDED_SECRETS=$((SEEDED_SECRETS + 1))
+        else
+          # Already present from an earlier run against a still-running container: refresh the
+          # value rather than fail, so re-running dev-up.sh after a re-seed stays consistent.
+          "${DC[@]}" exec -T localstack awslocal secretsmanager put-secret-value \
+            --secret-id "$sid" --secret-string "$payload" >/dev/null 2>&1 \
+            && SEEDED_SECRETS=$((SEEDED_SECRETS + 1)) \
+            || warn "could not write ${sid} to LocalStack"
+        fi
+      done < <(grep -oE '^secret://[^[:space:]:]+' "$REPO_ROOT/.dev/secrets.yaml" | sort -u)
+      ok "mirrored ${SEEDED_SECRETS} references into LocalStack Secrets Manager (PP_SECRETS_BACKEND=aws to use them)"
+    else
+      warn "localstack is not healthy; seeded references were not mirrored into Secrets Manager"
+    fi
   else
     warn "seeding failed; the stack is usable but empty (run scripts/seed.sh to retry)"
   fi
@@ -273,6 +330,17 @@ mkdir -p "$REPO_ROOT/.dev"
   echo "export PP_TEST_CONTROL_URL=\"http://localhost:${PP_DEV_CONTROL_API_PORT:-8082}\""
   echo "export PP_TEST_SIMULATOR_URL=\"http://localhost:${PP_DEV_SIMULATOR_PORT:-8090}\""
   echo "export PP_DEV_ISSUER_URL=\"http://localhost:${PP_DEV_ISSUER_PORT:-8088}\""
+  # LocalStack. The AWS_* trio is what the platform's own credential chain (secrets/credentials.go)
+  # and the aws CLI both read; the PP_* pair points the Secrets Manager client at the emulator.
+  # `test`/`test` are LocalStack's documented placeholder keys — every real endpoint rejects them.
+  echo "export AWS_ENDPOINT_URL=\"http://localhost:${PP_DEV_LOCALSTACK_PORT:-4566}\""
+  echo "export AWS_ACCESS_KEY_ID=\"test\""
+  echo "export AWS_SECRET_ACCESS_KEY=\"test\""
+  echo "export AWS_DEFAULT_REGION=\"us-east-1\""
+  echo "export PP_AWS_REGION=\"us-east-1\""
+  echo "export PP_SECRETS_ENDPOINT=\"http://localhost:${PP_DEV_LOCALSTACK_PORT:-4566}\""
+  echo "export PP_EVIDENCE_BUCKET=\"${PP_EVIDENCE_BUCKET:-pp-dev-dr-evidence}\""
+  echo "export PP_TEST_AWS_ENDPOINT=\"http://localhost:${PP_DEV_LOCALSTACK_PORT:-4566}\""
   [[ -n "$SEEDED_TENANT" ]]   && echo "export PP_TEST_TENANT_ID=\"$SEEDED_TENANT\""
   [[ -n "$SEEDED_MERCHANT" ]] && echo "export PP_TEST_MERCHANT_ID=\"$SEEDED_MERCHANT\""
   true
@@ -292,6 +360,7 @@ cat <<EOF
     Grafana     http://localhost:${PP_DEV_GRAFANA_PORT:-3000}   (anonymous admin)
     Jaeger      http://localhost:${PP_DEV_JAEGER_UI_PORT:-16686}
     OIDC issuer http://localhost:${PP_DEV_ISSUER_PORT:-8088}    (JWKS at /.well-known/jwks.json)
+    LocalStack  http://localhost:${PP_DEV_LOCALSTACK_PORT:-4566}    (Secrets Manager, S3, KMS; creds test/test, us-east-1)
 EOF
 
 if [[ -n "$SEEDED_TENANT" ]]; then

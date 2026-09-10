@@ -88,6 +88,11 @@ func seedCrashedInstance(
 	// The kill is raw SQL for a better reason: there is no repository method for "die", and
 	// production has none either. The lease stays owned with its deadline in the past and nothing
 	// releases it, which is what `kubectl delete pod --grace-period=0` leaves behind.
+	//
+	// Both lease_expires_at and run_after are written against the database clock, because that
+	// is the clock LeaseRunnable compares them with. The scope's fixed clock is anchored to the
+	// 15th of the month and is in the future for half of every month; a run_after taken from it
+	// would make the instance not yet runnable and the takeover below would find nothing.
 	c := ctx(t)
 	if err := s.TenantedCommitted(c, tenant, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(c, `
@@ -96,7 +101,7 @@ INSERT INTO pp.workflow_instances (
     input, checkpoint, lease_owner, lease_expires_at, attempt_epoch, run_after,
     created_at, updated_at)
 VALUES ($1,$2,$3,$4,$5,'RUNNING',$6,$7,'{}'::jsonb,'worker-killed',
-        now() - interval '1 minute',1,$8,$8,$8)`,
+        now() - interval '1 minute',1,now() - interval '1 minute',$8,$8)`,
 			inst.String(), tenant, onboarding.WorkflowName, onboarding.WorkflowVersion,
 			"resume-"+runToken+"-"+tag, steps[upTo], []byte(`{"probe":"resume"}`), now); err != nil {
 			return fmt.Errorf("create instance: %w", err)

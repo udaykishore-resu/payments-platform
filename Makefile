@@ -177,7 +177,7 @@ lint: ## golangci-lint over the whole module
 	  golangci-lint run ./...; \
 	else \
 	  printf '  golangci-lint not installed; running it via go run\n'; \
-	  $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.5.0 run ./...; \
+	  $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run ./...; \
 	fi
 
 .PHONY: fmt

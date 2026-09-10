@@ -269,12 +269,24 @@ func TestI1ConcurrentPartialRefundsCannotExceedCaptured(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	// One state hop per transaction: the database's transition guard (0013_state_guards)
+	// checks each UPDATE against the legal edge list, and CREATED -> CAPTURED is not an edge
+	// even though the aggregate can walk CREATED -> PROCESSING -> CAPTURED in memory.
 	if err := uow.Within(ctx, func(ctx context.Context, r ports.Repositories) error {
 		loaded, err := r.Payments.GetForUpdate(ctx, p.ID())
 		if err != nil {
 			return err
 		}
 		if err := loaded.MarkProcessing(clock); err != nil {
+			return err
+		}
+		return r.Payments.Save(ctx, loaded)
+	}); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if err := uow.Within(ctx, func(ctx context.Context, r ports.Repositories) error {
+		loaded, err := r.Payments.GetForUpdate(ctx, p.ID())
+		if err != nil {
 			return err
 		}
 		if err := loaded.MarkCaptured(money.MustNew(captured, "USD"), clock); err != nil {
@@ -304,9 +316,20 @@ func TestI1ConcurrentPartialRefundsCannotExceedCaptured(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if _, err := loaded.AddRefund(money.MustNew(slice, "USD"),
+				ref, err := loaded.AddRefund(money.MustNew(slice, "USD"),
 					payment.RefundReasonRequestedByCustomer,
-					"refund-"+string(rune('a'+i)), clock); err != nil {
+					"refund-"+string(rune('a'+i)), clock)
+				if err != nil {
+					return err
+				}
+				// A refund only counts against the captured amount once the gateway has
+				// confirmed it; confirming in the same transaction is what makes "reported
+				// success" and "refunded total" comparable below.
+				gwRef := "gw-refund-" + string(rune('a'+i))
+				if err := ref.MarkSubmitted(gwRef, clock.Now()); err != nil {
+					return err
+				}
+				if err := loaded.ConfirmRefund(ref.ID(), gwRef, clock); err != nil {
 					return err
 				}
 				return r.Payments.Save(ctx, loaded)

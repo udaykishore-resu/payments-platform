@@ -66,7 +66,7 @@ jobs:
           # The same pinned toolchain as everything else. CodeQL's autobuild would pick
           # whatever the runner image ships, and analysing a build that differs from the one
           # that ships is analysing a different program.
-          go-version: "1.24.7"
+          go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 
