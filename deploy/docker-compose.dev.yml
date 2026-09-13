@@ -48,7 +48,7 @@ services:
   # --- data stores --------------------------------------------------------------------------
 
   postgres:
-    image: postgres:16.6-alpine
+    image: postgres:18.6-alpine
     container_name: pp-dev-postgres
     labels: *pp-labels
     logging: *default-logging
@@ -91,7 +91,7 @@ services:
       start_period: 5s
 
   redis:
-    image: redis:7.4-alpine
+    image: redis:8.10-alpine
     container_name: pp-dev-redis
     labels: *pp-labels
     logging: *default-logging
@@ -119,7 +119,7 @@ services:
       retries: 30
 
   redpanda:
-    image: redpandadata/redpanda:v24.3.6
+    image: redpandadata/redpanda:v26.2.2
     container_name: pp-dev-redpanda
     labels: *pp-labels
     logging: *default-logging
@@ -315,7 +315,7 @@ services:
   # --- observability ---------------------------------------------------------------------------
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.118.0
+    image: otel/opentelemetry-collector-contrib:0.160.0
     container_name: pp-dev-otel-collector
     labels: *pp-labels
     logging: *default-logging
@@ -335,7 +335,7 @@ services:
         condition: service_started
 
   jaeger:
-    image: jaegertracing/all-in-one:1.65.0
+    image: jaegertracing/all-in-one:1.76.0
     container_name: pp-dev-jaeger
     labels: *pp-labels
     logging: *default-logging
@@ -345,7 +345,7 @@ services:
       - "${PP_DEV_JAEGER_UI_PORT:-16686}:16686"
 
   prometheus:
-    image: prom/prometheus:v3.1.0
+    image: prom/prometheus:v3.14.0
     container_name: pp-dev-prometheus
     labels: *pp-labels
     logging: *default-logging
@@ -370,7 +370,7 @@ services:
       retries: 20
 
   grafana:
-    image: grafana/grafana:11.5.1
+    image: grafana/grafana:13.2.1
     container_name: pp-dev-grafana
     labels: *pp-labels
     logging: *default-logging
