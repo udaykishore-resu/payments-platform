@@ -119,7 +119,7 @@ services:
       retries: 30
 
   redpanda:
-    image: redpandadata/redpanda:v26.2.2
+    image: redpandadata/redpanda:v26.2.3
     container_name: pp-dev-redpanda
     labels: *pp-labels
     logging: *default-logging
@@ -315,7 +315,7 @@ services:
   # --- observability ---------------------------------------------------------------------------
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.160.0
+    image: otel/opentelemetry-collector-contrib:0.161.0
     container_name: pp-dev-otel-collector
     labels: *pp-labels
     logging: *default-logging
@@ -345,7 +345,7 @@ services:
       - "${PP_DEV_JAEGER_UI_PORT:-16686}:16686"
 
   prometheus:
-    image: prom/prometheus:v3.14.0
+    image: prom/prometheus:v3.15.0
     container_name: pp-dev-prometheus
     labels: *pp-labels
     logging: *default-logging
@@ -370,7 +370,7 @@ services:
       retries: 20
 
   grafana:
-    image: grafana/grafana:13.2.1
+    image: grafana/grafana:13.2.2
     container_name: pp-dev-grafana
     labels: *pp-labels
     logging: *default-logging
